@@ -1,0 +1,165 @@
+# SuiteHarness 公司服务器配置示例。
+# 复制为 config/suiteharness.yaml 后按客户部署修改；此文件不含任何密钥。
+config_version: 1
+
+deployment:
+  mode: server
+  environment: production
+  instance_id: acme-suiteharness-prod
+  tenant_id: acme
+
+# 公司 ASGI 进程监听。即使只启用飞书，也承载 health/readiness 或 Webhook。
+server:
+  host: 0.0.0.0
+  port: 8080
+  max_concurrent_connections: 1000
+  backlog: 2048
+  startup_timeout_seconds: 300
+  shutdown_timeout_seconds: 60
+
+# 这里决定本次交付是 A、AB 还是 ABC 组合包。
+# 默认 customer360.mode=isolated，即各产品的用户画像完全隔离。
+customer_bundle:
+  schema_version: "1"
+  customer_bundle_id: acme-product-suite
+  version: 1.0.0
+  harness_api: ">=0.1,<0.2"
+  products:
+    - product_id: product-a
+      version: "==1.0.0"
+      config: {}
+  customer360:
+    mode: isolated
+    rules: []
+
+workspace:
+  root: /var/lib/suiteharness/workspaces
+  # 默认关闭。若组合包确需共享，必须逐产品声明 read_only 或 read_write。
+  shared_enabled: false
+  shared_access_by_product: {}
+
+storage:
+  root: /var/lib/suiteharness/state
+  sessions_database: sessions.sqlite3
+  audit_database: audit.sqlite3
+  runtime_database: runtime.sqlite3
+  # 转录和 run claim 是防重复执行证据，到达容量时失败关闭而不是静默删除。
+  # checkpoint 是可替换快照，只保留满足条数与累计字节限制的最新窗口。
+  session_limits:
+    max_sessions: 100000
+    max_transcript_payload_bytes: 4194304
+    max_transcript_events_per_session: 50000
+    max_transcript_events_total: 1000000
+    max_run_claims_per_session: 50000
+    max_run_claims_total: 1000000
+    max_checkpoint_state_bytes: 4194304
+    max_checkpoints_per_session: 8
+    max_checkpoint_bytes_per_session: 16777216
+
+sandbox:
+  backend: docker
+  required: true
+  # 必须替换为本公司构建并验证过的真实镜像摘要；production 禁止 latest/浮动标签。
+  image: registry.example.com/suiteharness/sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  limits:
+    cpu_count: 1.0
+    memory_mb: 512
+    pids: 128
+    timeout_seconds: 120
+    output_bytes: 1048576
+    tmpfs_mb: 128
+  network:
+    default: none
+    # 名称映射到运维预先创建、具备出口控制的 Docker network。
+    egress_profiles:
+      china-web: suiteharness-egress-cn
+    # Bash 网络权限按产品显式放行；未列出的产品只能使用 network=none。
+    allowed_profiles_by_product:
+      product-a: [china-web]
+
+models:
+  profiles:
+    - profile_id: deepseek-primary
+      provider_id: deepseek
+      model: deepseek-chat
+      credentials_ref: model/deepseek
+      timeout_seconds: 120
+      max_retries: 2
+  routes:
+    - route_id: default
+      primary_profile: deepseek-primary
+  default_route: default
+  product_routes: {}
+
+web_tools:
+  # 未显式列出时只能使用下面的公司默认 provider/route；非默认出口需逐产品放行。
+  search_providers_by_product:
+    product-a: [baidu-qianfan]
+  fetch_routes_by_product:
+    product-a: [direct]
+  search:
+    default_provider: baidu-qianfan
+    providers:
+      - kind: baidu_qianfan
+        provider_id: baidu-qianfan
+        credentials_ref: search/baidu-qianfan
+        endpoint: https://qianfan.baidubce.com/v2/ai_search/web_search
+  fetch:
+    # direct 带 DNS 固定和 SSRF 防护；境内网络不稳定时可换 managed_proxy/browser_worker。
+    default_route: direct
+    routes:
+      - kind: direct
+        name: direct
+
+channels:
+  # 产品 ACL 与共享 Web 会话成员 ACL 的单次调用上限；异常或超时一律拒绝。
+  authorization_timeout_seconds: 10
+  web:
+    enabled: true
+    websocket_path: /ws
+    # 公司 SSO 凭据在此换取最长 15 分钟的短期 WebSocket 票据；不接受账号密码正文。
+    session_path: /auth/session
+    session_lifetime_seconds: 300
+    authentication_timeout_seconds: 10
+    # 协议层与应用层统一固定为 1 MiB，避免完整大帧先被服务器缓冲。
+    max_frame_bytes: 1048576
+    allowed_origins:
+      - https://assistant.example.com
+    approval_mode: interactive
+    credentials_ref: web/default
+  feishu:
+    enabled: false
+    transport: long_connection
+    credentials_ref: feishu/default
+    # 飞书外部用户到公司目录主体的解析上限；超时或目录异常一律拒绝。
+    authentication_timeout_seconds: 10
+    default_access: read_only
+    interactive_approval: false
+    allow_delete: false
+    # 配置目录后仅 suiteharness.fs.write/edit 可在其下写入；删除、Bash、MCP写操作仍拒绝。
+    writable_roots: []
+  # AB/ABC 组合部署时，飞书会话必须显式绑定一个产品；Web 也可固定会话路由。
+  routes: []
+  agent_ids:
+    product-a: default
+  # false 表示即使在同一个群/会话，不同用户的 Session 仍彼此隔离。
+  share_conversation_sessions: false
+
+# MCP 必须按产品声明，不会成为跨产品全局单例。
+mcp:
+  servers_by_product: {}
+  # 远端注解不能自行降权；只有这里带理由的管理员规则可以标为 read。
+  tool_security_overrides: {}
+  # 渠道 MCP 权限默认全拒绝。allow_servers 放行该服务的全部工具；
+  # allow_tools 按远端原始工具名精确放行。不要对同一服务同时使用两种规则。
+  channel_access:
+    web: {}
+    feishu: {}
+
+# 仅加载显式路径；不会扫描目录。摘要必须与插件制品完全一致。
+plugins:
+  allowed_roots:
+    - /opt/suiteharness/plugins
+  sources: []
+  trusted_in_process_plugins: []
+  require_signatures: true

@@ -1,0 +1,46 @@
+# Data & caches
+data/
+.suiteharness/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite*
+*.sqlite3*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp-*/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.deps/
+.testdeps/
+.site/
+dist/
+build/
+*.egg-info/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local configuration and secrets (commit an explicit *.example file instead)
+config/suiteharness.secrets.yaml
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pem
+*.pfx
+*.log
+
+# Local test artifacts
+.pytest_tmp_*/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

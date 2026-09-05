@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a reproducible defect in SuiteHarness.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include secrets or customer data. Authorization bypasses, cross-tenant access, sandbox escapes, and secret exposure must be reported privately as described in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: SuiteHarness version or commit
+      placeholder: 0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Runtime and bundle composition
+        - Execution and tool safety
+        - Memory, knowledge, or Customer360
+        - Packaging or CI
+        - Documentation
+        - Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and relevant non-secret configuration.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest synthetic-data example that demonstrates the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Sanitized logs, tracebacks, or links to a minimal repository.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, credentials, customer data, and private evidence from this report.
+          required: true
+        - label: This is not a vulnerability report covered by SECURITY.md.
+          required: true

@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a scoped Harness capability or architecture change.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+      description: Describe the reusable framework need without prescribing the implementation first.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and isolation impact
+      description: Which Root/Tenant/Product/Agent scope owns this behavior? Does it affect Customer360 sharing?
+    validations:
+      required: true
+  - type: textarea
+    id: capability
+    attributes:
+      label: Capability and security impact
+      description: Required reads/writes, approval behavior, budgets, audit events, lifecycle, and failure semantics.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: compatibility
+    attributes:
+      label: Compatibility
+      options:
+        - label: I considered existing public APIs and product integration contracts.
+        - label: I identified whether this changes a descriptor, manifest, or other public contract.
