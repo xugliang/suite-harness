@@ -21,6 +21,8 @@
 
 ### Security
 
+- OpenAI 兼容模型的 `provider_options` 仅允许布尔 `enable_thinking`，DashScope JSON Schema
+  请求强制显式关闭思考模式，并发送严格 Schema，避免生产画像静默降级为非结构化文本；
 - 配置和 secrets 通过单一文件描述符读取，拒绝链接、非普通文件、身份复用、宽松 POSIX 权限、超限正文和生产占位值；
 - WebSocket 票据到期、账号停用和角色变化在空闲连接上也会有界生效；
 - 飞书崩溃前的处理中事件仅保留短租约，成功后才转为长期去重标记，避免永久丢失或 ABA 删除；

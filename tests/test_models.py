@@ -214,6 +214,95 @@ def test_openai_adapter_converts_tools_and_normalizes_response() -> None:
     assert "server-key" not in repr(sent)
 
 
+def test_dashscope_structured_output_disables_thinking_explicitly() -> None:
+    transport = FakeTransport(
+        [
+            _json_response(
+                {
+                    "id": "response-1",
+                    "model": "qwen-vision",
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"claims":[]}'},
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    descriptor = create_builtin_provider_registry().descriptor("dashscope")
+    assert descriptor is not None
+    profile = ModelProfile(
+        profile_id="dashscope-vision",
+        provider_id="dashscope",
+        model="qwen-vision",
+        credential_ref="models.dashscope.api_key",
+        max_retries=0,
+        provider_options={"enable_thinking": False},
+    )
+    request = ModelRequest(
+        messages=(ModelMessage.text(ModelRole.USER, "Return JSON"),),
+        response_schema={"type": "object", "properties": {"claims": {"type": "array"}}},
+    )
+
+    response = asyncio.run(
+        OpenAIChatAdapter(descriptor, profile, transport, SecretStr("server-key")).complete(
+            request
+        )
+    )
+
+    assert response.finish_reason is FinishReason.STOP
+    body = transport.requests[0].json_body
+    assert body["enable_thinking"] is False  # type: ignore[index]
+    assert body["response_format"]["json_schema"]["strict"] is True  # type: ignore[index]
+
+
+def test_dashscope_structured_output_fails_without_explicit_non_thinking_mode() -> None:
+    descriptor = create_builtin_provider_registry().descriptor("dashscope")
+    assert descriptor is not None
+    adapter = OpenAIChatAdapter(
+        descriptor,
+        _profile("dashscope", model="qwen-vision"),
+        FakeTransport(),
+        SecretStr("server-key"),
+    )
+    request = ModelRequest(
+        messages=(ModelMessage.text(ModelRole.USER, "Return JSON"),),
+        response_schema={"type": "object"},
+    )
+
+    with pytest.raises(ModelProviderError, match="enable_thinking=false") as caught:
+        asyncio.run(adapter.complete(request))
+
+    assert caught.value.code is ModelErrorCode.CONFIGURATION
+
+
+@pytest.mark.parametrize(
+    "options, match",
+    [
+        ({"enable_thinking": "false"}, "must be boolean"),
+        ({"arbitrary_body_field": True}, "unsupported.*provider option"),
+    ],
+)
+def test_openai_compatible_provider_options_are_fail_closed(
+    options: dict[str, object], match: str
+) -> None:
+    descriptor = create_builtin_provider_registry().descriptor("dashscope")
+    assert descriptor is not None
+    profile = ModelProfile(
+        profile_id="dashscope-vision",
+        provider_id="dashscope",
+        model="qwen-vision",
+        provider_options=options,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ModelProviderError, match=match) as caught:
+        OpenAIChatAdapter(descriptor, profile, FakeTransport(), None)
+
+    assert caught.value.code is ModelErrorCode.CONFIGURATION
+
+
 def test_openai_responses_adapter_uses_server_api_and_normalizes_function_calls() -> None:
     transport = FakeTransport(
         [

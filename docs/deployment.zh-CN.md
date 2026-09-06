@@ -336,6 +336,12 @@ workspace:
 
 在 `models.profiles` 定义服务器模型配置，在 `models.routes` 定义主/后备路由，在 `product_routes` 选择 A/B/C 的路由。密钥只写在 secrets 文件对应引用中。
 
+逐模型的能力差异写入 `models.profiles[].capabilities`。只有 profile 绑定一个精确模型并显式
+设置 `allow_capability_overrides: true`，才能把厂商注册表默认关闭的能力提升为 `true`；这只是
+管理员对已验证线协议的声明，不会让模型凭空获得能力。使用 DashScope 视觉模型做 JSON Schema
+结构化输出时，还必须设置 `provider_options: {enable_thinking: false}`。OpenAI 兼容适配器只允许
+透传这个布尔选项，拒绝任意请求体字段；遗漏时结构化请求在本地失败关闭。
+
 部署前逐模型验证：
 
 - 文本和中文编码；

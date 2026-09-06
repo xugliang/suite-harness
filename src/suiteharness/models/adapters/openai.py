@@ -55,6 +55,23 @@ class OpenAIChatAdapter:
                 provider_id=self.provider_id,
             )
         self._url = f"{base_url.rstrip('/')}/chat/completions"
+        options = dict(profile.provider_options)
+        unsupported = set(options) - {"enable_thinking"}
+        if unsupported:
+            raise ModelProviderError(
+                ModelErrorCode.CONFIGURATION,
+                "unsupported OpenAI-compatible provider option(s): "
+                + ", ".join(sorted(unsupported)),
+                provider_id=self.provider_id,
+            )
+        enable_thinking = options.get("enable_thinking")
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise ModelProviderError(
+                ModelErrorCode.CONFIGURATION,
+                "OpenAI-compatible provider option enable_thinking must be boolean",
+                provider_id=self.provider_id,
+            )
+        self._enable_thinking = enable_thinking
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json", **self._profile.default_headers}
@@ -94,6 +111,8 @@ class OpenAIChatAdapter:
             "max_tokens": request.max_output_tokens,
             "stream": stream,
         }
+        if self._enable_thinking is not None:
+            body["enable_thinking"] = self._enable_thinking
         if request.temperature is not None:
             body["temperature"] = request.temperature
         if request.top_p is not None:
@@ -114,9 +133,20 @@ class OpenAIChatAdapter:
             ]
             body["tool_choice"] = request.tool_choice
         if request.response_schema is not None:
+            if self.provider_id == "dashscope" and self._enable_thinking is not False:
+                raise ModelProviderError(
+                    ModelErrorCode.CONFIGURATION,
+                    "DashScope structured output requires provider_options."
+                    "enable_thinking=false",
+                    provider_id=self.provider_id,
+                )
             body["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"name": "response", "schema": request.response_schema},
+                "json_schema": {
+                    "name": "response",
+                    "strict": True,
+                    "schema": request.response_schema,
+                },
             }
         if stream:
             body["stream_options"] = {"include_usage": True}
