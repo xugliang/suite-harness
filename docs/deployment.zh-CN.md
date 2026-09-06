@@ -406,6 +406,13 @@ application = create_company_asgi_app(bootstrap)
 
 只传启用功能所需的可选适配器：Web 关闭时不能传 `web_authenticator`；飞书关闭时通常不传 `feishu_adapters`；未配置插件/MCP/Foundry/浏览器工作器时相应项可省略。Web 开启则必须传 `CompanyHttpAuthenticator`；共享 Web 会话还必须传可信 `ConversationAuthorizer`。若不同部门只能使用部分产品，Web 和飞书共用的 `ProductAccessAuthorizer` 必须连接公司 IAM/ACL；它在产品路由之后、创建作用域之前逐消息执行，拒绝、异常、超时或非严格 `True` 都失败关闭。两个 ACL 适配器共用 `channels.authorization_timeout_seconds`。省略产品 ACL 等价于“全部已认证公司用户可访问组合内全部产品”，部署评审必须明确接受。飞书必须使用 `FeishuHostAdapters(directory, outbound_sink, webhook_decryptor=...)` 或 `FeishuHostAdapters(..., long_connection_sdk=...)`，按配置传输二选一。
 
+Foundry 搜索配置只声明固定的 `provider_id`；项目端点、Bing 项目连接和 Microsoft Entra（微软
+云身份）认证由可信宿主在预绑定 `FoundryGroundingClient` 时提供，不写入 SuiteHarness 的通用
+service secrets，也不能用任意非空 token 冒充认证成功。宿主应使用公司托管身份与 RBAC（基于
+角色的访问控制）或等价服务器凭据，并确保客户端绑定到预期项目和连接。框架启动时会拒绝缺失
+或未实现 `grounded_search` 的客户端，运行时仍按 `provider_id` 执行产品工具授权和出口隔离。
+目前宿主负责创建该客户端；未来需要按配置懒创建时，应另行实现显式 factory（工厂）接口。
+
 `build()` 内部顺序固定为：解析客户组合 → 创建唯一 Web 审批回路 → `FoundationRuntime.create()` 并探测底座 → 准备产品工作区 → 激活产品 → 启动插件/MCP → 按已发现 MCP 清单组合渠道 → 启动可选飞书长连接 → 聚合就绪。任何阶段失败都反向回滚并保持不接流量；标准路径还把 `foundation.runtime_database` 复用给渠道去重。只有需要实现自定义公司宿主时才直接使用 `FoundationRuntime`、`CompanyChannelRuntime` 等低层接口。
 
 框架不会自动发现 `verified_product_catalog`，也不会替公司生成 `verified_product_activators` 或 `reviewed_grant_templates`。这三项决定 ABC 中实际加载的代码和工具权限，必须来自可信制品及管理员评审。

@@ -188,13 +188,28 @@ Docker 隔离的边界是容器和宿主内核。镜像供应链、Docker 守护
 - 严格解析，未知字段失败；
 - 不做环境变量插值；
 - 在 POSIX 系统检查密钥文件权限；
-- 校验公开配置中的引用存在；
+- 一般凭据引用在配置加载期校验存在性；搜索 provider 的类型、产品映射及各 provider 自身
+  的配置结构同样在加载期严格校验，但框架实际消费的搜索凭据存在性会延迟到可信 bootstrap
+  已拿到当前 bundle 的渠道/产品工具模板之后；
+- bootstrap 只对当前 bundle 中通过 `read_aliases` 实际授权 `suiteharness.web.search` 的产品，
+  按产品出口白名单求 provider 并集并构造实例；并集中任一 provider 未配置，或其真实依赖
+  缺失、为空白、不合格或构造失败，都会让整个组合失败关闭。当前百度千帆 provider 的真实
+  依赖是 secrets 文件中的 token/API key；Microsoft Foundry provider 的真实依赖则是可信宿主
+  预先绑定的、实现 `grounded_search` 的已认证客户端。未获搜索授权的产品不会因闲置 provider
+  的密钥或适配器缺失而阻塞启动；
 - 生产环境拒绝常见占位符、全零镜像摘要、明显伪密钥和保留示例域名；
 - 对验证错误做密钥脱敏。
 
 模型 HTTP 传输不继承系统代理，也不自动跟随重定向。请求、会话与审计不应包含凭据。
 
 Bedrock、Vertex 等云身份需要部署方显式提供服务器凭据。任何厂商的个人 OAuth（开放授权）、个人订阅登录或本地个人模型服务都不在支持范围；Ollama/vLLM 适配器只表示可连接公司管理的服务器端点。
+
+Microsoft Foundry 的项目端点、Bing 项目连接及 Microsoft Entra（微软云身份）认证不写入
+`FoundrySearchConfig`，而由可信公司宿主在构造 `FoundryGroundingClient` 时绑定。框架只按固定
+`provider_id` 选择该客户端，并继续执行产品工具授权与出口隔离；客户端对象存在本身不是认证
+证明，宿主必须使用公司托管身份/RBAC（基于角色的访问控制）或等价服务器凭据完成认证。若未来
+需要框架根据配置延迟创建 Foundry 客户端，应新增明确的 factory（工厂）契约，不能复用未消费
+的通用 secret 字段冒充认证。
 
 ## 11. MCP 安全
 

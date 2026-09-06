@@ -11,16 +11,25 @@ from pydantic import BaseModel, ConfigDict
 
 from suiteharness.channels import AuthenticatedPrincipal
 from suiteharness.config import SuiteHarnessConfigLoader
+from suiteharness.execution import ToolCallContext
 from suiteharness.memory import PROFILE_PROVIDER, InMemoryProfileProvider
-from suiteharness.runtime import PreparedProduct, ProductCatalog, ProductDescriptor
+from suiteharness.runtime import (
+    PreparedProduct,
+    ProductCatalog,
+    ProductDescriptor,
+    RequestScope,
+    ScopePath,
+)
 from suiteharness.sandbox import ProcessResult, SandboxUnavailable
 from suiteharness.server import (
     CompanyHttpAuthenticationRequest,
     CompanyServerApplication,
     CompanyServerBootstrap,
+    CompanyServerStartupError,
     ToolAccessTemplate,
     create_company_asgi_app,
 )
+from suiteharness.web import SearchRequest, SearchResponse, WebPolicyDenied
 
 TestClient = pytest.importorskip("starlette.testclient").TestClient
 
@@ -118,10 +127,25 @@ class MutableWebSessionRevalidator:
         return self.current
 
 
+class FoundryClient:
+    async def grounded_search(self, query: str, *, count: int):  # type: ignore[no-untyped-def]
+        return [{"title": query, "url": "https://example.com", "snippet": str(count)}]
+
+
+class SearchProvider:
+    def __init__(self, provider_id: str) -> None:
+        self.provider_id = provider_id
+
+    async def search(self, request: SearchRequest) -> SearchResponse:
+        return SearchResponse(provider_id=self.provider_id, query=request.query, results=())
+
+
 def _configuration(
     tmp_path: Path,
     *,
     authentication_timeout_seconds: float = 10.0,
+    include_search_secret: bool = True,
+    search_token: str = "token",
 ) -> tuple[Path, Path]:
     config = {
         "config_version": 1,
@@ -188,8 +212,9 @@ def _configuration(
     secrets = {
         "config_version": 1,
         "web": {"web/default": {"session_signing_key": "w" * 32}},
-        "services": {"search/baidu-qianfan": {"token": "token"}},
     }
+    if include_search_secret:
+        secrets["services"] = {"search/baidu-qianfan": {"token": search_token}}
     config_path = tmp_path / "suiteharness.yaml"
     secrets_path = tmp_path / "suiteharness.secrets.yaml"
     config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -206,6 +231,9 @@ def _bootstrap(
     authenticator: CompanyAuthenticator | None = None,
     session_revalidator: MutableWebSessionRevalidator | None = None,
     authentication_timeout_seconds: float = 10.0,
+    search_access: str | None = None,
+    include_search_secret: bool = True,
+    search_token: str = "token",
 ) -> tuple[CompanyServerBootstrap, CompanyAuthenticator]:
     descriptor = ProductDescriptor(
         product_id="product-a",
@@ -217,6 +245,8 @@ def _bootstrap(
     config_path, secrets_path = _configuration(
         tmp_path,
         authentication_timeout_seconds=authentication_timeout_seconds,
+        include_search_secret=include_search_secret,
+        search_token=search_token,
     )
     bootstrap = CompanyServerBootstrap.from_files(
         config_path,
@@ -224,7 +254,15 @@ def _bootstrap(
         product_catalog=ProductCatalog([descriptor]),
         product_activators=(ProductActivator(descriptor),),
         grant_templates=(
-            ToolAccessTemplate(channel_id="web", product_id="product-a"),
+            ToolAccessTemplate(
+                channel_id="web",
+                product_id="product-a",
+                read_aliases=("suiteharness.web.search",) if search_access == "read" else (),
+                write_aliases=("suiteharness.web.search",) if search_access == "write" else (),
+                destructive_aliases=("suiteharness.web.search",)
+                if search_access == "destructive"
+                else (),
+            ),
         ),
         web_authenticator=authenticator,
         web_session_revalidator=session_revalidator,
@@ -232,6 +270,279 @@ def _bootstrap(
         sandbox_transport=process,
     )
     return bootstrap, authenticator
+
+
+def _dual_product_search_bootstrap(
+    tmp_path: Path,
+    *,
+    include_baidu_secret: bool = True,
+    include_foundry_client: bool = True,
+    foundry_client: object | None = None,
+) -> CompanyServerBootstrap:
+    config_path, secrets_path = _configuration(
+        tmp_path,
+        include_search_secret=include_baidu_secret,
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["customer_bundle"]["products"].append(
+        {"product_id": "product-b", "version": "==1.0.0", "config": {}}
+    )
+    config["web_tools"]["search"]["providers"].append(
+        {
+            "kind": "microsoft_foundry",
+        }
+    )
+    config["web_tools"]["search_providers_by_product"] = {
+        "product-a": ["baidu-qianfan"],
+        "product-b": ["microsoft-foundry-bing-grounding"],
+    }
+    config["channels"]["agent_ids"]["product-b"] = "assistant"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    descriptors = tuple(
+        ProductDescriptor(
+            product_id=product_id,
+            version="1.0.0",
+            harness_api=">=0.1,<0.2",
+            config_model=EmptyProductConfig,
+        )
+        for product_id in ("product-a", "product-b")
+    )
+    return CompanyServerBootstrap.from_files(
+        config_path,
+        secrets_path,
+        product_catalog=ProductCatalog(descriptors),
+        product_activators=tuple(ProductActivator(item) for item in descriptors),
+        grant_templates=tuple(
+            ToolAccessTemplate(
+                channel_id="web",
+                product_id=product_id,
+                read_aliases=("suiteharness.web.search",),
+            )
+            for product_id in ("product-a", "product-b")
+        ),
+        web_authenticator=CompanyAuthenticator(),
+        model_transport=ModelTransport(),  # type: ignore[arg-type]
+        sandbox_transport=ProcessTransport(),
+        foundry_clients=(
+            {}
+            if not include_foundry_client
+            else {
+                "microsoft-foundry-bing-grounding": (
+                    FoundryClient() if foundry_client is None else foundry_client
+                )
+            }
+        ),  # type: ignore[arg-type]
+    )
+
+
+def test_dual_product_bootstrap_loads_authorized_search_union_and_isolates_egress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed: list[str] = []
+
+    def provider(provider_id: str) -> SearchProvider:
+        constructed.append(provider_id)
+        return SearchProvider(provider_id)
+
+    monkeypatch.setattr(
+        "suiteharness.server.foundation.BaiduQianfanSearchProvider",
+        lambda *_args, **_kwargs: provider("baidu-qianfan"),
+    )
+    monkeypatch.setattr(
+        "suiteharness.server.foundation.MicrosoftFoundryGroundingProvider",
+        lambda *_args, **_kwargs: provider("microsoft-foundry-bing-grounding"),
+    )
+    bootstrap = _dual_product_search_bootstrap(tmp_path)
+
+    async def exercise() -> None:
+        runtime = await bootstrap.build()
+        try:
+            for provider_id in (
+                "baidu-qianfan",
+                "microsoft-foundry-bing-grounding",
+            ):
+                response = await runtime.foundation.web_tools.search.search(
+                    SearchRequest(provider_id),
+                    provider_id=provider_id,
+                )
+                assert response.provider_id == provider_id
+
+            def context(product_id: str) -> ToolCallContext:
+                scope = RequestScope(
+                    ScopePath.agent("acme", product_id, "assistant", "session-1"),
+                    "user-1",
+                    channel_id="web",
+                )
+                registration = runtime.foundation.tools.resolve(
+                    scope,
+                    "suiteharness.web.search",
+                )
+                assert registration is not None
+                return ToolCallContext(
+                    scope=scope,
+                    run_id="run-1",
+                    call_id=f"call-{product_id}",
+                    tool_identity=registration.identity,
+                    tool=registration.spec,
+                    remaining_seconds=10,
+                )
+
+            product_a = context("product-a")
+            product_b = context("product-b")
+            policy = runtime.foundation.egress_policy
+            assert policy.authorize_search(product_a, "baidu-qianfan") == "baidu-qianfan"
+            assert (
+                policy.authorize_search(product_b, "microsoft-foundry-bing-grounding")
+                == "microsoft-foundry-bing-grounding"
+            )
+            with pytest.raises(PermissionError, match="not allowed"):
+                policy.authorize_search(product_a, "microsoft-foundry-bing-grounding")
+            with pytest.raises(PermissionError, match="not allowed"):
+                policy.authorize_search(product_b, "baidu-qianfan")
+        finally:
+            await runtime.close()
+
+    asyncio.run(exercise())
+    assert set(constructed) == {
+        "baidu-qianfan",
+        "microsoft-foundry-bing-grounding",
+    }
+
+
+def test_dual_product_bootstrap_fails_when_one_authorized_search_secret_is_missing(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _dual_product_search_bootstrap(
+        tmp_path,
+        include_baidu_secret=False,
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(ValueError, match="service credentials_ref"):
+            await bootstrap.build()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("include_foundry_client", "foundry_client", "expected_error", "message"),
+    [
+        (False, None, ValueError, "has no client adapter"),
+        (True, object(), TypeError, "must implement callable grounded_search"),
+    ],
+)
+def test_authorized_foundry_requires_valid_prebound_client(
+    tmp_path: Path,
+    include_foundry_client: bool,
+    foundry_client: object | None,
+    expected_error: type[Exception],
+    message: str,
+) -> None:
+    bootstrap = _dual_product_search_bootstrap(
+        tmp_path,
+        include_foundry_client=include_foundry_client,
+        foundry_client=foundry_client,
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(expected_error, match=message):
+            await bootstrap.build()
+
+    asyncio.run(exercise())
+
+
+def test_ungranted_search_provider_is_not_initialized_without_its_secret(
+    tmp_path: Path,
+) -> None:
+    bootstrap, _authenticator = _bootstrap(
+        tmp_path,
+        ProcessTransport(),
+        include_search_secret=False,
+    )
+
+    async def exercise() -> None:
+        runtime = await bootstrap.build()
+        try:
+            with pytest.raises(WebPolicyDenied, match="not enabled"):
+                await runtime.foundation.web_tools.search.search(SearchRequest("query"))
+        finally:
+            await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_granted_search_provider_still_requires_its_secret_at_startup(
+    tmp_path: Path,
+) -> None:
+    bootstrap, _authenticator = _bootstrap(
+        tmp_path,
+        ProcessTransport(),
+        search_access="read",
+        include_search_secret=False,
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(ValueError, match="service credentials_ref"):
+            await bootstrap.build()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("search_token", ["", " \t "])
+def test_granted_search_provider_rejects_blank_token_at_startup(
+    tmp_path: Path,
+    search_token: str,
+) -> None:
+    bootstrap, _authenticator = _bootstrap(
+        tmp_path,
+        ProcessTransport(),
+        search_access="read",
+        search_token=search_token,
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(ValueError, match="search token.*missing from the secrets file"):
+            await bootstrap.build()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("search_token", ["", " \t "])
+def test_ungranted_search_provider_ignores_blank_token(
+    tmp_path: Path,
+    search_token: str,
+) -> None:
+    bootstrap, _authenticator = _bootstrap(
+        tmp_path,
+        ProcessTransport(),
+        search_token=search_token,
+    )
+
+    async def exercise() -> None:
+        runtime = await bootstrap.build()
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("search_access", ["write", "destructive"])
+def test_search_provider_rejects_nonread_grant_categories_at_startup(
+    tmp_path: Path,
+    search_access: str,
+) -> None:
+    bootstrap, _authenticator = _bootstrap(
+        tmp_path,
+        ProcessTransport(),
+        search_access=search_access,
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(CompanyServerStartupError, match="only in read_aliases"):
+            await bootstrap.build()
+
+    asyncio.run(exercise())
 
 
 def test_company_asgi_lifespan_sso_health_and_websocket(

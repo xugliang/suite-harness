@@ -110,6 +110,22 @@ def test_loader_keeps_public_and_secret_files_separate_and_redacted(tmp_path: Pa
     assert "a-very-long-server-owned-signing-key" not in loaded.secrets.model_dump_json()
 
 
+def test_loader_defers_missing_search_secret_until_runtime_grants_are_known(
+    tmp_path: Path,
+) -> None:
+    public = tmp_path / "suiteharness.yaml"
+    private = tmp_path / "suiteharness.secrets.yaml"
+    secrets = _secret_config()
+    secrets["services"] = {}
+    _write_json_yaml(public, _public_config(tmp_path / "workspaces"))
+    _write_json_yaml(private, secrets, private=True)
+
+    loaded = SuiteHarnessConfigLoader(yaml_decoder=json.loads).load(public, private)
+
+    assert loaded.secrets.services == {}
+    assert loaded.config.web_tools.search.providers[0].provider_id == "baidu-qianfan"
+
+
 def test_loader_rejects_hardlinked_public_and_secret_documents(tmp_path: Path) -> None:
     public = tmp_path / "suiteharness.yaml"
     private = tmp_path / "suiteharness.secrets.yaml"

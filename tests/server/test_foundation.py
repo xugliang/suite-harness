@@ -13,9 +13,11 @@ from suiteharness.agents import (
     ProductRoutedReActWorkflow,
 )
 from suiteharness.config import (
+    FoundrySearchConfig,
     LoadedSuiteHarnessConfig,
     SuiteHarnessConfig,
     SuiteHarnessSecrets,
+    WebSearchConfig,
     WorkspaceConfig,
 )
 from suiteharness.execution import (
@@ -28,6 +30,7 @@ from suiteharness.models import MODEL_GATEWAY
 from suiteharness.runtime import RequestScope, ScopePath
 from suiteharness.sandbox import ProcessResult
 from suiteharness.server import FoundationRuntime, FoundationStartupError
+from suiteharness.web import SearchRequest, WebPolicyDenied
 from suiteharness.workspace import (
     WorkspaceAccessDenied,
     WorkspaceOperation,
@@ -41,6 +44,11 @@ class ModelTransport:
 
     def stream(self, request) -> AsyncIterator[bytes]:  # type: ignore[no-untyped-def]
         raise AssertionError("model transport should not be called")
+
+
+class FoundryClient:
+    async def grounded_search(self, query: str, *, count: int):  # type: ignore[no-untyped-def]
+        return [{"title": query, "url": "https://example.com", "snippet": str(count)}]
 
 
 class ProcessTransport:
@@ -237,6 +245,42 @@ def test_foundation_builds_shared_services_and_channel_specific_workspace_policy
     assert (tmp_path / "state" / "sessions.sqlite3").is_file()
     assert (tmp_path / "state" / "audit.sqlite3").is_file()
     assert (tmp_path / "state" / "runtime.sqlite3").is_file()
+
+
+def test_authorized_nondefault_search_provider_is_never_promoted_to_default(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        loaded = _loaded(tmp_path)
+        foundry = FoundrySearchConfig()
+        search = WebSearchConfig(
+            default_provider="baidu-qianfan",
+            providers=(*loaded.config.web_tools.search.providers, foundry),
+        )
+        web_tools = loaded.config.web_tools.model_copy(update={"search": search})
+        loaded = replace(
+            loaded,
+            config=loaded.config.model_copy(update={"web_tools": web_tools}),
+        )
+        runtime = FoundationRuntime(
+            loaded,
+            model_transport=ModelTransport(),  # type: ignore[arg-type]
+            sandbox_transport=ProcessTransport(),
+            foundry_clients={foundry.provider_id: FoundryClient()},
+            search_provider_ids=frozenset({foundry.provider_id}),
+        )
+        try:
+            explicit = await runtime.web_tools.search.search(
+                SearchRequest("SuiteHarness", count=3),
+                provider_id=foundry.provider_id,
+            )
+            assert explicit.provider_id == foundry.provider_id
+            with pytest.raises(WebPolicyDenied, match="not enabled"):
+                await runtime.web_tools.search.search(SearchRequest("implicit"))
+        finally:
+            await runtime.close()
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize(

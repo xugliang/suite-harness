@@ -50,9 +50,53 @@ from .host import CompanyChannelRuntime, FeishuHostAdapters, WebApprovalRuntime
 
 _LOGGER = logging.getLogger(__name__)
 _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_WEB_SEARCH_TOOL_ALIAS = "suiteharness.web.search"
 _SECURITY_SINGLETON_HEADERS = frozenset(
     {"authorization", "content-length", "cookie", "origin", "transfer-encoding"}
 )
+
+
+def _reachable_search_provider_ids(
+    loaded: LoadedSuiteHarnessConfig,
+    grant_templates: tuple[ToolAccessTemplate, ...],
+    product_ids: frozenset[str],
+) -> frozenset[str]:
+    """Return the provider union reachable through current product/channel grants."""
+
+    enabled_channels: set[str] = set()
+    if loaded.config.channels.web.enabled:
+        enabled_channels.add("web")
+    if loaded.config.channels.feishu.enabled:
+        enabled_channels.add("feishu")
+
+    required: set[str] = set()
+    for template in grant_templates:
+        if template.channel_id not in enabled_channels:
+            continue
+        if _WEB_SEARCH_TOOL_ALIAS in (
+            *template.write_aliases,
+            *template.destructive_aliases,
+        ):
+            raise CompanyServerStartupError(
+                "suiteharness.web.search must appear only in read_aliases"
+            )
+        if (
+            template.product_id not in product_ids
+            or _WEB_SEARCH_TOOL_ALIAS not in template.read_aliases
+        ):
+            continue
+        providers = loaded.config.web_tools.search_providers_by_product.get(
+            template.product_id
+        )
+        if providers is None:
+            providers = frozenset({loaded.config.web_tools.search.default_provider})
+        if not providers:
+            raise CompanyServerStartupError(
+                f"Web search is granted for product {template.product_id!r} "
+                "but no search provider is authorized"
+            )
+        required.update(providers)
+    return frozenset(required)
 
 
 def _require_starlette() -> tuple[type[Any], type[Any], type[Any], type[Any]]:
@@ -333,6 +377,11 @@ class CompanyServerBootstrap:
         """Activate products, extensions and channels as one rollback-safe unit."""
 
         plan = self.resolve_plan()
+        search_provider_ids = _reachable_search_provider_ids(
+            self.loaded,
+            self.grant_templates,
+            frozenset(product.product_id for product in plan.products),
+        )
         approvals = (
             WebApprovalRuntime(timeout_seconds=self.approval_timeout_seconds)
             if self.loaded.config.channels.web.enabled
@@ -348,6 +397,7 @@ class CompanyServerBootstrap:
                 sandbox_transport=self.sandbox_transport,
                 browser_workers=self.browser_workers,
                 foundry_clients=self.foundry_clients,
+                search_provider_ids=search_provider_ids,
                 interactive_approvals=(
                     approvals.coordinator if approvals is not None else None
                 ),

@@ -30,6 +30,7 @@ from suiteharness.config import (
     LoadedSuiteHarnessConfig,
     ManagedProxyFetchConfig,
     SandboxLimitsConfig,
+    validate_secret_references,
 )
 from suiteharness.execution import (
     PROMPT_STRATEGY,
@@ -119,7 +120,7 @@ from .extensions import (
 
 
 def _secret_value(value: SecretStr | None, label: str) -> SecretStr:
-    if value is None:
+    if value is None or not value.get_secret_value().strip():
         raise ValueError(f"{label} is missing from the secrets file")
     return value
 
@@ -314,10 +315,16 @@ def _build_web_tools(
     *,
     browser_workers: Mapping[str, BrowserWorkerClient],
     foundry_clients: Mapping[str, FoundryGroundingClient],
+    search_provider_ids: frozenset[str] | None = None,
 ) -> WebToolRuntime:
     transports = _build_fetch_registry(loaded, browser_workers)
     providers: list[WebSearchProvider] = []
     for configured in loaded.config.web_tools.search.providers:
+        if (
+            search_provider_ids is not None
+            and configured.provider_id not in search_provider_ids
+        ):
+            continue
         if isinstance(configured, BaiduQianfanSearchConfig):
             credentials = loaded.secrets.services[configured.credentials_ref]
             token = credentials.token or credentials.api_key
@@ -343,10 +350,14 @@ def _build_web_tools(
             raise TypeError("unsupported search provider")
         providers.append(provider)
     default_id = loaded.config.web_tools.search.default_provider
-    default = next(item for item in providers if item.provider_id == default_id)
+    default = next(
+        (item for item in providers if item.provider_id == default_id),
+        None,
+    )
     search_registry = SearchProviderRegistry(default)
+    registered_default_id = None if default is None else default.provider_id
     for provider in providers:
-        if provider.provider_id != default_id:
+        if provider.provider_id != registered_default_id:
             search_registry.register(provider)
     return WebToolRuntime(
         search=WebSearchService(search_registry),
@@ -376,11 +387,17 @@ class FoundationRuntime:
         sandbox_transport: SandboxProcessTransport | None = None,
         browser_workers: Mapping[str, BrowserWorkerClient] | None = None,
         foundry_clients: Mapping[str, FoundryGroundingClient] | None = None,
+        search_provider_ids: frozenset[str] | None = None,
         interactive_approvals: InteractiveApprovalCoordinator | None = None,
         plugin_adapters: PluginHostAdapters | None = None,
         mcp_adapters: McpHostAdapters | None = None,
     ) -> None:
         self.config = loaded.config
+        validate_secret_references(
+            loaded.config,
+            loaded.secrets,
+            search_provider_ids=search_provider_ids,
+        )
         self._selected_products = frozenset(
             item.product_id for item in self.config.customer_bundle.products
         )
@@ -428,6 +445,7 @@ class FoundationRuntime:
             loaded,
             browser_workers=browser_workers or {},
             foundry_clients=foundry_clients or {},
+            search_provider_ids=search_provider_ids,
         )
         self.sessions = SQLiteSessionStore(
             self.config.storage.sessions_path(),
@@ -510,6 +528,7 @@ class FoundationRuntime:
         sandbox_transport: SandboxProcessTransport | None = None,
         browser_workers: Mapping[str, BrowserWorkerClient] | None = None,
         foundry_clients: Mapping[str, FoundryGroundingClient] | None = None,
+        search_provider_ids: frozenset[str] | None = None,
         interactive_approvals: InteractiveApprovalCoordinator | None = None,
         plugin_adapters: PluginHostAdapters | None = None,
         mcp_adapters: McpHostAdapters | None = None,
@@ -525,6 +544,7 @@ class FoundationRuntime:
                 sandbox_transport=sandbox_transport,
                 browser_workers=browser_workers,
                 foundry_clients=foundry_clients,
+                search_provider_ids=search_provider_ids,
                 interactive_approvals=interactive_approvals,
                 plugin_adapters=plugin_adapters,
                 mcp_adapters=mcp_adapters,

@@ -196,6 +196,10 @@ class MicrosoftFoundryGroundingProvider:
     """Foundry Grounding with Bing Search adapter, not the retired Bing REST API."""
 
     def __init__(self, client: FoundryGroundingClient) -> None:
+        if not callable(getattr(client, "grounded_search", None)):
+            raise TypeError(
+                "Foundry grounding client must implement callable grounded_search"
+            )
         self._client = client
 
     @property
@@ -212,9 +216,11 @@ class MicrosoftFoundryGroundingProvider:
 
 
 class SearchProviderRegistry:
-    def __init__(self, default: WebSearchProvider) -> None:
-        self._default = default.provider_id
-        self._items: dict[str, WebSearchProvider] = {default.provider_id: default}
+    def __init__(self, default: WebSearchProvider | None = None) -> None:
+        self._default = None if default is None else default.provider_id
+        self._items: dict[str, WebSearchProvider] = (
+            {} if default is None else {default.provider_id: default}
+        )
 
     def register(self, provider: WebSearchProvider) -> None:
         if provider.provider_id in self._items:
@@ -223,6 +229,8 @@ class SearchProviderRegistry:
 
     def resolve(self, provider_id: str | None = None) -> WebSearchProvider:
         selected = provider_id or self._default
+        if selected is None:
+            raise WebPolicyDenied("Web search is not enabled for this deployment")
         try:
             return self._items[selected]
         except KeyError as exc:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Collection
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -750,34 +751,6 @@ class FoundrySearchConfig(_FrozenConfig):
     provider_id: Literal["microsoft-foundry-bing-grounding"] = (
         "microsoft-foundry-bing-grounding"
     )
-    credentials_ref: str
-    project_endpoint: str
-    connection_id: str
-
-    @field_validator("connection_id")
-    @classmethod
-    def validate_connection_id(cls, value: str) -> str:
-        if not value.strip() or len(value) > 2048 or "\x00" in value:
-            raise ValueError("Foundry connection_id must be a bounded non-blank identifier")
-        return value
-
-    @field_validator("credentials_ref")
-    @classmethod
-    def validate_credentials_ref(cls, value: str) -> str:
-        return _secret_ref(value, "Foundry credentials_ref")
-
-    @field_validator("project_endpoint")
-    @classmethod
-    def validate_project_endpoint(cls, value: str) -> str:
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme != "https"
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-        ):
-            raise ValueError("Foundry project_endpoint must be an absolute HTTPS URL")
-        return value
 
 
 SearchProviderConfig = Annotated[
@@ -1279,8 +1252,19 @@ class SuiteHarnessSecrets(_FrozenConfig):
         return value
 
 
-def validate_secret_references(config: SuiteHarnessConfig, secrets: SuiteHarnessSecrets) -> None:
-    """Validate cross-file credential references without exposing secret values."""
+def validate_secret_references(
+    config: SuiteHarnessConfig,
+    secrets: SuiteHarnessSecrets,
+    *,
+    search_provider_ids: Collection[str] | None = None,
+) -> None:
+    """Validate cross-file credential references without exposing secret values.
+
+    Search providers are activated from trusted tool grants at server startup.
+    Passing an explicit collection validates only providers reachable through
+    those grants; ``None`` preserves the conservative all-provider behaviour
+    for direct callers.
+    """
 
     if config.channels.web.enabled:
         ref = config.channels.web.credentials_ref
@@ -1305,9 +1289,21 @@ def validate_secret_references(config: SuiteHarnessConfig, secrets: SuiteHarness
             raise ValueError(
                 f"model credentials_ref {profile.credentials_ref!r} was not found in the secrets file"
             )
+    configured_search = {
+        provider.provider_id: provider for provider in config.web_tools.search.providers
+    }
+    selected_search = (
+        set(configured_search) if search_provider_ids is None else set(search_provider_ids)
+    )
+    if unknown_search := selected_search - set(configured_search):
+        raise ValueError(
+            f"authorized search providers were not configured: {sorted(unknown_search)!r}"
+        )
     service_refs: set[str] = set()
-    for provider in config.web_tools.search.providers:
-        service_refs.add(provider.credentials_ref)
+    for provider_id in selected_search:
+        provider = configured_search[provider_id]
+        if isinstance(provider, BaiduQianfanSearchConfig):
+            service_refs.add(provider.credentials_ref)
     for route in config.web_tools.fetch.routes:
         ref = getattr(route, "credentials_ref", None)
         if ref is not None:
