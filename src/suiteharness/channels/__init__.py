@@ -1,6 +1,7 @@
 """Company channel identities and root-owned tool authorization policy."""
 
 from .approvals import ApprovalChallenge, ApprovalPublisher, InteractiveApprovalCoordinator
+from .attachments import AttachmentContentBuilder, AttachmentResolver, ResolvedAttachment
 from .auth import CompanyIdentity, CompanyIdentityDirectory, FeishuCompanyAuthenticator
 from .gateway import (
     ChannelAdmissionError,
@@ -26,6 +27,8 @@ __all__ = [
     "ApprovalChallenge",
     "ApprovalPublisher",
     "AuthenticatedPrincipal",
+    "AttachmentContentBuilder",
+    "AttachmentResolver",
     "ChannelAdmissionError",
     "ChannelApplication",
     "ChannelAttachment",
@@ -44,5 +47,6 @@ __all__ = [
     "PrincipalAuthenticator",
     "ProductAccessAuthorizer",
     "ProductRouter",
+    "ResolvedAttachment",
     "WorkspaceWriteRule",
 ]

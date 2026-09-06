@@ -41,6 +41,7 @@ from suiteharness.execution import (
     SQLiteAuditJournal,
 )
 from suiteharness.models import (
+    MODEL_GATEWAY,
     BedrockConverseAdapter,
     Boto3BedrockRuntimeClient,
     GoogleAuthTokenProvider,
@@ -406,6 +407,8 @@ class FoundationRuntime:
                     image=sandbox_config.image,
                     allowed_host_roots=(self.config.workspace.root,),
                     binary=sandbox_config.binary,
+                    context=sandbox_config.context,
+                    require_rootless=sandbox_config.require_rootless,
                     production=self.config.deployment.environment == "production",
                     egress_networks=sandbox_config.network.egress_profiles,
                 ),
@@ -441,6 +444,7 @@ class FoundationRuntime:
         root = RootContext(
             bindings=ServiceBindings.root(
                 {
+                    MODEL_GATEWAY: self.models.gateway,
                     WORKFLOW: ProductRoutedReActWorkflow(
                         gateway=self.models.gateway,
                         routes=self.models,

@@ -261,6 +261,19 @@ class ProviderCapabilities(_FrozenModel):
     max_context_tokens: int | None = Field(default=None, ge=1)
 
 
+class ModelCapabilities(_FrozenModel):
+    """Explicit per-model differences; omitted fields retain provider defaults."""
+
+    streaming: bool | None = None
+    tools: bool | None = None
+    parallel_tool_calls: bool | None = None
+    json_schema: bool | None = None
+    reasoning: bool | None = None
+    vision: bool | None = None
+    documents: bool | None = None
+    max_context_tokens: int | None = Field(default=None, ge=1)
+
+
 class ProviderDescriptor(_FrozenModel):
     provider_id: str
     display_name: str
@@ -306,6 +319,24 @@ class ModelProfile(_FrozenModel):
     default_headers: dict[str, str] = Field(default_factory=dict)
     provider_options: dict[str, JsonValue] = Field(default_factory=dict)
     allow_plain_http: bool = False
+    capabilities: ModelCapabilities = Field(default_factory=ModelCapabilities)
+    allow_capability_overrides: bool = False
+
+    def effective_capabilities(self, provider: ProviderCapabilities) -> ProviderCapabilities:
+        values = provider.model_dump()
+        for name, value in self.capabilities.model_dump(exclude_none=True).items():
+            inherited = values[name]
+            if name == "max_context_tokens":
+                elevation = inherited is not None and value > inherited
+            else:
+                elevation = value is True and inherited is False
+            if elevation and not self.allow_capability_overrides:
+                raise ValueError(
+                    f"profile {self.profile_id!r} capability {name!r} exceeds provider defaults; "
+                    "an explicit allow_capability_overrides=true is required"
+                )
+            values[name] = value
+        return ProviderCapabilities.model_validate(values)
 
     @field_validator("profile_id", "provider_id")
     @classmethod
@@ -330,6 +361,8 @@ class ModelProfile(_FrozenModel):
 
     @model_validator(mode="after")
     def endpoint_security(self) -> ModelProfile:
+        if self.allow_capability_overrides and self.allowed_models - {self.model}:
+            raise ValueError("capability overrides require one exact model per profile")
         if self.base_url is None:
             return self
         parsed = urlparse(self.base_url)

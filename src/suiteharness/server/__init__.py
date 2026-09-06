@@ -28,6 +28,7 @@ from .asgi import (
     CompanyServerReadiness,
     CompanyServerRuntime,
     CompanyServerStartupError,
+    WebSocketSessionRevalidator,
     create_company_asgi_app,
 )
 from .extensions import (
@@ -100,6 +101,7 @@ __all__ = [
     "ToolAccessTemplate",
     "WebToolRuntime",
     "WebApprovalRuntime",
+    "WebSocketSessionRevalidator",
     "default_run_input",
     "create_company_asgi_app",
 ]

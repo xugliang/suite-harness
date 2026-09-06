@@ -24,6 +24,7 @@ from suiteharness.execution import (
     WORKFLOW,
     ToolCallContext,
 )
+from suiteharness.models import MODEL_GATEWAY
 from suiteharness.runtime import RequestScope, ScopePath
 from suiteharness.sandbox import ProcessResult
 from suiteharness.server import FoundationRuntime, FoundationStartupError
@@ -223,6 +224,7 @@ def test_foundation_builds_shared_services_and_channel_specific_workspace_policy
             runtime.models.product_routes["sales"] = "changed"  # type: ignore[index]
         assert len(runtime.builtins.identities) == 9
         assert isinstance(runtime.kernel.root.resolve(WORKFLOW), ProductRoutedReActWorkflow)
+        assert runtime.kernel.root.resolve(MODEL_GATEWAY) is runtime.models.gateway
         assert isinstance(runtime.kernel.root.resolve(PROMPT_STRATEGY), DefaultPromptStrategy)
         assert isinstance(runtime.kernel.root.resolve(REFLECTION_STRATEGY), NoOpReflectionStrategy)
         await runtime.close()

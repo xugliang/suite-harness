@@ -48,10 +48,32 @@ class WebSocketConnection(Protocol):
 
 
 class WebSocketAuthenticator(Protocol):
-    """Authenticate only company-managed server credentials from the handshake."""
+    """Authenticate only company-managed server credentials from the handshake.
+
+    The server invokes this method both at the handshake and before every later
+    client frame.  Implementations must therefore re-check time-bounded ticket
+    claims instead of caching a successful result for the connection lifetime.
+    """
 
     async def authenticate(
         self, handshake: WebSocketHandshake
+    ) -> AuthenticatedPrincipal | None: ...
+
+
+class WebSocketSessionRevalidator(Protocol):
+    """Revalidate mutable company session and directory state for one socket.
+
+    Deployments can use the original handshake credential (for example, a
+    digest of its bearer ticket) to enforce logout/revocation, then resolve the
+    principal again to detect account disablement or role changes.  Returning
+    ``None`` revokes the connection.  The server requires an exact match with
+    the identity established at the handshake.
+    """
+
+    async def revalidate(
+        self,
+        handshake: WebSocketHandshake,
+        established_principal: AuthenticatedPrincipal,
     ) -> AuthenticatedPrincipal | None: ...
 
 
@@ -114,6 +136,13 @@ class OriginPolicy:
 FrameSender = Callable[[ServerFrame], Awaitable[None]]
 
 
+class _SessionAuthenticationFailure(Exception):
+    def __init__(self, *, close_code: int, reason: str) -> None:
+        super().__init__(reason)
+        self.close_code = close_code
+        self.reason = reason
+
+
 class WebSocketApprovalHub:
     """Route exact-call approval challenges to active sockets of that principal."""
 
@@ -171,9 +200,14 @@ class WebSocketSession:
         *,
         connection_id: str,
         principal: AuthenticatedPrincipal,
+        handshake: WebSocketHandshake,
+        authenticator: WebSocketAuthenticator,
+        revalidator: WebSocketSessionRevalidator | None,
         dispatcher: WebSocketDispatcher,
         approvals: InteractiveApprovalCoordinator,
         approval_hub: WebSocketApprovalHub,
+        authentication_timeout_seconds: float = 10.0,
+        session_revalidation_interval_seconds: float = 30.0,
         max_frame_bytes: int = 1_048_576,
         max_outbound_bytes: int = 1_048_576,
         max_concurrent_messages: int = 4,
@@ -183,12 +217,31 @@ class WebSocketSession:
             raise ValueError("WebSocket frame limits must be positive")
         if max_concurrent_messages <= 0 or max_messages_per_connection <= 0:
             raise ValueError("WebSocket message limits must be positive")
+        if (
+            isinstance(authentication_timeout_seconds, bool)
+            or not isinstance(authentication_timeout_seconds, int | float)
+            or not (0 < authentication_timeout_seconds <= 60)
+        ):
+            raise ValueError("WebSocket authentication timeout must be in (0, 60]")
+        if (
+            isinstance(session_revalidation_interval_seconds, bool)
+            or not isinstance(session_revalidation_interval_seconds, int | float)
+            or not (0 < session_revalidation_interval_seconds <= 300)
+        ):
+            raise ValueError("WebSocket session revalidation interval must be in (0, 300]")
         self._connection = connection
         self._connection_id = connection_id
         self._principal = principal
+        self._handshake = handshake
+        self._authenticator = authenticator
+        self._revalidator = revalidator
         self._dispatcher = dispatcher
         self._approvals = approvals
         self._approval_hub = approval_hub
+        self._authentication_timeout = float(authentication_timeout_seconds)
+        self._session_revalidation_interval = float(
+            session_revalidation_interval_seconds
+        )
         self._max_frame_bytes = max_frame_bytes
         self._max_outbound_bytes = max_outbound_bytes
         self._max_concurrent = max_concurrent_messages
@@ -206,9 +259,10 @@ class WebSocketSession:
         )
         try:
             while True:
-                packet = await self._connection.receive()
+                packet = await self._receive_with_periodic_revalidation()
                 if packet.kind is WebSocketPacketKind.DISCONNECT:
                     break
+                await self._revalidate_session()
                 if packet.kind is WebSocketPacketKind.BINARY:
                     raise WebSocketProtocolError(
                         "binary_not_supported",
@@ -222,6 +276,9 @@ class WebSocketSession:
                     )
                 frame = parse_client_frame(packet.text)
                 await self._handle_frame(frame)
+        except _SessionAuthenticationFailure as exc:
+            await self._cancel_runs()
+            await self._connection.close(code=exc.close_code, reason=exc.reason)
         except WebSocketProtocolError as exc:
             try:
                 await self._send_frame(ErrorFrame(code=exc.code, message=str(exc)))
@@ -233,12 +290,71 @@ class WebSocketSession:
                 self._principal.principal_id,
                 self._connection_id,
             )
-            running = tuple(self._runs.values())
-            for task in running:
-                task.cancel()
-            if running:
-                await asyncio.gather(*running, return_exceptions=True)
-            self._runs.clear()
+            await self._cancel_runs()
+
+    async def _receive_with_periodic_revalidation(self) -> WebSocketPacket:
+        """Keep one receive alive while periodically enforcing ticket revocation."""
+
+        receive_task = asyncio.create_task(
+            self._connection.receive(),
+            name=f"suiteharness-web-receive-{self._connection_id}",
+        )
+        try:
+            while True:
+                done, _pending = await asyncio.wait(
+                    {receive_task},
+                    timeout=self._session_revalidation_interval,
+                )
+                if receive_task in done:
+                    return receive_task.result()
+                await self._revalidate_session()
+        finally:
+            if not receive_task.done():
+                receive_task.cancel()
+                await asyncio.gather(receive_task, return_exceptions=True)
+
+    async def _revalidate_session(self) -> None:
+        try:
+            async with asyncio.timeout(self._authentication_timeout):
+                ticket_principal = await self._authenticator.authenticate(self._handshake)
+                self._require_unchanged_principal(ticket_principal)
+                if self._revalidator is None:
+                    return
+                current_principal = await self._revalidator.revalidate(
+                    self._handshake,
+                    self._principal,
+                )
+                self._require_unchanged_principal(current_principal)
+        except _SessionAuthenticationFailure:
+            raise
+        except Exception as exc:
+            raise _SessionAuthenticationFailure(
+                close_code=1011,
+                reason="authentication_unavailable",
+            ) from exc
+
+    def _require_unchanged_principal(
+        self,
+        current: AuthenticatedPrincipal | None,
+    ) -> None:
+        if not isinstance(current, AuthenticatedPrincipal):
+            raise _SessionAuthenticationFailure(
+                close_code=4401,
+                reason="authentication_failed",
+            )
+        if current != self._principal:
+            raise _SessionAuthenticationFailure(
+                close_code=4401,
+                reason="authentication_changed",
+            )
+
+    async def _cancel_runs(self) -> None:
+        running = tuple(self._runs.values())
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        self._runs.clear()
 
     async def _handle_frame(
         self,
@@ -349,11 +465,14 @@ class EnterpriseWebSocketServer:
         *,
         tenant_id: str,
         authenticator: WebSocketAuthenticator,
+        session_revalidator: WebSocketSessionRevalidator | None = None,
         origin_policy: OriginPolicy,
         dispatcher: WebSocketDispatcher,
         approvals: InteractiveApprovalCoordinator,
         approval_hub: WebSocketApprovalHub,
         subprotocol: str = "suiteharness.v1",
+        authentication_timeout_seconds: float = 10.0,
+        session_revalidation_interval_seconds: float = 30.0,
         max_frame_bytes: int = 1_048_576,
         max_outbound_bytes: int = 1_048_576,
         max_concurrent_messages: int = 4,
@@ -363,13 +482,36 @@ class EnterpriseWebSocketServer:
             raise ValueError("invalid WebSocket deployment tenant_id")
         if not subprotocol or len(subprotocol) > 128 or any(char.isspace() for char in subprotocol):
             raise ValueError("invalid WebSocket subprotocol")
+        if (
+            isinstance(authentication_timeout_seconds, bool)
+            or not isinstance(authentication_timeout_seconds, int | float)
+            or not (0 < authentication_timeout_seconds <= 60)
+        ):
+            raise ValueError("WebSocket authentication timeout must be in (0, 60]")
+        if (
+            isinstance(session_revalidation_interval_seconds, bool)
+            or not isinstance(session_revalidation_interval_seconds, int | float)
+            or not (0 < session_revalidation_interval_seconds <= 300)
+        ):
+            raise ValueError("WebSocket session revalidation interval must be in (0, 300]")
+        if not callable(getattr(authenticator, "authenticate", None)):
+            raise TypeError("authenticator must implement async authenticate")
+        if session_revalidator is not None and not callable(
+            getattr(session_revalidator, "revalidate", None)
+        ):
+            raise TypeError("session_revalidator must implement async revalidate")
         self._authenticator = authenticator
+        self._session_revalidator = session_revalidator
         self._tenant_id = tenant_id
         self._origin_policy = origin_policy
         self._dispatcher = dispatcher
         self._approvals = approvals
         self._approval_hub = approval_hub
         self._subprotocol = subprotocol
+        self._authentication_timeout = float(authentication_timeout_seconds)
+        self._session_revalidation_interval = float(
+            session_revalidation_interval_seconds
+        )
         self._limits = (
             max_frame_bytes,
             max_outbound_bytes,
@@ -389,11 +531,12 @@ class EnterpriseWebSocketServer:
             await connection.close(code=4403, reason="origin_not_allowed")
             return
         try:
-            principal = await self._authenticator.authenticate(handshake)
+            async with asyncio.timeout(self._authentication_timeout):
+                principal = await self._authenticator.authenticate(handshake)
         except Exception:
             await connection.close(code=1011, reason="authentication_unavailable")
             return
-        if principal is None:
+        if not isinstance(principal, AuthenticatedPrincipal):
             await connection.close(code=4401, reason="authentication_failed")
             return
         if principal.tenant_id != self._tenant_id:
@@ -410,9 +553,14 @@ class EnterpriseWebSocketServer:
             connection,
             connection_id=connection_id,
             principal=principal,
+            handshake=handshake,
+            authenticator=self._authenticator,
+            revalidator=self._session_revalidator,
             dispatcher=self._dispatcher,
             approvals=self._approvals,
             approval_hub=self._approval_hub,
+            authentication_timeout_seconds=self._authentication_timeout,
+            session_revalidation_interval_seconds=self._session_revalidation_interval,
             max_frame_bytes=self._limits[0],
             max_outbound_bytes=self._limits[1],
             max_concurrent_messages=self._limits[2],
@@ -448,5 +596,6 @@ __all__ = [
     "WebSocketAuthenticator",
     "WebSocketConnection",
     "WebSocketDispatcher",
+    "WebSocketSessionRevalidator",
     "WebSocketSession",
 ]

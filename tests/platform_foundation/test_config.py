@@ -110,6 +110,115 @@ def test_loader_keeps_public_and_secret_files_separate_and_redacted(tmp_path: Pa
     assert "a-very-long-server-owned-signing-key" not in loaded.secrets.model_dump_json()
 
 
+def test_loader_rejects_hardlinked_public_and_secret_documents(tmp_path: Path) -> None:
+    public = tmp_path / "suiteharness.yaml"
+    private = tmp_path / "suiteharness.secrets.yaml"
+    _write_json_yaml(public, _public_config(tmp_path / "workspaces"), private=True)
+    os.link(public, private)
+
+    with pytest.raises(ConfigLoadError, match="separate files"):
+        SuiteHarnessConfigLoader(yaml_decoder=json.loads).load(public, private)
+
+
+def test_loader_rejects_symbolic_link_document(tmp_path: Path) -> None:
+    target = tmp_path / "actual.yaml"
+    public = tmp_path / "suiteharness.yaml"
+    private = tmp_path / "suiteharness.secrets.yaml"
+    _write_json_yaml(target, _public_config(tmp_path / "workspaces"))
+    try:
+        public.symlink_to(target)
+    except OSError:
+        pytest.skip("symbolic links are unavailable to this test process")
+    _write_json_yaml(private, _secret_config(), private=True)
+
+    with pytest.raises(ConfigLoadError, match="symbolic link"):
+        SuiteHarnessConfigLoader(yaml_decoder=json.loads).load(public, private)
+
+
+def test_production_loader_rejects_example_placeholders(tmp_path: Path) -> None:
+    public = tmp_path / "suiteharness.yaml"
+    private = tmp_path / "suiteharness.secrets.yaml"
+    raw = _public_config(tmp_path / "workspaces")
+    raw["deployment"]["environment"] = "production"  # type: ignore[index]
+    raw["sandbox"]["image"] = "registry.acme.cn/sandbox@sha256:" + "a" * 64  # type: ignore[index]
+    raw["channels"]["web"]["allowed_origins"] = ["https://assistant.acme.cn"]  # type: ignore[index]
+    profile = raw["models"]["profiles"][0]  # type: ignore[index]
+    profile["model"] = "replace-with-approved-model"  # type: ignore[index]
+    _write_json_yaml(public, raw)
+    _write_json_yaml(private, _secret_config(), private=True)
+
+    with pytest.raises(ConfigLoadError, match="placeholder"):
+        SuiteHarnessConfigLoader(yaml_decoder=json.loads).load(public, private)
+
+    profile["model"] = "qwen3"  # type: ignore[index]
+    raw["sandbox"]["image"] = "registry.acme.cn/sandbox@sha256:" + "0" * 64  # type: ignore[index]
+    _write_json_yaml(public, raw)
+    with pytest.raises(ConfigLoadError, match="all-zero"):
+        SuiteHarnessConfigLoader(yaml_decoder=json.loads).load(public, private)
+
+    raw["sandbox"]["image"] = "registry.example.com/sandbox@sha256:" + "a" * 64  # type: ignore[index]
+    _write_json_yaml(public, raw)
+    with pytest.raises(ConfigLoadError, match="reserved example hostname"):
+        SuiteHarnessConfigLoader(yaml_decoder=json.loads).load(public, private)
+
+    raw["sandbox"]["image"] = "registry.acme.cn/sandbox@sha256:" + "a" * 64  # type: ignore[index]
+    profile["base_url"] = None  # type: ignore[index]
+    _write_json_yaml(public, raw)
+    loaded = SuiteHarnessConfigLoader(yaml_decoder=json.loads).load(public, private)
+    assert loaded.config.models.profiles[0].base_url is None
+
+
+def test_production_loader_rejects_placeholder_and_dummy_secrets(tmp_path: Path) -> None:
+    public = tmp_path / "suiteharness.yaml"
+    private = tmp_path / "suiteharness.secrets.yaml"
+    raw = _public_config(tmp_path / "workspaces")
+    raw["deployment"]["environment"] = "production"  # type: ignore[index]
+    raw["sandbox"]["image"] = "registry.acme.cn/sandbox@sha256:" + "a" * 64  # type: ignore[index]
+    raw["channels"]["web"]["allowed_origins"] = ["https://assistant.acme.cn"]  # type: ignore[index]
+    _write_json_yaml(public, raw)
+
+    secrets = _secret_config()
+    secrets["services"]["search/baidu-qianfan"]["token"] = "replace-with-token"  # type: ignore[index]
+    _write_json_yaml(private, secrets, private=True)
+    with pytest.raises(ConfigLoadError, match="placeholder"):
+        SuiteHarnessConfigLoader(yaml_decoder=json.loads).load(public, private)
+
+    secrets["services"]["search/baidu-qianfan"]["token"] = "A" * 32  # type: ignore[index]
+    _write_json_yaml(private, secrets, private=True)
+    with pytest.raises(ConfigLoadError, match="dummy"):
+        SuiteHarnessConfigLoader(yaml_decoder=json.loads).load(public, private)
+
+
+def test_model_capabilities_flow_from_config_to_runtime_profile(tmp_path: Path) -> None:
+    raw = _public_config(tmp_path / "workspaces")
+    profile = raw["models"]["profiles"][0]  # type: ignore[index]
+    profile.update(  # type: ignore[union-attr]
+        {
+            "provider_id": "dashscope",
+            "model": "qwen-vl-exact",
+            "allowed_models": ["qwen-vl-exact"],
+            "capabilities": {"vision": True, "json_schema": True},
+            "allow_capability_overrides": True,
+        }
+    )
+
+    config = SuiteHarnessConfig.model_validate(raw)
+    runtime = config.models.profiles[0].to_runtime()
+
+    assert runtime.capabilities.vision is True
+    assert runtime.capabilities.json_schema is True
+    assert runtime.allow_capability_overrides is True
+
+
+def test_model_capabilities_reject_unknown_config_fields(tmp_path: Path) -> None:
+    raw = _public_config(tmp_path / "workspaces")
+    profile = raw["models"]["profiles"][0]  # type: ignore[index]
+    profile["capabilities"] = {"imaginary": True}  # type: ignore[index]
+
+    with pytest.raises(ValidationError, match="imaginary"):
+        SuiteHarnessConfig.model_validate(raw)
+
+
 def test_default_loader_accepts_normal_yaml_syntax(tmp_path: Path) -> None:
     pytest.importorskip("yaml")
     public = tmp_path / "suiteharness.yaml"
@@ -266,15 +375,50 @@ def test_production_requires_digest_https_origin_and_at_least_one_channel(
         SuiteHarnessConfig.model_validate(raw)
 
 
+def test_docker_sandbox_context_is_explicit_and_strict(tmp_path: Path) -> None:
+    raw = _public_config(tmp_path / "workspaces")
+    raw["sandbox"]["context"] = "suiteharness-rootless"  # type: ignore[index]
+    raw["sandbox"]["require_rootless"] = True  # type: ignore[index]
+    parsed = SuiteHarnessConfig.model_validate(raw)
+    assert parsed.sandbox.context == "suiteharness-rootless"  # type: ignore[union-attr]
+    assert parsed.sandbox.require_rootless is True  # type: ignore[union-attr]
+
+    raw["sandbox"]["require_rootless"] = "true"  # type: ignore[index]
+    with pytest.raises(ValidationError, match="require_rootless"):
+        SuiteHarnessConfig.model_validate(raw)
+    raw["sandbox"]["require_rootless"] = True  # type: ignore[index]
+
+    for unsafe in ("", "bad context", "--host", "bad/context", "x" * 129):
+        raw["sandbox"]["context"] = unsafe  # type: ignore[index]
+        with pytest.raises(ValidationError, match="context"):
+            SuiteHarnessConfig.model_validate(raw)
+
+    raw["sandbox"]["context"] = "suiteharness-rootless"  # type: ignore[index]
+    raw["sandbox"]["image"] = "--help@sha256:" + "a" * 64  # type: ignore[index]
+    with pytest.raises(ValidationError, match="image"):
+        SuiteHarnessConfig.model_validate(raw)
+
+def test_production_cannot_disable_secure_websocket_cookie(tmp_path: Path) -> None:
+    raw = _public_config(tmp_path / "workspaces")
+    raw["deployment"]["environment"] = "production"  # type: ignore[index]
+    raw["channels"]["web"]["allowed_origins"] = ["https://assistant.acme.cn"]  # type: ignore[index]
+    raw["sandbox"]["image"] = "registry.example/suiteharness@sha256:" + "a" * 64  # type: ignore[index]
+    raw["channels"]["web"]["session_cookie_secure"] = False  # type: ignore[index]
+    with pytest.raises(ValidationError, match="cookies must use Secure"):
+        SuiteHarnessConfig.model_validate(raw)
+
+
 def test_web_authentication_and_protocol_frame_limits_are_hard_bounded(
     tmp_path: Path,
 ) -> None:
     raw = _public_config(tmp_path / "workspaces")
     web = raw["channels"]["web"]  # type: ignore[index]
     web["authentication_timeout_seconds"] = 60
+    web["session_revalidation_interval_seconds"] = 30
     web["max_frame_bytes"] = 1_048_576
     parsed = SuiteHarnessConfig.model_validate(raw)
     assert parsed.channels.web.authentication_timeout_seconds == 60
+    assert parsed.channels.web.session_revalidation_interval_seconds == 30
     assert parsed.channels.web.max_frame_bytes == 1_048_576
 
     web["authentication_timeout_seconds"] = 60.01
@@ -287,6 +431,17 @@ def test_web_authentication_and_protocol_frame_limits_are_hard_bounded(
             SuiteHarnessConfig.model_validate(raw)
 
     web["authentication_timeout_seconds"] = 10
+    for invalid in (True, "30", 0, 300.01):
+        web["session_revalidation_interval_seconds"] = invalid
+        with pytest.raises(ValidationError):
+            SuiteHarnessConfig.model_validate(raw)
+
+    web["session_revalidation_interval_seconds"] = 31
+    web["session_lifetime_seconds"] = 30
+    with pytest.raises(ValidationError, match="revalidation interval"):
+        SuiteHarnessConfig.model_validate(raw)
+
+    web["session_revalidation_interval_seconds"] = 30
     web["max_frame_bytes"] = 2_097_152
     with pytest.raises(ValidationError):
         SuiteHarnessConfig.model_validate(raw)
@@ -364,6 +519,8 @@ def test_feishu_is_non_interactive_read_only_by_default_and_never_deletes(
     parsed = SuiteHarnessConfig.model_validate(raw)
     assert parsed.channels.feishu.default_access == "read_only"
     assert parsed.channels.feishu.authentication_timeout_seconds == 10
+    assert parsed.channels.feishu.event_processing_timeout_seconds == 600
+    assert parsed.channels.feishu.event_processing_lease_seconds == 660
 
     raw["channels"]["feishu"]["authentication_timeout_seconds"] = 60  # type: ignore[index]
     parsed_at_maximum = SuiteHarnessConfig.model_validate(raw)
@@ -372,10 +529,24 @@ def test_feishu_is_non_interactive_read_only_by_default_and_never_deletes(
         raw["channels"]["feishu"]["authentication_timeout_seconds"] = invalid  # type: ignore[index]
         with pytest.raises(ValidationError):
             SuiteHarnessConfig.model_validate(raw)
+    raw["channels"]["feishu"]["authentication_timeout_seconds"] = 10  # type: ignore[index]
+    raw["channels"]["feishu"]["event_processing_timeout_seconds"] = 900  # type: ignore[index]
+    raw["channels"]["feishu"]["event_processing_lease_seconds"] = 901  # type: ignore[index]
+    custom_processing = SuiteHarnessConfig.model_validate(raw)
+    assert custom_processing.channels.feishu.event_processing_timeout_seconds == 900
+    assert custom_processing.channels.feishu.event_processing_lease_seconds == 901
+
+    for timeout, lease in ((600, 600), (601, 600), (True, 660), (600, "660")):
+        raw["channels"]["feishu"]["event_processing_timeout_seconds"] = timeout  # type: ignore[index]
+        raw["channels"]["feishu"]["event_processing_lease_seconds"] = lease  # type: ignore[index]
+        with pytest.raises(ValidationError):
+            SuiteHarnessConfig.model_validate(raw)
     assert parsed.channels.feishu.interactive_approval is False
     assert parsed.channels.feishu.allow_delete is False
 
     raw["channels"]["feishu"]["authentication_timeout_seconds"] = 10  # type: ignore[index]
+    raw["channels"]["feishu"]["event_processing_timeout_seconds"] = 600  # type: ignore[index]
+    raw["channels"]["feishu"]["event_processing_lease_seconds"] = 660  # type: ignore[index]
     raw["channels"]["feishu"]["allow_delete"] = True  # type: ignore[index]
     with pytest.raises(ValidationError):
         SuiteHarnessConfig.model_validate(raw)

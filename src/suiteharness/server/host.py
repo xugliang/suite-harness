@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -37,6 +38,7 @@ from suiteharness.channels.websocket import (
     OriginPolicy,
     ServerSessionWebSocketAuthenticator,
     WebSocketApprovalHub,
+    WebSocketSessionRevalidator,
     create_starlette_websocket_route,
 )
 from suiteharness.config import LoadedSuiteHarnessConfig
@@ -158,6 +160,7 @@ class FeishuHostAdapters:
     directory: CompanyIdentityDirectory
     outbound_sink: OutboundSink
     bot_open_id: str | None = None
+    default_product_id: str | None = None
     webhook_decryptor: RawEventDecryptor | None = None
     long_connection_sdk: FeishuLongConnectionSdk | None = None
 
@@ -166,6 +169,10 @@ class FeishuHostAdapters:
             raise TypeError("Feishu directory must implement resolve_feishu_identity")
         if not callable(self.outbound_sink):
             raise TypeError("Feishu outbound_sink must be callable")
+        if self.default_product_id is not None and not re.fullmatch(
+            r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*", self.default_product_id
+        ):
+            raise ValueError("Feishu default_product_id is invalid")
         if self.webhook_decryptor is not None and not callable(
             getattr(self.webhook_decryptor, "decrypt", None)
         ):
@@ -206,6 +213,7 @@ class CompanyChannelRuntime:
         grant_templates: tuple[ToolAccessTemplate, ...],
         web_approvals: WebApprovalRuntime | None = None,
         web_conversation_authorizer: ConversationAuthorizer | None = None,
+        web_session_revalidator: WebSocketSessionRevalidator | None = None,
         product_access_authorizer: ProductAccessAuthorizer | None = None,
         feishu_adapters: FeishuHostAdapters | None = None,
         mcp_grant_material: Mapping[str, McpGrantMaterial] | None = None,
@@ -239,6 +247,7 @@ class CompanyChannelRuntime:
                 loaded,
                 web_approvals,
                 web_conversation_authorizer,
+                web_session_revalidator,
             )
             if loaded.config.channels.feishu.enabled:
                 if database is None:
@@ -446,6 +455,7 @@ class CompanyChannelRuntime:
         loaded: LoadedSuiteHarnessConfig,
         approvals: WebApprovalRuntime | None,
         conversation_authorizer: ConversationAuthorizer | None,
+        session_revalidator: WebSocketSessionRevalidator | None,
     ) -> None:
         config = loaded.config
         if not config.channels.web.enabled:
@@ -456,6 +466,10 @@ class CompanyChannelRuntime:
             if conversation_authorizer is not None:
                 raise ChannelHostConfigurationError(
                     "web_conversation_authorizer must be omitted when the Web channel is disabled"
+                )
+            if session_revalidator is not None:
+                raise ChannelHostConfigurationError(
+                    "web_session_revalidator must be omitted when the Web channel is disabled"
                 )
             self.web_session_tokens = None
             self.web_gateway = None
@@ -473,6 +487,10 @@ class CompanyChannelRuntime:
             raise TypeError(
                 "web_conversation_authorizer must implement async authorize"
             )
+        if session_revalidator is not None and not callable(
+            getattr(session_revalidator, "revalidate", None)
+        ):
+            raise TypeError("web_session_revalidator must implement async revalidate")
         if (
             config.channels.share_conversation_sessions
             and conversation_authorizer is None
@@ -495,7 +513,9 @@ class CompanyChannelRuntime:
             audience="suiteharness-company-websocket",
             tenant_id=tenant_id,
         )
-        authenticator = ServerSessionWebSocketAuthenticator(codec)
+        authenticator = ServerSessionWebSocketAuthenticator(
+            codec, cookie_name=config.channels.web.session_cookie_name
+        )
         gateway = _HostedEnterpriseChannelGateway(
             tenant_id=tenant_id,
             authenticator=_RejectingAuthenticator(),
@@ -514,10 +534,15 @@ class CompanyChannelRuntime:
         self.web_server = EnterpriseWebSocketServer(
             tenant_id=tenant_id,
             authenticator=authenticator,
+            session_revalidator=session_revalidator,
             origin_policy=OriginPolicy(config.channels.web.allowed_origins),
             dispatcher=gateway,
             approvals=approvals.coordinator,
             approval_hub=approvals.hub,
+            authentication_timeout_seconds=config.channels.web.authentication_timeout_seconds,
+            session_revalidation_interval_seconds=(
+                config.channels.web.session_revalidation_interval_seconds
+            ),
             max_frame_bytes=config.channels.web.max_frame_bytes,
         )
         self._web_approvals = approvals
@@ -537,6 +562,16 @@ class CompanyChannelRuntime:
         if credentials is None:
             raise ChannelHostConfigurationError("configured Feishu credentials are unavailable")
         tenant_id = config.deployment.tenant_id
+        selected_products = {
+            item.product_id for item in config.customer_bundle.products
+        }
+        if (
+            adapters.default_product_id is not None
+            and adapters.default_product_id not in selected_products
+        ):
+            raise ChannelHostConfigurationError(
+                "Feishu default_product_id must identify an active product"
+            )
         authenticator = FeishuCompanyAuthenticator(
             tenant_id=tenant_id,
             directory=adapters.directory,
@@ -561,12 +596,19 @@ class CompanyChannelRuntime:
                 config.deployment.instance_id,
                 ChannelKind.FEISHU.value,
             ),
+            processing_lease_seconds=(
+                config.channels.feishu.event_processing_lease_seconds
+            ),
         )
         processor = FeishuEventProcessor(
             gateway,
             bot_open_id=adapters.bot_open_id,
+            default_product_id=adapters.default_product_id,
             deduplicator=deduplicator,
             outbound_sink=adapters.outbound_sink,
+            processing_timeout_seconds=(
+                config.channels.feishu.event_processing_timeout_seconds
+            ),
         )
         self.feishu_gateway = gateway
         self.feishu_deduplicator = deduplicator

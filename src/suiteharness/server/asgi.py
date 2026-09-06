@@ -29,7 +29,7 @@ from suiteharness.channels import (
     ConversationAuthorizer,
     ProductAccessAuthorizer,
 )
-from suiteharness.channels.websocket import OriginPolicy
+from suiteharness.channels.websocket import OriginPolicy, WebSocketSessionRevalidator
 from suiteharness.config import LoadedSuiteHarnessConfig, SuiteHarnessConfigLoader
 from suiteharness.models import HttpTransport as ModelHttpTransport
 from suiteharness.runtime import (
@@ -262,6 +262,7 @@ class CompanyServerBootstrap:
         grant_templates: Iterable[ToolAccessTemplate],
         web_authenticator: CompanyHttpAuthenticator | None = None,
         web_conversation_authorizer: ConversationAuthorizer | None = None,
+        web_session_revalidator: WebSocketSessionRevalidator | None = None,
         product_access_authorizer: ProductAccessAuthorizer | None = None,
         feishu_adapters: FeishuHostAdapters | None = None,
         model_transport: ModelHttpTransport | None = None,
@@ -285,12 +286,19 @@ class CompanyServerBootstrap:
             raise ValueError("enabled Web channel requires a company HTTP authenticator")
         if not loaded.config.channels.web.enabled and web_authenticator is not None:
             raise ValueError("company HTTP authenticator requires the Web channel")
+        if not loaded.config.channels.web.enabled and web_session_revalidator is not None:
+            raise ValueError("Web session revalidator requires the Web channel")
+        if web_session_revalidator is not None and not callable(
+            getattr(web_session_revalidator, "revalidate", None)
+        ):
+            raise TypeError("web_session_revalidator must implement async revalidate")
         self.loaded = loaded
         self.product_catalog = product_catalog
         self.product_activators = tuple(product_activators)
         self.grant_templates = tuple(grant_templates)
         self.web_authenticator = web_authenticator
         self.web_conversation_authorizer = web_conversation_authorizer
+        self.web_session_revalidator = web_session_revalidator
         self.product_access_authorizer = product_access_authorizer
         self.feishu_adapters = feishu_adapters
         self.model_transport = model_transport
@@ -363,6 +371,7 @@ class CompanyServerBootstrap:
                 grant_templates=self.grant_templates,
                 web_approvals=approvals,
                 web_conversation_authorizer=self.web_conversation_authorizer,
+                web_session_revalidator=self.web_session_revalidator,
                 product_access_authorizer=self.product_access_authorizer,
                 feishu_adapters=self.feishu_adapters,
                 mcp_grant_material=extensions.mcp_by_product,
@@ -544,7 +553,7 @@ class CompanyServerApplication:
         if codec is None:
             return self._json({"error": "service_unavailable"}, status_code=503, headers=cors)
         token = codec.issue(principal, lifetime_seconds=config.session_lifetime_seconds)
-        return self._json(
+        response = self._json(
             {
                 "access_token": token,
                 "token_type": "Bearer",
@@ -553,6 +562,16 @@ class CompanyServerApplication:
             status_code=200,
             headers=cors,
         )
+        response.set_cookie(
+            key=config.session_cookie_name,
+            value=token,
+            max_age=config.session_lifetime_seconds,
+            path=config.websocket_path,
+            secure=config.session_cookie_secure,
+            httponly=True,
+            samesite="strict",
+        )
+        return response
 
     @staticmethod
     def _single_header(request: Request, name: str) -> str | None:
@@ -708,5 +727,6 @@ __all__ = [
     "CompanyServerReadiness",
     "CompanyServerRuntime",
     "CompanyServerStartupError",
+    "WebSocketSessionRevalidator",
     "create_company_asgi_app",
 ]

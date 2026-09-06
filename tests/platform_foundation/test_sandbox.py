@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -28,18 +29,22 @@ class FakeTransport:
         self,
         *,
         probe_exit_code: int | None = 0,
+        probe_stdout: bytes = b"26.1",
         execution_result: ProcessResult | None = None,
         cleanup_result: ProcessResult | None = None,
     ) -> None:
         self.probe_exit_code = probe_exit_code
+        self.probe_stdout = probe_stdout
         self.execution_result = execution_result or ProcessResult(0, b"ok", b"")
         self.cleanup_result = cleanup_result or ProcessResult(0, b"", b"")
         self.executions: list[tuple[tuple[str, ...], Mapping[str, str]]] = []
+        self.probe_commands: list[tuple[str, ...]] = []
         self.probes = 0
 
     async def probe(self, argv: tuple[str, ...], *, timeout_seconds: float) -> ProcessResult:
         self.probes += 1
-        return ProcessResult(self.probe_exit_code, b"26.1", b"")
+        self.probe_commands.append(argv)
+        return ProcessResult(self.probe_exit_code, self.probe_stdout, b"")
 
     async def execute(
         self,
@@ -52,9 +57,10 @@ class FakeTransport:
         output_bytes: int,
     ) -> ProcessResult:
         self.executions.append((argv, environment))
-        if argv[:2] == ("docker", "rm"):
+        command_index = 3 if len(argv) > 3 and argv[1] == "--context" else 1
+        if argv[command_index : command_index + 1] == ("rm",):
             return self.cleanup_result
-        if argv[:3] == ("docker", "container", "ls"):
+        if argv[command_index : command_index + 2] == ("container", "ls"):
             return ProcessResult(0, b"", b"")
         return self.execution_result
 
@@ -138,6 +144,125 @@ def test_docker_builder_applies_isolation_and_resource_limits(tmp_path: Path) ->
     assert command[-3:] == ("bash", "-lc", "printf ok")
 
 
+def test_docker_context_is_applied_to_run_probe_and_exact_cleanup(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    transport = FakeTransport(
+        execution_result=ProcessResult(None, b"", b"", timed_out=True)
+    )
+    config = replace(_docker_config(workspace), context="suiteharness-rootless")
+    backend = DockerSandboxBackend(
+        config,
+        transport,
+        quarantine_store=MemoryQuarantineStore(),
+    )
+
+    result = asyncio.run(backend.run(_request(workspace)))
+
+    assert result.timed_out
+    assert transport.probe_commands == [
+        (
+            "docker",
+            "--context",
+            "suiteharness-rootless",
+            "version",
+            "--format",
+            "{{.Server.Version}}",
+        ),
+        (
+            "docker",
+            "--context",
+            "suiteharness-rootless",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            config.image,
+        ),
+    ]
+    run_command, cleanup_command = (item[0] for item in transport.executions)
+    assert run_command[:4] == (
+        "docker",
+        "--context",
+        "suiteharness-rootless",
+        "run",
+    )
+    assert cleanup_command[:4] == (
+        "docker",
+        "--context",
+        "suiteharness-rootless",
+        "rm",
+    )
+
+
+@pytest.mark.parametrize(
+    "context",
+    ("", "bad context", "--host", "bad/context", "x" * 129),
+)
+def test_docker_context_rejects_unsafe_names(tmp_path: Path, context: str) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with pytest.raises(SandboxConfigurationError, match="context"):
+        replace(_docker_config(workspace), context=context)
+
+
+def test_docker_image_cannot_be_parsed_as_a_cli_option(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with pytest.raises(SandboxConfigurationError, match="image"):
+        replace(_docker_config(workspace), image="--help@sha256:" + "a" * 64)
+
+
+def test_required_rootless_daemon_is_verified_before_any_run(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = replace(
+        _docker_config(workspace),
+        context="suiteharness-rootless",
+        require_rootless=True,
+    )
+    rootless = FakeTransport(
+        probe_stdout=b'["name=seccomp,profile=builtin","name=rootless"]'
+    )
+    backend = DockerSandboxBackend(
+        config,
+        rootless,
+        quarantine_store=MemoryQuarantineStore(),
+    )
+    assert asyncio.run(backend.run(_request(workspace))).stdout == b"ok"
+    assert rootless.probe_commands == [
+        (
+            "docker",
+            "--context",
+            "suiteharness-rootless",
+            "info",
+            "--format",
+            "{{json .SecurityOptions}}",
+        ),
+        (
+            "docker",
+            "--context",
+            "suiteharness-rootless",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            config.image,
+        ),
+    ]
+
+    for unsafe_output in (b'["name=seccomp"]', b"not-json", b"{}"):
+        rootful = FakeTransport(probe_stdout=unsafe_output)
+        denied = DockerSandboxBackend(
+            config,
+            rootful,
+            quarantine_store=MemoryQuarantineStore(),
+        )
+        with pytest.raises(SandboxUnavailable, match="rootless"):
+            asyncio.run(denied.run(_request(workspace)))
+        assert rootful.executions == []
+
+
 def test_docker_backend_fails_closed_when_daemon_is_unavailable(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -145,6 +270,30 @@ def test_docker_backend_fails_closed_when_daemon_is_unavailable(tmp_path: Path) 
     backend = _backend(workspace, transport)
 
     with pytest.raises(SandboxUnavailable, match="unavailable"):
+        asyncio.run(backend.run(_request(workspace)))
+    assert transport.executions == []
+
+
+def test_production_docker_requires_the_pinned_image_to_exist_locally(
+    tmp_path: Path,
+) -> None:
+    class MissingImageTransport(FakeTransport):
+        async def probe(
+            self, argv: tuple[str, ...], *, timeout_seconds: float
+        ) -> ProcessResult:
+            del timeout_seconds
+            self.probes += 1
+            self.probe_commands.append(argv)
+            if "inspect" in argv:
+                return ProcessResult(1, b"", b"image not found")
+            return ProcessResult(0, b"26.1", b"")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    transport = MissingImageTransport()
+    backend = _backend(workspace, transport)
+
+    with pytest.raises(SandboxUnavailable, match="image is unavailable"):
         asyncio.run(backend.run(_request(workspace)))
     assert transport.executions == []
 
@@ -178,7 +327,7 @@ def test_docker_availability_coalesces_concurrent_daemon_probes(tmp_path: Path) 
 
     available, probes = asyncio.run(exercise())
     assert all(available)
-    assert probes == 1
+    assert probes == 2
 
 
 def test_docker_availability_reprobes_after_healthy_cache_ttl(tmp_path: Path) -> None:
@@ -203,7 +352,7 @@ def test_docker_availability_reprobes_after_healthy_cache_ttl(tmp_path: Path) ->
         return first, cached, transport.probes
 
     first, cached, expired = asyncio.run(exercise())
-    assert (first, cached, expired) == (1, 1, 2)
+    assert (first, cached, expired) == (2, 2, 4)
 
 
 def test_docker_quarantine_immediately_overrides_cached_health(tmp_path: Path) -> None:
@@ -225,7 +374,7 @@ def test_docker_quarantine_immediately_overrides_cached_health(tmp_path: Path) -
     assert healthy.available is True
     assert quarantined.available is False
     assert "quarantined" in quarantined.detail
-    assert probes == 1
+    assert probes == 2
 
 
 def test_docker_backend_passes_limits_and_environment_to_transport(tmp_path: Path) -> None:

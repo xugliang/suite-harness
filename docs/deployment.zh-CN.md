@@ -111,7 +111,9 @@ python scripts/check_distributions.py dist
 要求：
 
 - 框架、宿主源码和插件由部署账号写、运行账号只读；
-- Linux 上密钥文件应 `chmod 600`，不得是符号链接；
+- Linux 上密钥文件应 `chmod 600`，不得是符号链接；配置加载器使用不跟随符号链接的
+  文件句柄读取，再以 `fstat`（已打开文件状态）核对普通文件、权限、身份和 1 MiB 上限，
+  避免“先检查路径、再被替换”的竞态；
 - 插件 `allowed_roots` 及其每一级祖先必须由 root/部署管理员拥有，SuiteHarness 服务账号和插件代码不得写入，并在容器内只读挂载；摘要复核会缩小但不能彻底消除 Python 路径导入竞态；
 - 状态目录只给服务账号；
 - 沙箱挂载的产品/共享工作区只包含 Agent 允许处理的数据；
@@ -143,8 +145,23 @@ docker inspect --format='{{index .RepoDigests 0}}' \
 sandbox:
   backend: docker
   required: true
+  context: suiteharness-rootless
+  require_rootless: true
   image: registry.example.com/suiteharness/sandbox@sha256:<64位真实摘要>
 ```
+
+生产服务账号必须在配置的同一个 Docker context 中预先拉取该摘要镜像：
+
+```bash
+docker --context suiteharness-rootless pull \
+  registry.example.com/suiteharness/sandbox@sha256:<64位真实摘要>
+docker --context suiteharness-rootless image inspect \
+  registry.example.com/suiteharness/sandbox@sha256:<64位真实摘要>
+```
+
+readiness 会同时核验 daemon、`require_rootless`（若启用）和本地精确摘要镜像；不会在
+处理请求时临时拉取一个尚未验收的镜像。镜像缺失、context 指错或 daemon 不是 rootless
+都会使服务保持 not-ready。
 
 ### 5.2 运行约束
 
@@ -175,6 +192,15 @@ sandbox:
 - 或把沙箱放到独立执行节点，由窄化服务接口接收任务；
 - 监控异常容器、镜像拉取和网络变化；
 - 定期更新宿主内核、Docker 与基础镜像。
+
+`sandbox.context`（Docker 上下文）会以 `docker --context <name> ...` 的形式应用到可用性
+探测、运行、超时清理和隔离恢复的每一条命令。生产建议为 SuiteHarness 服务账号创建
+固定名称的 rootless context 并在配置中显式填写；这样不会因为 shell 当前环境或默认
+context 改变而误连 rootful daemon。context 名只允许字母、数字、点、下划线和连字符，
+不能注入 `--host` 等额外 CLI 参数。仅填写 context 名并不会自动把对应 daemon 变安全，
+上线仍须核验其 endpoint 确实属于目标非特权账号。启用 `require_rootless: true` 后，readiness
+还会通过 `docker info` 检查 daemon 的 `name=rootless` 安全标志；无法解析、没有该标志或
+daemon 不可用都失败关闭，且不会执行任何沙箱命令。
 
 Docker 沙箱主要保护 Bash 和可接入的 stdio MCP；它不会自动隔离可信进程内 Python 产品/插件。
 
@@ -209,7 +235,10 @@ loaded = SuiteHarnessConfigLoader().load(
 )
 ```
 
-加载器只读取这两个显式路径，不做环境变量插值或命令替换。公开配置与密钥配置必须是不同普通文件，最大默认 1 MiB。
+加载器只读取这两个显式路径，不做环境变量插值或命令替换。公开配置与密钥配置必须是
+不同普通文件（硬链接到同一文件也拒绝），最大默认 1 MiB。`production` 还会拒绝常见
+`replace-with-*`/`change-me` 占位符、全零镜像摘要、明显伪密钥及保留的 `example.*` 域名；
+示例配置故意不能未经替换就上线。
 
 关键设置：
 
@@ -224,8 +253,8 @@ loaded = SuiteHarnessConfigLoader().load(
 - `sandbox.network.default` 固定 `none`；
 - `sandbox.network.allowed_profiles_by_product` 逐产品开放 Bash 出口；仅配置 Docker network 名称不会自动授权产品使用；
 - `web_tools.search_providers_by_product` 和 `fetch_routes_by_product` 控制各产品可选择的搜索/抓取出口；未配置时只允许公司默认值，空列表表示连默认值也拒绝；
-- `channels.web.allowed_origins` 只列公司 HTTPS 前端；`session_path` 默认 `/auth/session`，`session_lifetime_seconds` 只能在 30–900 秒之间且默认 300 秒；公司认证适配器总时限 `authentication_timeout_seconds` 默认 10 秒、最大 60 秒；WebSocket 入站帧在协议层和应用层固定为 1 MiB；WebSocket、会话交换、飞书 Webhook 和健康路径不能冲突；
-- 飞书启用时必须填写公司应用 `app_id`，并固定 `default_access=read_only`、`interactive_approval=false`、`allow_delete=false`；公司目录认证时限 `authentication_timeout_seconds` 默认 10 秒、最大 60 秒；
+- `channels.web.allowed_origins` 只列公司 HTTPS 前端；`session_path` 默认 `/auth/session`，`session_lifetime_seconds` 只能在 30–900 秒之间且默认 300 秒；公司认证适配器总时限 `authentication_timeout_seconds` 默认 10 秒、最大 60 秒；空闲 WebSocket 的 `session_revalidation_interval_seconds` 默认 30 秒、最大 300 秒且不能超过票据寿命；WebSocket 入站帧在协议层和应用层固定为 1 MiB；WebSocket、会话交换、飞书 Webhook 和健康路径不能冲突；
+- 飞书启用时必须填写公司应用 `app_id`，并固定 `default_access=read_only`、`interactive_approval=false`、`allow_delete=false`；公司目录认证时限 `authentication_timeout_seconds` 默认 10 秒、最大 60 秒；`event_processing_timeout_seconds` 是 claim 后分发、回复和完成标记的总上限（默认 600 秒），`event_processing_lease_seconds` 是阻止其他实例重复领取的 processing lease（默认 660 秒），配置必须满足 `lease > timeout`，否则加载失败；
 - `channels.share_conversation_sessions=false` 默认按用户隔离持久会话；只有明确需要群组共享且完成成员授权时才开启；
 - `channels.authorization_timeout_seconds` 同时约束产品 ACL 与共享 Web 会话成员 ACL，默认 10 秒、最大 60 秒；超时和适配器异常都拒绝；
 - MCP 按产品配置；
@@ -486,13 +515,13 @@ class CompanySsoAdapter:
 1. 用户完成企业 SSO/OIDC/JWT；
 2. 浏览器从精确允许的 HTTPS Origin，以已有 Cookie 或 Authorization（认证）头调用 `POST /auth/session`，请求正文必须为空；
 3. 内置路由把受边界限制的请求元数据交给认证适配器，并核对返回的 tenant；
-4. 成功响应为 `{access_token, token_type: "Bearer", expires_in}`，禁止缓存且不设置 Cookie；票据寿命默认 300 秒、只能配置 30–900 秒；
-5. 浏览器以 `Authorization: Bearer <access_token>` 连接 `/ws`，并使用 `suiteharness.v1` WebSocket 子协议；
-6. 票据过期后重新经过公司认证流程。
+4. 成功响应为 `{access_token, token_type: "Bearer", expires_in}`，禁止缓存，同时设置限定 `/ws` 路径的 HttpOnly/SameSite=Strict/Secure 短票 Cookie；票据寿命默认 300 秒、只能配置 30–900 秒；
+5. 浏览器自动携带 Cookie 连接 `/ws` 并使用 `suiteharness.v1` 子协议；不能设置 WebSocket `Authorization` 头的限制不会迫使前端把票据写入 URL 或 localStorage。非浏览器客户端仍可使用响应中的 Bearer；
+6. 框架在每个非断开客户端帧前重验原票据；票据过期时关闭连接、取消连接内在途运行，并要求重新经过公司认证流程。
 
 `OPTIONS` 预检只接受目标方法 `POST` 并返回精确 Origin。路由拒绝正文、重复安全头、超量/非法头和不允许的 Origin；认证不可用返回 503，错误凭据或异租户主体返回 401。不能让浏览器自己提交 `tenant_id`、`principal_id` 或角色后直接签票。
 
-`web/default.session_signing_key` 至少 32 个字符，生产必须使用密码学随机值并与公开配置分离。当前 HMAC（基于哈希的消息认证码）短票没有 key-id（密钥编号）多密钥轮换、单票吊销、刷新或重放存储；认证器已有 10 秒默认、60 秒硬上限的调用超时，但没有框架内置熔断或分布式限流。生产还要在公司边界实现退出、账号变更联动、短 TTL、密钥轮换、CSRF、速率限制、登录审计和异常保护。
+`web/default.session_signing_key` 至少 32 个字符，生产必须使用密码学随机值并与公开配置分离。当前 HMAC（基于哈希的消息认证码）短票没有 key-id（密钥编号）多密钥轮换、内置吊销存储、刷新或重放存储；认证/动态复核使用 10 秒默认、60 秒硬上限的调用超时，但框架没有内置熔断或分布式限流。部署可向 `CompanyServerBootstrap(web_session_revalidator=...)` 注入实现了 `WebSocketSessionRevalidator` 的公司适配器：它根据握手凭据摘要和初始主体查询退出/吊销状态、账号启用状态及当前角色，返回最新 `AuthenticatedPrincipal`；返回空值、tenant/主体/角色改变、超时或异常都会关闭连接。适配器不得记录或持久化原始 Cookie/Bearer。生产还要完成短 TTL、密钥轮换、CSRF、速率限制、登录审计和异常保护。
 
 ### 13.1 可选共享会话
 
@@ -528,7 +557,9 @@ feishu_host_adapters = FeishuHostAdapters(
 - `outbound_sink` 一般包装 `FeishuMessageClient`；
 - Webhook 模式要求签名/verification token，并在启用加密时提供解密器；
 - 长连接模式必须提供官方 SDK 适配器；
-- 渠道组合器使用传入的 `foundation.runtime_database` 创建持久飞书事件去重器；该连接仍由 Foundation 拥有和关闭。
+- 渠道组合器使用传入的 `foundation.runtime_database` 创建持久飞书事件去重器；该连接仍由 Foundation 拥有和关闭；
+- `CompanyServerBootstrap` 从 `channels.feishu` 把 `event_processing_timeout_seconds` 同时接到事件处理器、把更长的 `event_processing_lease_seconds` 接到 SQLite 去重器。处理超时会取消当前分发并释放该代 claim，让飞书按供应商重试策略重新投递；租约覆盖整个允许处理窗口，因此首个处理仍运行时其他进程不能领取同一事件。产品若直接组合低层 `FeishuEventProcessor`，也必须提供公开 `processing_lease_seconds` 且严格大于处理上限的去重器；
+- 官方 SDK 适配器自身的回调等待上限不得小于 `event_processing_timeout_seconds`，应从同一产品/部署配置取值，不能另写一个更短的硬编码值。
 - 开启共享会话时，同一已验签 `chat_id + product_id` 的成员使用共同持久历史；这不放宽飞书工具策略。
 
 标准 `CompanyServerBootstrap` 会在受监管后台任务中启动长连接，并在任务立即失败时让启动失败；Webhook 路由则在 ASGI lifespan 成功后动态加入。直接使用低层 `CompanyChannelRuntime` 的自定义宿主才需要自行调用 `run_feishu_long_connection()` 或组合 `starlette_routes()`。无论哪种传输，飞书权限规则完全相同。

@@ -33,6 +33,7 @@ from .server import (
     WebSocketConnection,
     WebSocketDispatcher,
     WebSocketSession,
+    WebSocketSessionRevalidator,
 )
 from .starlette import (
     StarletteWebSocketConnection,
@@ -64,6 +65,7 @@ __all__ = [
     "WebSocketAuthenticator",
     "WebSocketConnection",
     "WebSocketDispatcher",
+    "WebSocketSessionRevalidator",
     "WebSocketHandshake",
     "WebSocketPacket",
     "WebSocketPacketKind",

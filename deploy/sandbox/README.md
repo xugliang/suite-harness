@@ -12,6 +12,10 @@ docker build \
 docker inspect --format='{{index .RepoDigests 0}}' suiteharness-sandbox:0.1.0
 ```
 
+部署前要以 SuiteHarness 服务账号在配置指定的 Docker context 中预拉取最终摘要。生产
+readiness 会执行精确摘要的本地 `image inspect`；镜像未预拉取时会失败关闭，而不会等到
+第一次 Bash 工具请求才联网拉取。
+
 运行时框架还会强制只读根文件系统、删除全部 Linux capabilities、启用
 `no-new-privileges`、限制 CPU/内存/PID/临时盘，并默认关闭网络。工作区以
 UID/GID `65532:65532` 挂载；运维应只对相应租户/产品目录设置这个属主或受控

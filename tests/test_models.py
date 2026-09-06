@@ -139,8 +139,16 @@ def test_secret_and_http_request_repr_are_redacted() -> None:
         method="POST",
         url="https://example.invalid",
         headers={"Authorization": "Bearer top-secret"},
+        json_body={"prompt": "private-customer-source"},
     )
     assert "top-secret" not in repr(request)
+    assert "private-customer-source" not in repr(request)
+    response = HttpResponse(
+        status_code=200,
+        headers={},
+        body=b"private-model-response",
+    )
+    assert "private-model-response" not in repr(response)
 
 
 def test_plain_http_profiles_require_an_explicit_internal_opt_in() -> None:
@@ -406,21 +414,27 @@ def test_cloud_factories_are_bound_explicitly_to_server_clients() -> None:
     registry = create_builtin_provider_registry()
     registry.bind_factory("bedrock", bedrock_factory(FakeBedrock()))
     registry.bind_factory("vertex", vertex_factory(FakeTokenProvider()))
-    assert registry.create(
-        ModelProfile(profile_id="aws", provider_id="bedrock", model="model"),
-        FakeTransport(),
-        MappingSecretResolver({}),
-    ).provider_id == "bedrock"
-    assert registry.create(
-        ModelProfile(
-            profile_id="gcp",
-            provider_id="vertex",
-            model="model",
-            provider_options={"project": "project"},
-        ),
-        FakeTransport(),
-        MappingSecretResolver({}),
-    ).provider_id == "vertex"
+    assert (
+        registry.create(
+            ModelProfile(profile_id="aws", provider_id="bedrock", model="model"),
+            FakeTransport(),
+            MappingSecretResolver({}),
+        ).provider_id
+        == "bedrock"
+    )
+    assert (
+        registry.create(
+            ModelProfile(
+                profile_id="gcp",
+                provider_id="vertex",
+                model="model",
+                provider_options={"project": "project"},
+            ),
+            FakeTransport(),
+            MappingSecretResolver({}),
+        ).provider_id
+        == "vertex"
+    )
 
 
 def test_gateway_rejects_model_override_outside_server_allowlist() -> None:
@@ -473,6 +487,22 @@ def test_sse_decoder_handles_arbitrary_chunk_boundaries() -> None:
         return [item async for item in iter_sse_json(chunks())]
 
     assert asyncio.run(collect()) == [{"a": 1}]
+
+
+def test_sse_decoder_handles_utf8_code_points_split_across_chunks() -> None:
+    encoded = 'data: {"answer":"你好🙂"}\n\n'.encode()
+    chinese = "你".encode()
+    split_at = encoded.index(chinese) + 1
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield encoded[:split_at]
+        yield encoded[split_at : split_at + 1]
+        yield encoded[split_at + 1 :]
+
+    async def collect() -> list[dict[str, object]]:
+        return [item async for item in iter_sse_json(chunks())]
+
+    assert asyncio.run(collect()) == [{"answer": "你好🙂"}]
 
 
 def test_sse_decoder_enforces_total_and_unterminated_event_limits() -> None:

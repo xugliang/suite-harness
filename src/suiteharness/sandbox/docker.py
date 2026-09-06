@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import secrets
@@ -41,15 +42,28 @@ class DockerBackendConfig:
     image: str
     allowed_host_roots: tuple[Path, ...]
     binary: str = "docker"
+    context: str | None = None
+    require_rootless: bool = False
     production: bool = True
     egress_networks: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.binary or Path(self.binary).name != self.binary:
             raise SandboxConfigurationError("Docker binary must be a bare executable name")
+        if not isinstance(self.require_rootless, bool):
+            raise SandboxConfigurationError("require_rootless must be a boolean")
+        if self.context is not None and (
+            len(self.context) > 128 or not _DOCKER_RESOURCE.fullmatch(self.context)
+        ):
+            raise SandboxConfigurationError("invalid Docker context name")
         if self.production and not _DIGEST_IMAGE.fullmatch(self.image):
             raise SandboxConfigurationError("production Docker image must be pinned by sha256 digest")
-        if not self.image or any(char.isspace() for char in self.image):
+        if (
+            not self.image
+            or self.image.startswith("-")
+            or "\x00" in self.image
+            or any(char.isspace() for char in self.image)
+        ):
             raise SandboxConfigurationError("invalid Docker image reference")
         roots = tuple(Path(item).resolve(strict=True) for item in self.allowed_host_roots)
         if not roots or any(not item.is_dir() for item in roots):
@@ -61,6 +75,12 @@ class DockerBackendConfig:
         object.__setattr__(self, "allowed_host_roots", roots)
         object.__setattr__(self, "egress_networks", MappingProxyType(networks))
 
+    @property
+    def command_prefix(self) -> tuple[str, ...]:
+        if self.context is None:
+            return (self.binary,)
+        return (self.binary, "--context", self.context)
+
 
 class DockerCommandBuilder:
     def __init__(self, config: DockerBackendConfig) -> None:
@@ -69,7 +89,7 @@ class DockerCommandBuilder:
     def build(self, request: SandboxRequest) -> tuple[str, ...]:
         limits = request.limits
         command = [
-            self._config.binary,
+            *self._config.command_prefix,
             "run",
             "--rm",
             f"--name={self.container_name(request.request_id)}",
@@ -197,9 +217,24 @@ class DockerSandboxBackend:
             return result
 
     async def _probe_daemon(self) -> SandboxAvailability:
+        command = (
+            (
+                *self._config.command_prefix,
+                "info",
+                "--format",
+                "{{json .SecurityOptions}}",
+            )
+            if self._config.require_rootless
+            else (
+                *self._config.command_prefix,
+                "version",
+                "--format",
+                "{{.Server.Version}}",
+            )
+        )
         try:
             result = await self._transport.probe(
-                (self._config.binary, "version", "--format", "{{.Server.Version}}"),
+                command,
                 timeout_seconds=5.0,
             )
         except Exception:
@@ -208,6 +243,52 @@ class DockerSandboxBackend:
             return SandboxAvailability(False, "Docker availability probe timed out")
         if result.exit_code != 0:
             return SandboxAvailability(False, "Docker daemon is unavailable")
+        if self._config.require_rootless:
+            try:
+                options = json.loads(result.stdout.decode("utf-8", errors="strict"))
+            except (UnicodeError, json.JSONDecodeError):
+                return SandboxAvailability(
+                    False,
+                    "Docker daemon rootless status could not be verified",
+                )
+            if (
+                not isinstance(options, list)
+                or len(options) > 128
+                or any(not isinstance(option, str) for option in options)
+                or "name=rootless" not in options
+            ):
+                return SandboxAvailability(
+                    False,
+                    "Docker daemon is not verified rootless",
+                )
+        if self._config.production:
+            try:
+                image = await self._transport.probe(
+                    (
+                        *self._config.command_prefix,
+                        "image",
+                        "inspect",
+                        "--format",
+                        "{{.Id}}",
+                        self._config.image,
+                    ),
+                    timeout_seconds=5.0,
+                )
+            except Exception:
+                return SandboxAvailability(
+                    False,
+                    "Pinned Docker sandbox image inspection failed",
+                )
+            if image.timed_out:
+                return SandboxAvailability(
+                    False,
+                    "Pinned Docker sandbox image inspection timed out",
+                )
+            if image.exit_code != 0 or not image.stdout.strip():
+                return SandboxAvailability(
+                    False,
+                    "Pinned Docker sandbox image is unavailable",
+                )
         return SandboxAvailability(True)
 
     async def run(self, request: SandboxRequest) -> SandboxResult:
@@ -265,7 +346,7 @@ class DockerSandboxBackend:
         try:
             result = await self._transport.execute(
                 (
-                    self._config.binary,
+                    *self._config.command_prefix,
                     "rm",
                     "--force",
                     container_name,
@@ -426,7 +507,7 @@ class DockerSandboxBackend:
         for name in names:
             listing = await self._transport.execute(
                 (
-                    self._config.binary,
+                    *self._config.command_prefix,
                     "container",
                     "ls",
                     "--all",
@@ -445,7 +526,7 @@ class DockerSandboxBackend:
                 )
             if listing.stdout.strip():
                 removal = await self._transport.execute(
-                    (self._config.binary, "rm", "--force", name),
+                    (*self._config.command_prefix, "rm", "--force", name),
                     working_directory=None,
                     environment={},
                     stdin=None,
@@ -458,7 +539,7 @@ class DockerSandboxBackend:
                     )
                 verified = await self._transport.execute(
                     (
-                        self._config.binary,
+                        *self._config.command_prefix,
                         "container",
                         "ls",
                         "--all",

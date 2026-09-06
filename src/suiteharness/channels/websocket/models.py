@@ -15,6 +15,7 @@ from pydantic import (
     TypeAdapter,
     field_serializer,
     field_validator,
+    model_validator,
 )
 
 from suiteharness.channels.approvals import ApprovalChallenge
@@ -40,7 +41,7 @@ class MessageFrame(_Frame):
     type: Literal["message"]
     client_message_id: str
     conversation_id: str
-    text: str = Field(min_length=1, max_length=1_000_000)
+    text: str = Field(default="", max_length=1_000_000)
     product_id: str | None = None
     attachments: tuple[ChannelAttachment, ...] = ()
 
@@ -70,9 +71,15 @@ class MessageFrame(_Frame):
     @field_validator("text")
     @classmethod
     def validate_text(cls, value: str) -> str:
-        if "\x00" in value or not value.strip():
-            raise ValueError("message text must be non-blank and NUL-free")
+        if "\x00" in value:
+            raise ValueError("message text must be NUL-free")
         return value
+
+    @model_validator(mode="after")
+    def require_content(self) -> MessageFrame:
+        if not self.text.strip() and not self.attachments:
+            raise ValueError("message requires non-blank text or attachments")
+        return self
 
 
 class ApprovalDecisionFrame(_Frame):

@@ -234,7 +234,19 @@ class EnterpriseChannelGateway:
                 raise ChannelAdmissionError(
                     "the authenticated principal is not a member of this shared conversation"
                 )
-        session_values = [message.channel.value, message.conversation_id, product_id]
+        session_scope_id = message.conversation_id
+        if message.channel is ChannelKind.FEISHU:
+            trusted_scope = message.metadata.get("session_scope_id")
+            if trusted_scope is not None:
+                if (
+                    not isinstance(trusted_scope, str)
+                    or not trusted_scope
+                    or len(trusted_scope) > 1024
+                    or "\x00" in trusted_scope
+                ):
+                    raise ChannelAdmissionError("trusted channel session scope is invalid")
+                session_scope_id = trusted_scope
+        session_values = [message.channel.value, session_scope_id, product_id]
         if not self._share_conversation_sessions:
             session_values.append(principal.principal_id)
         session_id = self._safe_id("session", *session_values)

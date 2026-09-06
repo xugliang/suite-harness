@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import hmac
 import json
+import math
+import re
+import secrets
 import time
 import unicodedata
+import weakref
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime
@@ -95,7 +100,12 @@ class FeishuDispatcher(Protocol):
 
 
 class EventDeduplicator(Protocol):
+    @property
+    def processing_lease_seconds(self) -> float: ...
+
     async def claim(self, event_id: str) -> bool: ...
+
+    async def complete(self, event_id: str) -> None: ...
 
     async def release(self, event_id: str) -> None: ...
 
@@ -107,25 +117,55 @@ class InMemoryEventDeduplicator:
         self,
         *,
         ttl_seconds: float = 86_400,
+        processing_lease_seconds: float | None = None,
         max_entries: int = 100_000,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if ttl_seconds <= 0:
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, int | float)
+            or not math.isfinite(ttl_seconds)
+            or ttl_seconds <= 0
+        ):
             raise ValueError("dedupe ttl_seconds must be positive")
-        if max_entries <= 0:
+        if processing_lease_seconds is not None and (
+            isinstance(processing_lease_seconds, bool)
+            or not isinstance(processing_lease_seconds, int | float)
+            or not math.isfinite(processing_lease_seconds)
+            or processing_lease_seconds <= 0
+        ):
+            raise ValueError("dedupe processing_lease_seconds must be positive")
+        if (
+            isinstance(max_entries, bool)
+            or not isinstance(max_entries, int)
+            or max_entries <= 0
+        ):
             raise ValueError("dedupe max_entries must be positive")
         self._ttl = ttl_seconds
+        self._processing_lease = (
+            min(ttl_seconds, 660.0)
+            if processing_lease_seconds is None
+            else float(processing_lease_seconds)
+        )
         self._maximum = max_entries
         self._clock = clock
-        self._entries: OrderedDict[str, float] = OrderedDict()
+        self._entries: OrderedDict[str, tuple[float, str, bool]] = OrderedDict()
+        self._expirations: list[tuple[float, str, str]] = []
+        self._owned_claims: weakref.WeakKeyDictionary[asyncio.Task[object], dict[str, str]] = (
+            weakref.WeakKeyDictionary()
+        )
         self._lock = asyncio.Lock()
 
+    @property
+    def processing_lease_seconds(self) -> float:
+        return self._processing_lease
+
     def _purge_expired(self, now: float) -> None:
-        while self._entries:
-            event_id, expires_at = next(iter(self._entries.items()))
-            if expires_at > now:
-                break
-            self._entries.pop(event_id, None)
+        while self._expirations and self._expirations[0][0] <= now:
+            expires_at, event_id, owner_token = heapq.heappop(self._expirations)
+            current = self._entries.get(event_id)
+            if current is not None and current[:2] == (expires_at, owner_token):
+                self._entries.pop(event_id, None)
 
     async def claim(self, event_id: str) -> bool:
         now = self._clock()
@@ -133,14 +173,51 @@ class InMemoryEventDeduplicator:
             self._purge_expired(now)
             if event_id in self._entries:
                 return False
-            while len(self._entries) >= self._maximum:
-                self._entries.popitem(last=False)
-            self._entries[event_id] = now + self._ttl
+            if len(self._entries) >= self._maximum:
+                # Evicting a live marker would allow a duplicate request to run.
+                raise RuntimeError("event deduplication capacity has been reached")
+            owner_token = secrets.token_urlsafe(32)
+            expires_at = now + self._processing_lease
+            self._entries[event_id] = (
+                expires_at,
+                owner_token,
+                False,
+            )
+            heapq.heappush(self._expirations, (expires_at, event_id, owner_token))
+            task = self._current_task()
+            self._owned_claims.setdefault(task, {})[event_id] = owner_token
             return True
 
-    async def release(self, event_id: str) -> None:
+    async def complete(self, event_id: str) -> None:
+        now = self._clock()
+        task = self._current_task()
         async with self._lock:
-            self._entries.pop(event_id, None)
+            owned = self._owned_claims.get(task)
+            owner_token = None if owned is None else owned.get(event_id)
+            current = self._entries.get(event_id)
+            if owner_token is None or current is None or current[1] != owner_token:
+                raise RuntimeError("event claim ownership expired before completion")
+            expires_at = now + self._ttl
+            self._entries[event_id] = (expires_at, owner_token, True)
+            heapq.heappush(self._expirations, (expires_at, event_id, owner_token))
+            self._entries.move_to_end(event_id)
+            owned.pop(event_id, None)
+
+    async def release(self, event_id: str) -> None:
+        task = self._current_task()
+        async with self._lock:
+            owned = self._owned_claims.get(task)
+            owner_token = None if owned is None else owned.pop(event_id, None)
+            current = self._entries.get(event_id)
+            if owner_token is not None and current is not None and current[1] == owner_token:
+                self._entries.pop(event_id, None)
+
+    @staticmethod
+    def _current_task() -> asyncio.Task[object]:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("channel event claims require an asyncio task")
+        return task
 
 
 class FeishuEventProcessor:
@@ -151,17 +228,54 @@ class FeishuEventProcessor:
         dispatcher: FeishuDispatcher,
         *,
         bot_open_id: str | None,
+        default_product_id: str | None = None,
         deduplicator: EventDeduplicator | None = None,
         outbound_sink: OutboundSink | None = None,
         clock: Callable[[], datetime] | None = None,
+        processing_timeout_seconds: float = 600.0,
     ) -> None:
         if bot_open_id is not None and (not bot_open_id or "\x00" in bot_open_id):
             raise ValueError("bot_open_id is invalid")
+        if default_product_id is not None and not re.fullmatch(
+            r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*", default_product_id
+        ):
+            raise ValueError("default_product_id is invalid")
+        if (
+            isinstance(processing_timeout_seconds, bool)
+            or not isinstance(processing_timeout_seconds, int | float)
+            or not math.isfinite(processing_timeout_seconds)
+            or not (0 < processing_timeout_seconds <= 3_600)
+        ):
+            raise ValueError("processing_timeout_seconds must be in (0, 3600]")
+        selected_deduplicator = deduplicator or InMemoryEventDeduplicator(
+            processing_lease_seconds=float(processing_timeout_seconds) + 60.0
+        )
+        processing_lease_seconds = getattr(
+            selected_deduplicator,
+            "processing_lease_seconds",
+            None,
+        )
+        if (
+            isinstance(processing_lease_seconds, bool)
+            or not isinstance(processing_lease_seconds, int | float)
+            or not math.isfinite(processing_lease_seconds)
+            or processing_lease_seconds <= processing_timeout_seconds
+        ):
+            raise ValueError(
+                "event deduplicator processing lease must be strictly greater than "
+                "processing_timeout_seconds"
+            )
         self._dispatcher = dispatcher
         self._bot_open_id = bot_open_id
-        self._deduplicator = deduplicator or InMemoryEventDeduplicator()
+        self._default_product_id = default_product_id
+        self._deduplicator = selected_deduplicator
         self._outbound_sink = outbound_sink
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._processing_timeout = float(processing_timeout_seconds)
+
+    @property
+    def processing_timeout_seconds(self) -> float:
+        return self._processing_timeout
 
     async def accept_verified_json(self, body: bytes) -> FeishuEventOutcome:
         """Accept JSON bytes already authenticated by webhook or the official SDK."""
@@ -178,12 +292,15 @@ class FeishuEventProcessor:
         if not await self._deduplicator.claim(event_id):
             return FeishuEventOutcome.DUPLICATE
         try:
-            message = self._normalize_message(payload, event_id=event_id)
-            if message is None:
-                return FeishuEventOutcome.IGNORED
-            async for outbound in self._dispatcher.dispatch(message):
-                if self._outbound_sink is not None:
-                    await self._outbound_sink(message, outbound)
+            async with asyncio.timeout(self._processing_timeout):
+                message = self._normalize_message(payload, event_id=event_id)
+                if message is None:
+                    await self._deduplicator.complete(event_id)
+                    return FeishuEventOutcome.IGNORED
+                async for outbound in self._dispatcher.dispatch(message):
+                    if self._outbound_sink is not None:
+                        await self._outbound_sink(message, outbound)
+                await self._deduplicator.complete(event_id)
         except BaseException:
             await self._deduplicator.release(event_id)
             raise
@@ -244,6 +361,17 @@ class FeishuEventProcessor:
             metadata["root_id"] = root_id
         if parent_id is not None:
             metadata["parent_id"] = parent_id
+        # Keep delivery addressing (chat_id) separate from the durable session
+        # scope. A legacy deployment may key a plain private chat by the employee
+        # open_id, so an offline import can resume the same logical history
+        # without ever sending a reply to an open_id as though it were a chat.
+        thread_id = root_id or parent_id
+        if thread_id is not None:
+            metadata["session_scope_id"] = f"{chat_id}:{thread_id}"
+        elif chat_type == "p2p":
+            metadata["session_scope_id"] = sender_external_id
+        else:
+            metadata["session_scope_id"] = chat_id
         return InboundMessage(
             channel=ChannelKind.FEISHU,
             event_id=event_id,
@@ -251,6 +379,9 @@ class FeishuEventProcessor:
             conversation_id=chat_id,
             sender_external_id=sender_external_id,
             text=text,
+            # Product routing is supplied only by the trusted host adapter.  A
+            # similarly named field in the provider event is intentionally ignored.
+            product_id=self._default_product_id,
             received_at=received_at,
             metadata=metadata,
         )

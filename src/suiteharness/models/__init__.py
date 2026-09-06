@@ -23,6 +23,7 @@ from suiteharness.models.registry import (
     create_builtin_provider_registry,
 )
 from suiteharness.models.secrets import MappingSecretResolver
+from suiteharness.models.services import MODEL_GATEWAY
 from suiteharness.models.transport import (
     HttpRequest,
     HttpResponse,
@@ -36,6 +37,7 @@ from suiteharness.models.types import (
     DocumentContent,
     FinishReason,
     ImageContent,
+    ModelCapabilities,
     ModelMessage,
     ModelProfile,
     ModelRequest,
@@ -75,6 +77,8 @@ __all__ = [
     "MappingSecretResolver",
     "ModelErrorCode",
     "ModelGateway",
+    "MODEL_GATEWAY",
+    "ModelCapabilities",
     "ModelMessage",
     "ModelProfile",
     "ModelProvider",

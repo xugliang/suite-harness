@@ -66,8 +66,62 @@ def test_message_client_checks_business_code_and_builds_text_message() -> None:
     assert request.headers["Authorization"] == "Bearer tenant-token"
     assert request.url.endswith("/open-apis/im/v1/messages?receive_id_type=chat_id")
     assert request.json_body["receive_id"] == "oc-chat"
+    assert "uuid" not in request.json_body
     assert json.loads(request.json_body["content"]) == {"text": "你好，企业"}
     assert "tenant-token" not in repr(request)
+
+
+def test_message_client_maps_idempotency_key_to_feishu_uuid() -> None:
+    class Tokens:
+        async def get_token(self) -> str:
+            return "tenant-token"
+
+    transport = Transport([{"code": 0, "data": {"message_id": "om-result"}}])
+    result = asyncio.run(
+        FeishuMessageClient(transport, Tokens()).send_text(
+            "oc-chat",
+            "幂等答复",
+            idempotency_key="c5ad4f4c90ed4de2a9da8c4d1f0cc06b",
+        )
+    )
+    assert result.message_id == "om-result"
+    request = transport.requests[0]
+    assert request.json_body["uuid"] == "c5ad4f4c90ed4de2a9da8c4d1f0cc06b"
+
+
+def test_message_client_can_explicitly_reply_to_verified_source_message() -> None:
+    class Tokens:
+        async def get_token(self) -> str:
+            return "tenant-token"
+
+    transport = Transport([{"code": 0, "data": {"message_id": "om-reply"}}])
+    result = asyncio.run(
+        FeishuMessageClient(transport, Tokens()).reply_text(
+            "om/source id",
+            "线程答复",
+            idempotency_key="reply-1",
+        )
+    )
+    assert result.message_id == "om-reply"
+    request = transport.requests[0]
+    assert request.url.endswith("/open-apis/im/v1/messages/om%2Fsource%20id/reply")
+    assert request.json_body == {
+        "msg_type": "text",
+        "content": '{"text":"线程答复"}',
+        "reply_in_thread": True,
+        "uuid": "reply-1",
+    }
+
+
+@pytest.mark.parametrize("value", ["", "x" * 51, "bad\x00key"])
+def test_message_client_rejects_invalid_idempotency_key(value: str) -> None:
+    class Tokens:
+        async def get_token(self) -> str:
+            raise AssertionError("invalid input must fail before token acquisition")
+
+    client = FeishuMessageClient(Transport([]), Tokens())
+    with pytest.raises(ValueError, match="idempotency_key"):
+        asyncio.run(client.send_text("oc-chat", "hello", idempotency_key=value))
 
 
 def test_nonzero_feishu_business_code_is_failure_without_leaking_body() -> None:

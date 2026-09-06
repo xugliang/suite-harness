@@ -46,6 +46,8 @@ def _loaded(
     web: bool,
     feishu: bool,
     feishu_transport: str = "long_connection",
+    feishu_processing_timeout_seconds: float = 600.0,
+    feishu_processing_lease_seconds: float = 660.0,
     products: tuple[str, ...] = ("sales",),
     routes: tuple[dict[str, str], ...] = (),
     writable: bool = False,
@@ -63,6 +65,8 @@ def _loaded(
             "app_id": "cli-company" if feishu else None,
             "credentials_ref": "feishu/default",
             "transport": feishu_transport,
+            "event_processing_timeout_seconds": feishu_processing_timeout_seconds,
+            "event_processing_lease_seconds": feishu_processing_lease_seconds,
             "writable_roots": (
                 [{"space": "product", "path": "exports"}] if writable else []
             ),
@@ -369,7 +373,13 @@ def test_web_runtime_builds_routes_auth_router_and_shared_session_policy(tmp_pat
 
 def test_feishu_long_connection_uses_durable_deployment_dedupe(tmp_path: Path) -> None:
     async def exercise():  # type: ignore[no-untyped-def]
-        loaded = _loaded(tmp_path, web=False, feishu=True)
+        loaded = _loaded(
+            tmp_path,
+            web=False,
+            feishu=True,
+            feishu_processing_timeout_seconds=700,
+            feishu_processing_lease_seconds=701,
+        )
         activation = Activation(("sales",))
         sdk = LongConnectionSdk(_feishu_body())
         shared_database = SQLiteDatabase(loaded.config.storage.runtime_path())
@@ -394,6 +404,8 @@ def test_feishu_long_connection_uses_durable_deployment_dedupe(tmp_path: Path) -
             ),
             runtime_database=shared_database,
         )
+        assert runtime.feishu_processor.processing_timeout_seconds == 700
+        assert runtime.feishu_deduplicator.processing_lease_seconds == 701
         assert runtime.starlette_routes() == ()
         await runtime.run_feishu_long_connection()
         row = runtime._database.connection.execute(  # noqa: SLF001
@@ -419,6 +431,79 @@ def test_feishu_long_connection_uses_durable_deployment_dedupe(tmp_path: Path) -
     assert activation.requests[0].scope.channel_id == "feishu"
     assert activation.requests[0].scope.path.agent_id == "sales-agent"
     assert scope == ("acme-main", "feishu")
+
+
+def test_feishu_default_product_routes_new_ab_private_chat(tmp_path: Path) -> None:
+    async def exercise():  # type: ignore[no-untyped-def]
+        loaded = _loaded(
+            tmp_path,
+            web=False,
+            feishu=True,
+            feishu_transport="webhook",
+            products=("product-a", "product-b"),
+            # This satisfies the static config rule but deliberately does not
+            # match the new private chat in _feishu_body().
+            routes=(
+                {
+                    "channel": "feishu",
+                    "conversation_id": "previously-known-chat",
+                    "product_id": "product-a",
+                },
+            ),
+        )
+        activation = Activation(("product-a", "product-b"))
+        runtime = await CompanyChannelRuntime.create(
+            loaded,
+            activation=activation,
+            sessions=InMemorySessionStore(),
+            tools=InMemoryToolRegistry(),
+            capabilities=InMemoryCapabilityAuthority(),
+            grant_templates=(
+                ToolAccessTemplate(
+                    channel_id="feishu", product_id="product-a"
+                ),
+                ToolAccessTemplate(channel_id="feishu", product_id="product-b"),
+            ),
+            feishu_adapters=FeishuHostAdapters(
+                directory=Directory(),
+                outbound_sink=lambda _message, _event: asyncio.sleep(0),
+                default_product_id="product-a",
+            ),
+        )
+        outcome = await runtime.feishu_processor.accept_verified_json(_feishu_body())
+        await runtime.close()
+        return activation, outcome
+
+    activation, outcome = asyncio.run(exercise())
+    assert outcome is FeishuEventOutcome.DISPATCHED
+    assert activation.requests[0].scope.product_id == "product-a"
+
+
+def test_feishu_unknown_default_product_fails_startup(tmp_path: Path) -> None:
+    async def exercise():  # type: ignore[no-untyped-def]
+        loaded = _loaded(tmp_path, web=False, feishu=True)
+        with pytest.raises(
+            ChannelHostConfigurationError,
+            match="default_product_id.*active product",
+        ):
+            await CompanyChannelRuntime.create(
+                loaded,
+                activation=Activation(("sales",)),
+                sessions=InMemorySessionStore(),
+                tools=InMemoryToolRegistry(),
+                capabilities=InMemoryCapabilityAuthority(),
+                grant_templates=(
+                    ToolAccessTemplate(channel_id="feishu", product_id="sales"),
+                ),
+                feishu_adapters=FeishuHostAdapters(
+                    directory=Directory(),
+                    outbound_sink=lambda _message, _event: asyncio.sleep(0),
+                    default_product_id="not-selected",
+                    long_connection_sdk=LongConnectionSdk(_feishu_body()),
+                ),
+            )
+
+    asyncio.run(exercise())
 
 
 def test_feishu_whitelisted_write_template_makes_run_not_read_only(tmp_path: Path) -> None:

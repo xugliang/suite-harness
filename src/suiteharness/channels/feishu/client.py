@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from pydantic import SecretStr
 
@@ -72,6 +72,21 @@ def _api_payload(response: FeishuHttpResponse, operation: str) -> dict[str, Any]
             retryable=code in {99991400, 99991401, 99991402},
         )
     return payload
+
+
+def _idempotency_key(value: str | None) -> str | None:
+    """Validate Feishu's create/reply ``uuid`` field.
+
+    Feishu documents this field as a caller-provided unique string with a
+    maximum length of 50 characters.  It is intentionally optional so existing
+    callers keep their previous wire payload.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 50 or "\x00" in value:
+        raise ValueError("invalid Feishu idempotency_key")
+    return value
 
 
 class CachedTenantAccessTokenProvider:
@@ -192,6 +207,7 @@ class FeishuMessageClient:
         text: str,
         *,
         receive_id_type: str = "chat_id",
+        idempotency_key: str | None = None,
     ) -> FeishuSendResult:
         if receive_id_type not in self._RECEIVE_ID_TYPES:
             raise ValueError("unsupported Feishu receive_id_type")
@@ -199,8 +215,18 @@ class FeishuMessageClient:
             raise ValueError("invalid Feishu receive_id")
         if not text or len(text) > self._max_text_chars or "\x00" in text:
             raise ValueError("invalid Feishu message text")
+        uuid = _idempotency_key(idempotency_key)
         token = await self._tokens.get_token()
         query = urlencode({"receive_id_type": receive_id_type})
+        body: dict[str, Any] = {
+            "receive_id": receive_id,
+            "msg_type": "text",
+            "content": json.dumps(
+                {"text": text}, ensure_ascii=False, separators=(",", ":")
+            ),
+        }
+        if uuid is not None:
+            body["uuid"] = uuid
         response = await self._transport.send(
             FeishuHttpRequest(
                 method="POST",
@@ -209,27 +235,79 @@ class FeishuMessageClient:
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json; charset=utf-8",
                 },
-                json_body={
-                    "receive_id": receive_id,
-                    "msg_type": "text",
-                    "content": json.dumps(
-                        {"text": text}, ensure_ascii=False, separators=(",", ":")
-                    ),
-                },
+                json_body=body,
                 timeout_seconds=self._timeout_seconds,
             )
         )
-        payload = _api_payload(response, "message send")
+        return self._send_result(response, "message send")
+
+    async def reply_text(
+        self,
+        message_id: str,
+        text: str,
+        *,
+        idempotency_key: str | None = None,
+        reply_in_thread: bool = True,
+    ) -> FeishuSendResult:
+        """Reply to one verified source message, optionally inside its thread.
+
+        Hosts must select this method from trusted channel configuration or
+        verified event metadata.  Model output must never choose ``message_id``.
+        """
+
+        if not message_id or len(message_id) > 1024 or "\x00" in message_id:
+            raise ValueError("invalid Feishu message_id")
+        if not text or len(text) > self._max_text_chars or "\x00" in text:
+            raise ValueError("invalid Feishu message text")
+        if not isinstance(reply_in_thread, bool):
+            raise ValueError("reply_in_thread must be a boolean")
+        uuid = _idempotency_key(idempotency_key)
+        token = await self._tokens.get_token()
+        body: dict[str, Any] = {
+            "msg_type": "text",
+            "content": json.dumps(
+                {"text": text}, ensure_ascii=False, separators=(",", ":")
+            ),
+            "reply_in_thread": reply_in_thread,
+        }
+        if uuid is not None:
+            body["uuid"] = uuid
+        encoded_message_id = quote(message_id, safe="")
+        response = await self._transport.send(
+            FeishuHttpRequest(
+                method="POST",
+                url=(
+                    f"{self._endpoint}/open-apis/im/v1/messages/"
+                    f"{encoded_message_id}/reply"
+                ),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json_body=body,
+                timeout_seconds=self._timeout_seconds,
+            )
+        )
+        return self._send_result(response, "message reply")
+
+    @staticmethod
+    def _send_result(
+        response: FeishuHttpResponse,
+        operation: str,
+    ) -> FeishuSendResult:
+        payload = _api_payload(response, operation)
         data = payload.get("data")
         if not isinstance(data, dict):
-            raise FeishuApiError("Feishu message send response omitted data")
+            raise FeishuApiError(f"Feishu {operation} response omitted data")
         message_id = data.get("message_id")
         if not isinstance(message_id, str):
-            raise FeishuApiError("Feishu message send response omitted message_id")
+            raise FeishuApiError(f"Feishu {operation} response omitted message_id")
         try:
             return FeishuSendResult(message_id=message_id)
         except ValueError as exc:
-            raise FeishuApiError("Feishu message send returned an invalid message_id") from exc
+            raise FeishuApiError(
+                f"Feishu {operation} returned an invalid message_id"
+            ) from exc
 
 
 class HttpxFeishuTransport:

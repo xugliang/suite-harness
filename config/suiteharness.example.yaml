@@ -59,6 +59,9 @@ storage:
 sandbox:
   backend: docker
   required: true
+  # 生产建议显式选择服务账号自己的 rootless Docker context，避免误连宿主 root daemon。
+  context: suiteharness-rootless
+  require_rootless: true
   # 必须替换为本公司构建并验证过的真实镜像摘要；production 禁止 latest/浮动标签。
   image: registry.example.com/suiteharness/sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
   limits:
@@ -121,6 +124,7 @@ channels:
     session_path: /auth/session
     session_lifetime_seconds: 300
     authentication_timeout_seconds: 10
+    session_revalidation_interval_seconds: 30
     # 协议层与应用层统一固定为 1 MiB，避免完整大帧先被服务器缓冲。
     max_frame_bytes: 1048576
     allowed_origins:
@@ -133,6 +137,9 @@ channels:
     credentials_ref: feishu/default
     # 飞书外部用户到公司目录主体的解析上限；超时或目录异常一律拒绝。
     authentication_timeout_seconds: 10
+    # 从事件 claim 到完成标记的总处理上限；租约必须严格大于该值。
+    event_processing_timeout_seconds: 600
+    event_processing_lease_seconds: 660
     default_access: read_only
     interactive_approval: false
     allow_delete: false

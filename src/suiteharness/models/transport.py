@@ -7,6 +7,7 @@ headers from ``repr`` because they may contain credentials.
 
 from __future__ import annotations
 
+import codecs
 import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
@@ -22,7 +23,7 @@ class HttpRequest:
     method: str
     url: str
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
-    json_body: JsonValue | None = None
+    json_body: JsonValue | None = field(default=None, repr=False)
     timeout_seconds: float = 120.0
 
 
@@ -30,7 +31,7 @@ class HttpRequest:
 class HttpResponse:
     status_code: int
     headers: Mapping[str, str]
-    body: bytes
+    body: bytes = field(repr=False)
 
     def json(self) -> JsonValue:
         try:
@@ -245,6 +246,7 @@ async def iter_sse_json(
     buffer = ""
     event_lines: list[str] = []
     received = 0
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
 
     def decode_event(lines: list[str]) -> dict[str, Any] | None:
         data = "\n".join(line[5:].lstrip() for line in lines if line.startswith("data:"))
@@ -272,7 +274,7 @@ async def iter_sse_json(
                 "model provider stream exceeded the configured byte limit",
             )
         try:
-            buffer += chunk.decode("utf-8")
+            buffer += decoder.decode(chunk, final=False)
         except UnicodeDecodeError as exc:
             raise ModelProviderError(
                 ModelErrorCode.RESPONSE_INVALID,
@@ -294,6 +296,29 @@ async def iter_sse_json(
             event_lines = []
             if value is not None:
                 yield value
+    try:
+        buffer += decoder.decode(b"", final=True)
+    except UnicodeDecodeError as exc:
+        raise ModelProviderError(
+            ModelErrorCode.RESPONSE_INVALID,
+            "model provider stream is not UTF-8",
+        ) from exc
+    if len(buffer) > max_buffer_characters:
+        raise ModelProviderError(
+            ModelErrorCode.RESPONSE_INVALID,
+            "model provider SSE event exceeded the configured buffer limit",
+        )
+    while "\n" in buffer:
+        line, buffer = buffer.split("\n", 1)
+        line = line.rstrip("\r")
+        if line:
+            if not line.startswith(":"):
+                event_lines.append(line)
+            continue
+        value = decode_event(event_lines)
+        event_lines = []
+        if value is not None:
+            yield value
     if buffer:
         event_lines.append(buffer.rstrip("\r"))
     value = decode_event(event_lines)

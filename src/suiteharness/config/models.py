@@ -277,6 +277,8 @@ class DockerSandboxConfig(_FrozenConfig):
     backend: Literal["docker"] = "docker"
     required: Literal[True] = True
     binary: str = "docker"
+    context: str | None = None
+    require_rootless: bool = False
     image: str
     limits: SandboxLimitsConfig = Field(default_factory=SandboxLimitsConfig)
     network: SandboxNetworkConfig = Field(default_factory=SandboxNetworkConfig)
@@ -288,10 +290,32 @@ class DockerSandboxConfig(_FrozenConfig):
             raise ValueError("sandbox binary must be a bare executable name")
         return value
 
+    @field_validator("context")
+    @classmethod
+    def validate_context(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+            raise ValueError("sandbox Docker context name is invalid")
+        return value
+
+    @field_validator("require_rootless", mode="before")
+    @classmethod
+    def validate_require_rootless(cls, value: object) -> object:
+        if not isinstance(value, bool):
+            raise ValueError("sandbox require_rootless must be a boolean")
+        return value
+
     @field_validator("image")
     @classmethod
     def validate_image(cls, value: str) -> str:
-        if not value or value != value.strip() or any(char.isspace() for char in value):
+        if (
+            not value
+            or value.startswith("-")
+            or "\x00" in value
+            or value != value.strip()
+            or any(char.isspace() for char in value)
+        ):
             raise ValueError("Docker image must be a non-empty image reference")
         leaf = value.rsplit("/", 1)[-1]
         if value.endswith(":latest") or (":" not in leaf and "@" not in value):
@@ -322,18 +346,40 @@ class WebChannelConfig(_FrozenConfig):
     websocket_path: str = "/ws"
     session_path: str = "/auth/session"
     session_lifetime_seconds: int = Field(default=300, ge=30, le=900)
+    session_cookie_name: str = "suiteharness_session"
+    session_cookie_secure: bool = True
     authentication_timeout_seconds: float = Field(default=10.0, gt=0.0, le=60.0)
+    session_revalidation_interval_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
     max_frame_bytes: Literal[1_048_576] = 1_048_576
     allowed_origins: tuple[str, ...] = ()
     approval_mode: Literal["interactive"] = "interactive"
     credentials_ref: str = "web/default"
 
-    @field_validator("authentication_timeout_seconds", mode="before")
+    @field_validator("session_cookie_name")
+    @classmethod
+    def validate_session_cookie_name(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value):
+            raise ValueError("invalid Web session cookie name")
+        return value
+
+    @field_validator(
+        "authentication_timeout_seconds",
+        "session_revalidation_interval_seconds",
+        mode="before",
+    )
     @classmethod
     def validate_authentication_timeout_type(cls, value: object) -> object:
         if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ValueError("Web authentication timeout must be a number")
+            raise ValueError("Web authentication timeout and revalidation interval must be numbers")
         return value
+
+    @model_validator(mode="after")
+    def validate_session_timing(self) -> WebChannelConfig:
+        if self.session_revalidation_interval_seconds > self.session_lifetime_seconds:
+            raise ValueError(
+                "Web session revalidation interval must not exceed the session lifetime"
+            )
+        return self
 
     @field_validator("websocket_path")
     @classmethod
@@ -386,13 +432,20 @@ class FeishuChannelConfig(_FrozenConfig):
     interactive_approval: Literal[False] = False
     allow_delete: Literal[False] = False
     authentication_timeout_seconds: float = Field(default=10.0, gt=0.0, le=60.0)
+    event_processing_timeout_seconds: float = Field(default=600.0, gt=0.0, le=3_600.0)
+    event_processing_lease_seconds: float = Field(default=660.0, gt=0.0, le=7_200.0)
     writable_roots: tuple[WorkspaceRootConfig, ...] = ()
 
-    @field_validator("authentication_timeout_seconds", mode="before")
+    @field_validator(
+        "authentication_timeout_seconds",
+        "event_processing_timeout_seconds",
+        "event_processing_lease_seconds",
+        mode="before",
+    )
     @classmethod
     def validate_authentication_timeout_type(cls, value: object) -> object:
         if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ValueError("Feishu authentication timeout must be a number")
+            raise ValueError("Feishu timeout and lease values must be numbers")
         return value
 
     @field_validator("credentials_ref")
@@ -418,6 +471,11 @@ class FeishuChannelConfig(_FrozenConfig):
             raise ValueError("Feishu app_id must not be blank")
         if len(self.writable_roots) != len(set(self.writable_roots)):
             raise ValueError("Feishu writable_roots must not contain duplicates")
+        if self.event_processing_lease_seconds <= self.event_processing_timeout_seconds:
+            raise ValueError(
+                "Feishu event_processing_lease_seconds must be strictly greater than "
+                "event_processing_timeout_seconds"
+            )
         return self
 
 
@@ -488,6 +546,24 @@ class ChannelsConfig(_FrozenConfig):
         return self
 
 
+class ModelCapabilitiesConfig(_FrozenConfig):
+    """Optional per-model capability differences declared by the trusted host."""
+
+    streaming: bool | None = None
+    tools: bool | None = None
+    parallel_tool_calls: bool | None = None
+    json_schema: bool | None = None
+    reasoning: bool | None = None
+    vision: bool | None = None
+    documents: bool | None = None
+    max_context_tokens: int | None = Field(default=None, ge=1)
+
+    def to_runtime(self):  # type: ignore[no-untyped-def]
+        from suiteharness.models import ModelCapabilities
+
+        return ModelCapabilities.model_validate(self.model_dump())
+
+
 class ModelProfileConfig(_FrozenConfig):
     """One server-owned model endpoint; credentials remain in SuiteHarnessSecrets."""
 
@@ -502,6 +578,8 @@ class ModelProfileConfig(_FrozenConfig):
     default_headers: dict[str, str] = Field(default_factory=dict)
     provider_options: dict[str, JsonValue] = Field(default_factory=dict)
     allow_plain_http: bool = False
+    capabilities: ModelCapabilitiesConfig = Field(default_factory=ModelCapabilitiesConfig)
+    allow_capability_overrides: bool = False
 
     @field_validator("profile_id", "provider_id")
     @classmethod
@@ -562,6 +640,8 @@ class ModelProfileConfig(_FrozenConfig):
             default_headers=self.default_headers,
             provider_options=self.provider_options,
             allow_plain_http=self.allow_plain_http,
+            capabilities=self.capabilities.to_runtime(),
+            allow_capability_overrides=self.allow_capability_overrides,
         )
 
 
@@ -1114,6 +1194,8 @@ class SuiteHarnessConfig(_FrozenConfig):
                     f"{sorted(insecure_credential_profiles)!r}"
                 )
             if self.channels.web.enabled:
+                if not self.channels.web.session_cookie_secure:
+                    raise ValueError("production Web session cookies must use Secure")
                 if not self.channels.web.allowed_origins:
                     raise ValueError("production Web channel requires allowed_origins")
                 if any(not origin.startswith("https://") for origin in self.channels.web.allowed_origins):
@@ -1257,6 +1339,7 @@ __all__ = [
     "PluginsConfig",
     "ProviderCredentials",
     "ServiceCredentials",
+    "ModelCapabilitiesConfig",
     "ModelProfileConfig",
     "ModelRouteConfig",
     "ModelsConfig",

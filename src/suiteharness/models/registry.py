@@ -119,6 +119,9 @@ class ProviderRegistry:
                 ) from exc
         elif descriptor.auth is ProviderAuthKind.INTERNAL_NONE and profile.credential_ref:
             credential = secrets.resolve(profile.credential_ref)
+        descriptor = descriptor.model_copy(
+            update={"capabilities": profile.effective_capabilities(descriptor.capabilities)}
+        )
         return factory(descriptor, profile, transport, credential)
 
     def descriptors(self) -> tuple[ProviderDescriptor, ...]:

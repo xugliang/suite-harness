@@ -18,7 +18,12 @@ from suiteharness.channels import (
 )
 
 
-def _message(*, product_id: str | None = None, sender: str = "ou-external") -> InboundMessage:
+def _message(
+    *,
+    product_id: str | None = None,
+    sender: str = "ou-external",
+    metadata: dict[str, str] | None = None,
+) -> InboundMessage:
     return InboundMessage(
         channel=ChannelKind.FEISHU,
         event_id="event/ext/1",
@@ -28,6 +33,7 @@ def _message(*, product_id: str | None = None, sender: str = "ou-external") -> I
         text="hello",
         product_id=product_id,
         received_at=datetime.now(UTC),
+        metadata=metadata or {},
     )
 
 
@@ -87,6 +93,44 @@ def test_gateway_authenticates_and_builds_product_isolated_scope() -> None:
     assert scope.channel_id == "feishu"
     assert scope.path.session_id.startswith("session-")
     assert events[0].payload == {"product_id": "sales"}
+
+
+def test_feishu_trusted_session_scope_can_preserve_legacy_private_history() -> None:
+    async def scope_for(metadata: dict[str, str]):  # type: ignore[no-untyped-def]
+        app = Application()
+        gateway = EnterpriseChannelGateway(
+            tenant_id="acme",
+            authenticator=Authenticator(),
+            router=ProductRouter(("sales",)),
+            application=app,
+        )
+        _ = [event async for event in gateway.dispatch(_message(metadata=metadata))]
+        return app.scopes[0]
+
+    default = asyncio.run(scope_for({}))
+    compatible = asyncio.run(scope_for({"session_scope_id": "user-1"}))
+
+    assert compatible.path.session_id != default.path.session_id
+    assert compatible.principal_id == default.principal_id == "user-1"
+
+
+def test_invalid_feishu_trusted_session_scope_fails_closed() -> None:
+    async def exercise():  # type: ignore[no-untyped-def]
+        gateway = EnterpriseChannelGateway(
+            tenant_id="acme",
+            authenticator=Authenticator(),
+            router=ProductRouter(("sales",)),
+            application=Application(),
+        )
+        return [
+            event
+            async for event in gateway.dispatch(
+                _message(metadata={"session_scope_id": ""})
+            )
+        ]
+
+    with pytest.raises(ChannelAdmissionError, match="session scope"):
+        asyncio.run(exercise())
 
 
 def test_gateway_does_not_trust_an_unknown_external_sender() -> None:

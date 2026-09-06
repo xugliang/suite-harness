@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -40,6 +41,12 @@ class LoadedSuiteHarnessConfig:
     secrets_path: Path = field(repr=False)
 
 
+@dataclass(frozen=True)
+class _DecodedDocument:
+    value: Mapping[str, Any]
+    identity: tuple[int, int]
+
+
 def _default_yaml_decoder(text: str) -> object:
     """Decode YAML with PyYAML when present, with a dependency-free JSON fallback.
 
@@ -67,24 +74,68 @@ def _read_document(
     maximum_bytes: int,
     decoder: YamlDecoder,
     check_private_permissions: bool,
-) -> Mapping[str, Any]:
+) -> _DecodedDocument:
     if path.suffix.lower() not in _YAML_SUFFIXES:
         raise ConfigLoadError(f"{label} must use a .yaml or .yml file")
-    if path.is_symlink():
-        raise ConfigLoadError(f"{label} must not be a symbolic link")
-    if not path.is_file():
-        raise ConfigLoadError(f"{label} is not a regular file: {path}")
-    if check_private_permissions and os.name != "nt":
-        permissions = stat.S_IMODE(path.stat().st_mode)
-        if permissions & 0o077:
-            raise ConfigLoadError(f"{label} must not be accessible by group or other users")
-    size = path.stat().st_size
-    if size > maximum_bytes:
-        raise ConfigLoadError(f"{label} exceeds the {maximum_bytes}-byte limit")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        text = path.read_text(encoding="utf-8-sig")
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode):
+            raise ConfigLoadError(f"{label} must not be a symbolic link")
+        descriptor = os.open(path, flags | nofollow)
+    except ConfigLoadError:
+        raise
+    except OSError as exc:
+        raise ConfigLoadError(f"{label} could not be opened safely") from exc
+
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ConfigLoadError(f"{label} is not a regular file")
+        # Windows does not expose O_NOFOLLOW.  Comparing the opened object to
+        # lstat closes the check/open gap there; Linux additionally rejects a
+        # link atomically in os.open.
+        if nofollow == 0:
+            try:
+                after = path.lstat()
+            except OSError as exc:
+                raise ConfigLoadError(f"{label} identity changed while opening") from exc
+            if stat.S_ISLNK(after.st_mode) or (after.st_dev, after.st_ino) != (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                raise ConfigLoadError(f"{label} identity changed while opening")
+        if check_private_permissions and os.name != "nt":
+            permissions = stat.S_IMODE(opened.st_mode)
+            if permissions & 0o077:
+                raise ConfigLoadError(
+                    f"{label} must not be accessible by group or other users"
+                )
+        if opened.st_size > maximum_bytes:
+            raise ConfigLoadError(f"{label} exceeds the {maximum_bytes}-byte limit")
+        with os.fdopen(descriptor, "rb", closefd=True) as source:
+            descriptor = -1
+            payload = source.read(maximum_bytes + 1)
+            after_read = os.fstat(source.fileno())
+        if (
+            (after_read.st_dev, after_read.st_ino) != (opened.st_dev, opened.st_ino)
+            or after_read.st_mode != opened.st_mode
+            or after_read.st_size != opened.st_size
+            or after_read.st_mtime_ns != opened.st_mtime_ns
+            or after_read.st_ctime_ns != opened.st_ctime_ns
+            or len(payload) != opened.st_size
+        ):
+            raise ConfigLoadError(f"{label} changed while being read")
+        if len(payload) > maximum_bytes:
+            raise ConfigLoadError(f"{label} exceeds the {maximum_bytes}-byte limit")
+        text = payload.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ConfigLoadError(f"{label} must be UTF-8 encoded") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     try:
         decoded = decoder(text)
     except ConfigLoadError:
@@ -95,7 +146,102 @@ def _read_document(
         raise ConfigLoadError(f"{label} is not valid YAML") from exc
     if not isinstance(decoded, Mapping):
         raise ConfigLoadError(f"{label} document root must be a mapping")
-    return decoded
+    return _DecodedDocument(
+        value=decoded,
+        identity=(opened.st_dev, opened.st_ino),
+    )
+
+
+def _is_placeholder(value: str) -> bool:
+    normalized = value.strip().casefold()
+    return normalized in {"replace", "secret", "token", "password"} or any(
+        marker in normalized
+        for marker in (
+            "replace-with",
+            ":replace@",
+            "change-me",
+            "changeme",
+            "your-api-key",
+            "your-secret",
+            "placeholder",
+        )
+    )
+
+
+def _is_reserved_url(value: str) -> bool:
+    parsed = urlsplit(value if "://" in value else f"//{value}")
+    hostname = (parsed.hostname or "").rstrip(".").casefold()
+    return hostname in {"example", "example.com", "example.org", "example.net"} or any(
+        hostname.endswith(suffix)
+        for suffix in (".example", ".example.com", ".example.org", ".example.net", ".invalid")
+    )
+
+
+def _iter_secret_values(secrets: SuiteHarnessSecrets) -> list[str]:
+    values: list[str] = []
+    for credential in secrets.web.values():
+        values.append(credential.session_signing_key.get_secret_value())
+    for credential in secrets.feishu.values():
+        values.append(credential.app_secret.get_secret_value())
+        for optional in (credential.verification_token, credential.encrypt_key):
+            if optional is not None:
+                values.append(optional.get_secret_value())
+    for credential in secrets.model_providers.values():
+        for optional in (
+            credential.api_key,
+            credential.access_key_id,
+            credential.secret_access_key,
+            credential.session_token,
+            credential.service_account_json,
+            credential.endpoint_credential,
+        ):
+            if optional is not None:
+                values.append(optional.get_secret_value())
+    for credential in secrets.services.values():
+        for optional in (
+            credential.token,
+            credential.api_key,
+            credential.client_id,
+            credential.client_secret,
+        ):
+            if optional is not None:
+                values.append(optional.get_secret_value())
+        values.extend(value.get_secret_value() for value in credential.headers.values())
+    return values
+
+
+def _validate_production_placeholders(
+    config: SuiteHarnessConfig,
+    secrets: SuiteHarnessSecrets,
+) -> None:
+    if config.deployment.environment != "production":
+        return
+
+    public_values = [profile.model for profile in config.models.profiles]
+    if config.channels.feishu.enabled:
+        public_values.append(config.channels.feishu.app_id)
+    if any(_is_placeholder(value) for value in public_values):
+        raise ConfigLoadError("production configuration contains a placeholder value")
+    secret_values = _iter_secret_values(secrets)
+    if any(_is_placeholder(value) for value in secret_values):
+        raise ConfigLoadError("production secrets contain a placeholder value")
+    if any(
+        len(value.strip()) >= 16 and len(set(value.strip().rstrip("="))) <= 1
+        for value in secret_values
+    ):
+        raise ConfigLoadError("production secrets contain an obvious dummy value")
+
+    image = config.sandbox.image
+    if "@sha256:" in image and image.rsplit("@sha256:", 1)[1] == "0" * 64:
+        raise ConfigLoadError("production sandbox image uses the all-zero example digest")
+    endpoint_urls = [
+        profile.base_url for profile in config.models.profiles if profile.base_url is not None
+    ]
+    endpoint_urls.extend(config.channels.web.allowed_origins)
+    if _is_reserved_url(image.split("@", 1)[0]) or any(
+        _is_reserved_url(value) for value in endpoint_urls
+    ):
+        raise ConfigLoadError("production configuration uses a reserved example hostname")
 
 
 class SuiteHarnessConfigLoader:
@@ -117,26 +263,25 @@ class SuiteHarnessConfigLoader:
         private_path = Path(secrets_path).absolute()
         if public_path == private_path:
             raise ConfigLoadError("config and secrets must be separate files")
-        try:
-            if public_path.exists() and private_path.exists() and public_path.samefile(private_path):
-                raise ConfigLoadError("config and secrets must be separate files")
-        except OSError as exc:
-            raise ConfigLoadError("config file identity could not be verified") from exc
 
-        public_raw = _read_document(
+        public_document = _read_document(
             public_path,
             label="configuration file",
             maximum_bytes=self._maximum_bytes,
             decoder=self._decoder,
             check_private_permissions=False,
         )
-        private_raw = _read_document(
+        private_document = _read_document(
             private_path,
             label="secrets file",
             maximum_bytes=self._maximum_bytes,
             decoder=self._decoder,
             check_private_permissions=True,
         )
+        if public_document.identity == private_document.identity:
+            raise ConfigLoadError("config and secrets must be separate files")
+        public_raw = public_document.value
+        private_raw = private_document.value
         try:
             config = SuiteHarnessConfig.model_validate(public_raw)
         except ValidationError as exc:
@@ -153,6 +298,7 @@ class SuiteHarnessConfigLoader:
             validate_secret_references(config, secrets)
         except ValueError as exc:
             raise ConfigLoadError(str(exc)) from exc
+        _validate_production_placeholders(config, secrets)
         return LoadedSuiteHarnessConfig(
             config=config,
             secrets=secrets,

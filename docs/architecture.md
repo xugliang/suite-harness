@@ -231,7 +231,7 @@ suiteharness.web.search              suiteharness.web.fetch
 
 每个产品默认只能读写自己的产品目录。共享目录默认关闭；启用后还必须在 `workspace.shared_access_by_product` 为每个产品分别声明 `read_only`（只读）或 `read_write`（读写），未列出的产品看不到共享目录。Web/internal 服从这项产品级策略；飞书在此基础上仍保持全局只读，只能显式给 `write/edit` 配置白名单子目录，且 `allow_delete=false`。
 
-Bash 通过 `bash -lc` 在 `SandboxBackend`（沙箱后端）中执行。生产只接受摘要固定的 Docker 镜像，容器使用只读根文件系统、非特权用户、移除 Linux capabilities（内核特权能力）、禁止提权、限制 CPU/内存/进程/临时盘/时间/输出，网络默认关闭。若需要访问外部服务，只能选择运维预建的出口网络。每次启动 Docker 前先持久化准确容器名的 active lease（活动租约）；租约写入失败则不启动容器，正常完成或确认删除后才清除。进程硬崩溃、超时、取消、Docker CLI 异常或清理不确定都会留下租约，使重启后的整个 Docker 后端失败关闭，直到管理员按准确名称核对、必要时强制删除、再次确认容器消失并成功清除记录。
+Bash 通过 `bash -lc` 在 `SandboxBackend`（沙箱后端）中执行。生产只接受摘要固定的 Docker 镜像，容器使用只读根文件系统、非特权用户、移除 Linux capabilities（内核特权能力）、禁止提权、限制 CPU/内存/进程/临时盘/时间/输出，网络默认关闭。若需要访问外部服务，只能选择运维预建的出口网络。部署可用严格校验的 `sandbox.context` 显式选择服务账号的 rootless Docker 上下文；运行、探测、清理和恢复始终使用同一 context，避免环境默认值漂移。每次启动 Docker 前先持久化准确容器名的 active lease（活动租约）；租约写入失败则不启动容器，正常完成或确认删除后才清除。进程硬崩溃、超时、取消、Docker CLI 异常或清理不确定都会留下租约，使重启后的整个 Docker 后端失败关闭，直到管理员按准确名称核对、必要时强制删除、再次确认容器消失并成功清除记录。
 
 `web_search` 使用结构化搜索接口：百度千帆已有具体实现，Foundry Bing 保留注入客户端的适配面。`web_fetch` 可直连、通过公司 HTTP CONNECT 代理或浏览器工作进程；它对每次跳转重新解析地址、阻止私网/回环/链路本地等目标并要求对端 IP 证明，限制跳转、压缩、解压和文本大小。
 
@@ -269,9 +269,10 @@ Plugin（插件）是显式配置路径下的制品，不进行目录扫描。�
 
 WebSocket：
 
-- 握手前认证；
+- 握手前认证，并在每个非断开客户端帧前重新验证原票据；
 - 精确 Origin（网页来源）白名单，不接受通配符；
 - 可使用企业 SSO 后签发的短时 HMAC（消息认证码）会话票据，或注入 OIDC/JWT 认证器；
+- 可注入 `WebSocketSessionRevalidator` 查询公司会话/目录的动态状态；退出、禁用、tenant、主体或角色变化均失败关闭并取消连接内在途运行；
 - 严格帧模型、大小/并发/数量限制；
 - 审批只发给同公司同主体的连接，决定绑定具体调用且一次消费。
 
@@ -286,6 +287,7 @@ WebSocket：
 - 长连接通过官方 SDK 适配接口接线；
 - 外部用户标识必须经公司目录映射为内部主体；
 - 公司目录解析受 `channels.feishu.authentication_timeout_seconds` 限制，异常或超时失败关闭；
+- 事件 claim 后的分发、回复和完成标记受 `event_processing_timeout_seconds` 总上限约束，持久 processing lease 必须严格更长；Host 在启动时验证并接线，避免长回调仍运行时重复领取；
 - 过滤机器人消息，群聊要求提及机器人；
 - 默认只读，只有白名单目录下的内置写入/编辑可以开启，永不删除。
 

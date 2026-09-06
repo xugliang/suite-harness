@@ -333,6 +333,7 @@ tenants/{tenant}/products/{product}
 - CPU、内存、进程、临时盘、时间和输出有界；
 - 只挂载允许的产品/共享路径；
 - 默认断网，出口映射只能选预配置 Docker network；
+- 可通过严格名称校验的 `context` 对运行、探测与清理统一指定 rootless Docker 上下文，`require_rootless` 可在执行前强制核验 daemon 的 rootless 安全标志；
 - 调用 Docker 前先持久化准确容器名的活动租约，写入失败不启动；
 - 超时、取消或执行异常后只清理本次请求对应的确定容器名；
 - 正常完成或确认删除后才清除租约；硬崩溃、清理不确定或清单加载失败时重启后的整个后端停止接收运行；
@@ -553,7 +554,7 @@ SQLite 实现用事务、修订号 CAS、幂等键和持久运行 claim 防并�
 
 ### `persistence/events.py`
 
-`SQLiteChannelEventDeduplicator` 对渠道事件做带 TTL（存活时间）的持久 claim；容量不足时失败关闭，不驱逐仍有效的 claim。
+`SQLiteChannelEventDeduplicator` 对渠道事件做带 TTL（存活时间）的持久 claim；容量不足时失败关闭，不驱逐仍有效的 claim。它公开实际 `processing_lease_seconds`，供事件处理器在启动时验证租约严格覆盖单次处理硬上限；SQLite 和内存实现使用相同契约。
 
 ### `persistence/mcp.py`
 
@@ -609,7 +610,7 @@ SQLite 实现用事务、修订号 CAS、幂等键和持久运行 claim 防并�
 
 ### `channels/feishu/processor.py`
 
-过滤机器人/应用消息，群聊要求提及机器人，执行事件去重并转换为内部消息。可注入持久化去重器。
+过滤机器人/应用消息，群聊要求提及机器人，执行事件去重并转换为内部消息。可注入持久化去重器。claim 成功后的规范化、产品分发、所有回复和完成标记受一个总处理时限约束；去重器的 processing lease 不严格大于该时限时构造直接失败，避免首个回调仍运行时供应商重投被再次领取。
 
 ### `channels/feishu/client.py`
 
@@ -629,11 +630,11 @@ SQLite 实现用事务、修订号 CAS、幂等键和持久运行 claim 防并�
 
 ### `channels/websocket/auth.py`
 
-实现企业 SSO 后可签发的短时 HMAC 会话票据引用，并定义可替换 OIDC/JWT 认证器契约。票据不是 SSO 本身。
+实现企业 SSO 后可签发的短时 HMAC 会话票据引用，并定义可替换 OIDC/JWT 认证器契约。票据不是 SSO 本身；内置 HMAC 验证器在每个客户端帧前重新检查签名和到期时间。
 
 ### `channels/websocket/server.py`
 
-握手前核对精确 Origin 和认证；限制连接并发、帧大小和消息数；执行连接内去重；把审批挑战只投递给相同公司与主体的 socket。
+握手前核对精确 Origin 和认证，每个非断开客户端帧前重验原凭据；可注入 `WebSocketSessionRevalidator` 逐帧查询退出、吊销、账号状态和最新角色。复核返回空值、tenant/主体/角色与握手快照不同、超时或异常时均失败关闭，并取消该连接内的在途运行。服务还限制连接并发、帧大小和消息数，执行连接内去重，并把审批挑战只投递给相同公司与主体的 socket。
 
 ### `channels/websocket/starlette.py`
 
@@ -655,7 +656,7 @@ SQLite 实现用事务、修订号 CAS、幂等键和持久运行 claim 防并�
 - 插件路径、摘要和信任；
 - 单独密钥结构。
 
-跨字段验证会拒绝生产本地沙箱、浮动 Docker 镜像、Web 非 HTTPS Origin、WebSocket/会话交换/Webhook/健康路由冲突、多产品飞书无路由、未知产品/模型/MCP/出口/共享工作区引用、未定义的出口名称、关闭共享却声明共享权限、飞书共享写却没有产品级 `read_write` 等组合。至少启用一个公司渠道。`server.host/port` 供 ASGI 监听；Web `session_lifetime_seconds` 限制为 30–900 秒；公司认证和渠道 ACL 超时都有 60 秒硬上限且拒绝字符串/布尔值伪装成数字。
+跨字段验证会拒绝生产本地沙箱、浮动 Docker 镜像、Web 非 HTTPS Origin、WebSocket/会话交换/Webhook/健康路由冲突、多产品飞书无路由、未知产品/模型/MCP/出口/共享工作区引用、未定义的出口名称、关闭共享却声明共享权限、飞书共享写却没有产品级 `read_write` 等组合。至少启用一个公司渠道。`server.host/port` 供 ASGI 监听；Web `session_lifetime_seconds` 限制为 30–900 秒，`session_revalidation_interval_seconds` 必须为不超过票据寿命且最多 300 秒的正数；公司认证和渠道 ACL 超时都有 60 秒硬上限且拒绝字符串/布尔值伪装成数字。
 
 ### `config/loader.py`
 

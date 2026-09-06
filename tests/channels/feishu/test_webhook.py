@@ -121,6 +121,26 @@ def test_signature_and_decryption_happen_before_event_json_parsing() -> None:
     assert decryptor.calls == 1
     assert dispatcher.messages[0].text == "你好"
     assert dispatcher.messages[0].received_at == datetime.fromtimestamp(1_700_000_000, tz=UTC)
+    assert dispatcher.messages[0].product_id is None
+    assert dispatcher.messages[0].conversation_id == "oc-1"
+    assert dispatcher.messages[0].metadata["session_scope_id"] == "ou-user"
+
+
+def test_trusted_default_product_ignores_forged_event_product() -> None:
+    dispatcher = Dispatcher()
+    payload = _event(event_id="routed-event")
+    payload["product_id"] = "product-b"
+    payload["event"]["product_id"] = "product-b"  # type: ignore[index]
+    processor = FeishuEventProcessor(
+        dispatcher,
+        bot_open_id="ou-bot",
+        default_product_id="product-a",
+    )
+
+    outcome = asyncio.run(processor.process_payload(payload))
+
+    assert outcome is FeishuEventOutcome.DISPATCHED
+    assert dispatcher.messages[0].product_id == "product-a"
 
 
 def test_invalid_signature_never_reaches_decryptor() -> None:
@@ -169,6 +189,25 @@ def test_event_is_deduplicated_and_group_requires_bot_mention() -> None:
 
     messages = asyncio.run(exercise())
     assert [item.text for item in messages] == ["你好", "请总结"]
+    assert messages[1].metadata["session_scope_id"] == "oc-1"
+
+
+def test_thread_uses_chat_and_root_only_for_durable_session_scope() -> None:
+    dispatcher = Dispatcher()
+    payload = _event(event_id="thread-event", chat_type="group")
+    payload["event"]["message"]["root_id"] = "om-root"  # type: ignore[index]
+    payload["event"]["message"]["mentions"] = [  # type: ignore[index]
+        {"key": "@bot", "id": {"open_id": "ou-bot"}}
+    ]
+    payload["event"]["message"]["content"] = json.dumps({"text": "@bot 问题"})  # type: ignore[index]
+
+    outcome = asyncio.run(
+        FeishuEventProcessor(dispatcher, bot_open_id="ou-bot").process_payload(payload)
+    )
+
+    assert outcome is FeishuEventOutcome.DISPATCHED
+    assert dispatcher.messages[0].conversation_id == "oc-1"
+    assert dispatcher.messages[0].metadata["session_scope_id"] == "oc-1:om-root"
 
 
 @pytest.mark.parametrize(

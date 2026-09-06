@@ -131,6 +131,24 @@ class ProductAActivator:
 
 每个选中产品都必须提供一个独立存活的 `PROFILE_PROVIDER`。A 和 B 可以用同一个适配器类，但不能复用同一个对象，也不能落入同一个无产品分区的数据空间。
 
+### 3.1 产品复用公司模型网关
+
+需要直接调用模型的产品服务应复用 Root（根作用域）唯一的 `MODEL_GATEWAY`，不能自行读取密钥、拼接任意模型地址或再创建一套网关。该服务键只能在 Root 绑定，产品可以在 `install` 阶段解析，但不能覆盖：
+
+```python
+from suiteharness.models import MODEL_GATEWAY
+
+
+async def install(context: ProductActivationContext) -> None:
+    gateway = context.resolve(MODEL_GATEWAY)
+    model_client.bind(gateway)  # 先绑定，再发布产品 HTTP/runtime 句柄
+    context.own("product-a-model-client", model_client.clear)
+```
+
+`prepare()` 发生在 `install()` 之前，因此需要提前构造产品服务时，可注入一个未绑定即失败的延迟代理（Deferred Proxy，延迟代理），并在 `install()` 中绑定。不要在 `prepare()` 中发模型请求。产品仍只能调用管理员配置中存在的 `route_id`（模型路线）；网关会继续校验精确模型白名单、视觉/结构化输出等能力、凭据和后备路线。
+
+若安装中途失败，延迟代理和产品对外句柄必须随事务清理。这样不会出现“产品 HTTP 已能接流量，但模型网关尚未就绪”的半启动状态。
+
 ## 4. 工作流、提示词与反思如何分工
 
 - `Workflow`（工作流）：决定下一步回答还是提出工具调用；

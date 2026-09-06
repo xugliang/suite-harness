@@ -98,6 +98,26 @@ class HangingCompanyAuthenticator(CompanyAuthenticator):
         await asyncio.Event().wait()
 
 
+class MutableWebSessionRevalidator:
+    def __init__(self) -> None:
+        self.current: AuthenticatedPrincipal | None = AuthenticatedPrincipal(
+            tenant_id="acme",
+            principal_id="alice",
+            roles=frozenset({"employee"}),
+        )
+        self.calls = 0
+
+    async def revalidate(
+        self,
+        handshake,  # type: ignore[no-untyped-def]
+        established_principal: AuthenticatedPrincipal,
+    ) -> AuthenticatedPrincipal | None:
+        del handshake
+        self.calls += 1
+        assert established_principal.principal_id == "alice"
+        return self.current
+
+
 def _configuration(
     tmp_path: Path,
     *,
@@ -184,6 +204,7 @@ def _bootstrap(
     process: ProcessTransport,
     *,
     authenticator: CompanyAuthenticator | None = None,
+    session_revalidator: MutableWebSessionRevalidator | None = None,
     authentication_timeout_seconds: float = 10.0,
 ) -> tuple[CompanyServerBootstrap, CompanyAuthenticator]:
     descriptor = ProductDescriptor(
@@ -206,6 +227,7 @@ def _bootstrap(
             ToolAccessTemplate(channel_id="web", product_id="product-a"),
         ),
         web_authenticator=authenticator,
+        web_session_revalidator=session_revalidator,
         model_transport=ModelTransport(),  # type: ignore[arg-type]
         sandbox_transport=process,
     )
@@ -293,6 +315,92 @@ def test_company_asgi_lifespan_sso_health_and_websocket(
     assert owned_runtime.closed
 
 
+def test_browser_websocket_uses_https_cookie_without_authorization_header(tmp_path: Path) -> None:
+    from starlette.websockets import WebSocketDisconnect
+
+    bootstrap, _authenticator = _bootstrap(tmp_path, ProcessTransport())
+    application = create_company_asgi_app(bootstrap)
+    with TestClient(application, base_url="https://portal.example.cn") as client:
+        issued = client.post("/auth/session", headers={
+            "Origin": "https://portal.example.cn", "Authorization": "Bearer company-sso",
+        })
+        assert issued.status_code == 200
+        cookie = issued.headers["set-cookie"]
+        assert "HttpOnly" in cookie and "Secure" in cookie
+        assert "SameSite=strict" in cookie and "Max-Age=300" in cookie
+        assert "Path=/ws" in cookie and "Domain=" not in cookie
+        # Browser WebSocket constructors cannot attach an Authorization header.
+        # The client must automatically select the host/path/secure cookie instead.
+        with client.websocket_connect(
+            "wss://portal.example.cn/ws", headers={"Origin": "https://portal.example.cn"},
+            subprotocols=["suiteharness.v1"],
+        ) as socket:
+            socket.send_json({"type": "ping", "nonce": "browser-cookie"})
+            assert socket.receive_json() == {"type": "pong", "nonce": "browser-cookie"}
+        with pytest.raises(WebSocketDisconnect) as denied:
+            with client.websocket_connect(
+                "wss://portal.example.cn/ws", headers={"Origin": "https://foreign.invalid"},
+            ):
+                pytest.fail("cross-origin cookie connection was accepted")
+        assert denied.value.code == 4403
+
+
+def test_bootstrap_injected_session_revalidator_revokes_an_open_socket(
+    tmp_path: Path,
+) -> None:
+    from starlette.websockets import WebSocketDisconnect
+
+    revalidator = MutableWebSessionRevalidator()
+    bootstrap, _authenticator = _bootstrap(
+        tmp_path,
+        ProcessTransport(),
+        session_revalidator=revalidator,
+    )
+    application = create_company_asgi_app(bootstrap)
+    with TestClient(application, base_url="https://portal.example.cn") as client:
+        issued = client.post(
+            "/auth/session",
+            headers={
+                "Origin": "https://portal.example.cn",
+                "Authorization": "Bearer company-sso",
+            },
+        )
+        token = issued.json()["access_token"]
+        with client.websocket_connect(
+            "/ws",
+            headers={
+                "Origin": "https://portal.example.cn",
+                "Authorization": f"Bearer {token}",
+            },
+            subprotocols=["suiteharness.v1"],
+        ) as socket:
+            socket.send_json({"type": "ping", "nonce": "active"})
+            assert socket.receive_json() == {"type": "pong", "nonce": "active"}
+            revalidator.current = None
+            socket.send_json({"type": "ping", "nonce": "revoked"})
+            with pytest.raises(WebSocketDisconnect) as denied:
+                socket.receive_json()
+            assert denied.value.code == 4401
+    assert revalidator.calls == 2
+
+
+def test_browser_cookie_is_not_sent_over_plain_websocket_or_as_query_token(tmp_path: Path) -> None:
+    from starlette.websockets import WebSocketDisconnect
+
+    bootstrap, _authenticator = _bootstrap(tmp_path, ProcessTransport())
+    application = create_company_asgi_app(bootstrap)
+    with TestClient(application, base_url="https://portal.example.cn") as client:
+        issued = client.post("/auth/session", headers={
+            "Origin": "https://portal.example.cn", "Authorization": "Bearer company-sso",
+        })
+        token = issued.json()["access_token"]
+        with pytest.raises(WebSocketDisconnect) as denied:
+            with client.websocket_connect(
+                f"ws://portal.example.cn/ws?token={token}",
+                headers={"Origin": "https://portal.example.cn"},
+            ):
+                pytest.fail("an insecure URL token was accepted")
+        assert denied.value.code == 4401
 def test_company_asgi_startup_fails_closed_when_sandbox_is_unavailable(
     tmp_path: Path,
 ) -> None:

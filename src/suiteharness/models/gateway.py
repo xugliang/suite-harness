@@ -47,8 +47,10 @@ class ModelGateway:
         for key, profile in self._profiles.items():
             if key != profile.profile_id:
                 raise ValueError("model profile map key must equal profile_id")
-            if self._registry.descriptor(profile.provider_id) is None:
+            descriptor = self._registry.descriptor(profile.provider_id)
+            if descriptor is None:
                 raise ValueError(f"unknown provider in model profile {key!r}")
+            profile.effective_capabilities(descriptor.capabilities)
         for key, route in self._routes.items():
             if key != route.route_id:
                 raise ValueError("model route map key must equal route_id")
@@ -84,7 +86,9 @@ class ModelGateway:
             self._providers[profile.profile_id] = provider
         return provider
 
-    def _validate_request(self, profile: ModelProfile, request: ModelRequest) -> None:
+    def _validate_request(
+        self, profile: ModelProfile, request: ModelRequest, *, streaming: bool = False
+    ) -> None:
         model = request.model or profile.model
         if not profile.permits_model(model):
             raise ModelProviderError(
@@ -98,7 +102,13 @@ class ModelGateway:
                 ModelErrorCode.PROVIDER_NOT_FOUND,
                 f"provider {profile.provider_id!r} was not found",
             )
-        capabilities = descriptor.capabilities
+        capabilities = profile.effective_capabilities(descriptor.capabilities)
+        if streaming and not capabilities.streaming:
+            raise ModelProviderError(
+                ModelErrorCode.UNSUPPORTED_FEATURE,
+                f"profile {profile.profile_id!r} does not support streaming",
+                provider_id=descriptor.provider_id,
+            )
         if request.tools and not capabilities.tools:
             raise ModelProviderError(
                 ModelErrorCode.UNSUPPORTED_FEATURE,
@@ -134,7 +144,17 @@ class ModelGateway:
             provider = self._provider(profile)
             for attempt in range(profile.max_retries + 1):
                 try:
-                    return await provider.complete(request)
+                    response = await provider.complete(request)
+                    descriptor = self._registry.descriptor(profile.provider_id)
+                    assert descriptor is not None
+                    capabilities = profile.effective_capabilities(descriptor.capabilities)
+                    if len(response.tool_calls) > 1 and not capabilities.parallel_tool_calls:
+                        raise ModelProviderError(
+                            ModelErrorCode.UNSUPPORTED_FEATURE,
+                            "model returned parallel tool calls disabled by the profile",
+                            provider_id=profile.provider_id,
+                        )
+                    return response
                 except ModelProviderError as exc:
                     last_error = exc
                     if not exc.retryable or attempt >= profile.max_retries:
@@ -151,12 +171,24 @@ class ModelGateway:
         last_error: ModelProviderError | None = None
         for profile_id in (route.primary_profile, *route.fallback_profiles):
             profile = self.profile(profile_id)
-            self._validate_request(profile, request)
+            self._validate_request(profile, request, streaming=True)
             provider = self._provider(profile)
+            descriptor = self._registry.descriptor(profile.provider_id)
+            assert descriptor is not None
+            capabilities = profile.effective_capabilities(descriptor.capabilities)
             for attempt in range(profile.max_retries + 1):
                 emitted = False
+                call_ids: set[str] = set()
                 try:
                     async for event in provider.stream(request):
+                        if event.tool_call is not None:
+                            call_ids.add(event.tool_call.call_id)
+                            if len(call_ids) > 1 and not capabilities.parallel_tool_calls:
+                                raise ModelProviderError(
+                                    ModelErrorCode.UNSUPPORTED_FEATURE,
+                                    "model returned parallel tool calls disabled by the profile",
+                                    provider_id=profile.provider_id,
+                                )
                         emitted = True
                         yield event
                     return

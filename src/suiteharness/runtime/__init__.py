@@ -33,6 +33,13 @@ from suiteharness.runtime.descriptor import (
     ProductDescriptor,
 )
 from suiteharness.runtime.effects import EffectCleanupError, EffectScope
+from suiteharness.runtime.resources import (
+    AuthorizedResource,
+    ResourceAccessDenied,
+    ResourceAuthorizer,
+    ResourceRef,
+    require_resource_access,
+)
 from suiteharness.runtime.scopes import (
     AgentContext,
     ProductContext,
@@ -72,6 +79,7 @@ def __getattr__(name: str) -> object:
 __all__ = [
     "ActivatedCustomerBundle",
     "AgentContext",
+    "AuthorizedResource",
     "Bundle",
     "BundleActivation",
     "BundleInstallContext",
@@ -102,6 +110,9 @@ __all__ = [
     "ProductDescriptor",
     "PreparedProduct",
     "RequestScope",
+    "ResourceAccessDenied",
+    "ResourceAuthorizer",
+    "ResourceRef",
     "ResolvedCustomerProduct",
     "RootContext",
     "ScopeKind",
@@ -114,4 +125,5 @@ __all__ = [
     "install_bundle_plan",
     "resolve_bundle_plan",
     "resolve_customer_bundle",
+    "require_resource_access",
 ]

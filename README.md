@@ -109,7 +109,7 @@ python -m build
 python scripts/check_distributions.py dist
 ```
 
-生产配置从 [`config/suiteharness.example.yaml`](config/suiteharness.example.yaml) 和 [`config/suiteharness.secrets.example.yaml`](config/suiteharness.secrets.example.yaml) 开始。配置加载器只读取显式指定的 YAML 文件，不做环境变量插值；密钥文件不能提交版本库。
+生产配置从 [`config/suiteharness.example.yaml`](config/suiteharness.example.yaml) 和 [`config/suiteharness.secrets.example.yaml`](config/suiteharness.secrets.example.yaml) 开始。配置加载器只读取显式指定的 YAML 文件，不做环境变量插值；密钥文件不能提交版本库。生产加载会拒绝示例占位符、全零镜像摘要和保留示例域名，样例必须完整替换后才能启动。
 
 产品开发顺序：
 
