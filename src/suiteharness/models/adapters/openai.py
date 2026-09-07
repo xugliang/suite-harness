@@ -108,9 +108,10 @@ class OpenAIChatAdapter:
         body: dict[str, Any] = {
             "model": request.model or self._profile.model,
             "messages": messages,
-            "max_tokens": request.max_output_tokens,
             "stream": stream,
         }
+        if self.provider_id != "dashscope" or request.response_schema is None:
+            body["max_tokens"] = request.max_output_tokens
         if self._enable_thinking is not None:
             body["enable_thinking"] = self._enable_thinking
         if request.temperature is not None:

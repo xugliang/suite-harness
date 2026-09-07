@@ -256,6 +256,36 @@ def test_dashscope_structured_output_disables_thinking_explicitly() -> None:
     body = transport.requests[0].json_body
     assert body["enable_thinking"] is False  # type: ignore[index]
     assert body["response_format"]["json_schema"]["strict"] is True  # type: ignore[index]
+    assert "max_tokens" not in body  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "response_schema"),
+    [
+        ("dashscope", None),
+        ("openai", {"type": "object"}),
+    ],
+)
+def test_openai_compatible_requests_keep_max_tokens_except_dashscope_structured(
+    provider_id: str, response_schema: dict[str, object] | None
+) -> None:
+    descriptor = create_builtin_provider_registry().descriptor(provider_id)
+    assert descriptor is not None
+    adapter = OpenAIChatAdapter(
+        descriptor,
+        _profile(provider_id),
+        FakeTransport(),
+        SecretStr("server-key"),
+    )
+
+    request = ModelRequest(
+        messages=(ModelMessage.text(ModelRole.USER, "Return text"),),
+        max_output_tokens=321,
+        response_schema=response_schema,
+    )
+    body = adapter._body(request, stream=False)
+
+    assert body["max_tokens"] == 321
 
 
 def test_dashscope_structured_output_fails_without_explicit_non_thinking_mode() -> None:
