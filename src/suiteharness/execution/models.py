@@ -519,6 +519,9 @@ class ConversationContext(_FrozenModel):
 
     messages: tuple[ConversationMessage, ...] = ()
     truncated: bool = False
+    working_summary: str = Field(default='', max_length=12000)
+    long_term_context: str = Field(default='', max_length=12000)
+    memory_degraded: bool = False
 
 
 class WorkflowFrame(_FrozenModel):

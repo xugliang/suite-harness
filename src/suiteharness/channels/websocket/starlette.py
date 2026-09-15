@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .models import WebSocketHandshake, WebSocketPacket, WebSocketPacketKind
-from .server import EnterpriseWebSocketServer
+from .server import EnterpriseWebSocketServer, WebSocketConnection
 
 _SINGLETON_HANDSHAKE_HEADERS = (
     "origin",
@@ -26,7 +26,7 @@ def _require_starlette() -> tuple[type[Any], type[Any]]:
     return WebSocketRoute, WebSocketState
 
 
-class StarletteWebSocketConnection:
+class StarletteWebSocketConnection(WebSocketConnection):
     """Translate Starlette ASGI messages to the transport-neutral socket seam."""
 
     def __init__(self, websocket: Any) -> None:
@@ -105,7 +105,9 @@ def _scope_header_values(websocket: Any, name: str) -> tuple[str, ...]:
     return tuple(values)
 
 
-def create_starlette_websocket_route(path: str, server: EnterpriseWebSocketServer) -> Any:
+def create_starlette_websocket_route(
+    path: str, server: EnterpriseWebSocketServer
+) -> Any:
     """Create a Starlette route without forcing Starlette on core deployments."""
 
     route_type, _state = _require_starlette()

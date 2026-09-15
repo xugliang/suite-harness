@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-from collections.abc import AsyncIterator, Mapping
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import aclosing
 from dataclasses import dataclass
-from typing import Protocol
 
 from suiteharness.runtime import RequestScope, ScopePath
+from suiteharness.sessions.models import TranscriptEvent
 
+from .dispatch import FeishuDispatcher, WebSocketDispatcher
 from .models import AuthenticatedPrincipal, ChannelKind, InboundMessage, OutboundEvent
 
 
@@ -18,13 +21,17 @@ class ChannelAdmissionError(PermissionError):
     """Safe rejection at the company-channel boundary."""
 
 
-class PrincipalAuthenticator(Protocol):
-    async def authenticate(self, message: InboundMessage) -> AuthenticatedPrincipal | None: ...
+class PrincipalAuthenticator(ABC):
+    @abstractmethod
+    async def authenticate(
+        self, message: InboundMessage
+    ) -> AuthenticatedPrincipal | None: ...
 
 
-class ConversationAuthorizer(Protocol):
+class ConversationAuthorizer(ABC):
     """Authorize membership in a client-addressable shared Web conversation."""
 
+    @abstractmethod
     async def authorize(
         self,
         principal: AuthenticatedPrincipal,
@@ -35,9 +42,10 @@ class ConversationAuthorizer(Protocol):
     ) -> bool: ...
 
 
-class ProductAccessAuthorizer(Protocol):
+class ProductAccessAuthorizer(ABC):
     """Authorize one authenticated company principal for one active product."""
 
+    @abstractmethod
     async def authorize(
         self,
         principal: AuthenticatedPrincipal,
@@ -48,12 +56,27 @@ class ProductAccessAuthorizer(Protocol):
     ) -> bool: ...
 
 
-class ChannelApplication(Protocol):
+class ChannelApplication(ABC):
+    @abstractmethod
     def handle(
         self,
         message: InboundMessage,
         scope: RequestScope,
+        *,
+        before_commit: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncIterator[OutboundEvent]: ...
+
+    async def history(self, scope: RequestScope, *, limit: int = 100,
+                      include_invalidated: bool = False) -> tuple[TranscriptEvent, ...]:
+        """Optional scoped display history; simple channel adapters need not provide memory."""
+        raise NotImplementedError('this channel application does not provide conversation history')
+
+    async def invalidate_memory(self, scope: RequestScope, *, reason: str = 'source_changed',
+                                idempotency_key: str | None = None,
+                                source_namespace: str | None = None,
+                                source_version: int | None = None) -> None:
+        """Optional durable memory invalidation, with ordered external-source stamps."""
+        raise NotImplementedError('this channel application does not provide memory invalidation')
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +126,7 @@ class ProductRouter:
         )
 
 
-class EnterpriseChannelGateway:
+class EnterpriseChannelGateway(WebSocketDispatcher, FeishuDispatcher):
     """Authenticate first, then construct the only RequestScope seen by products."""
 
     def __init__(
@@ -169,9 +192,12 @@ class EnterpriseChannelGateway:
                 "channel identity authentication failed closed"
             ) from exc
         if principal is None or principal.tenant_id != self._tenant_id:
-            raise ChannelAdmissionError("channel identity is not authorized for this deployment")
-        async for event in self._dispatch_principal(message, principal):
-            yield event
+            raise ChannelAdmissionError(
+                "channel identity is not authorized for this deployment"
+            )
+        async with aclosing(self._dispatch_principal(message, principal)) as source:
+            async for event in source:
+                yield event
 
     async def dispatch_authenticated(
         self,
@@ -194,9 +220,12 @@ class EnterpriseChannelGateway:
             or principal.tenant_id != self._tenant_id
             or message.sender_external_id != principal.principal_id
         ):
-            raise ChannelAdmissionError("authenticated Web identity does not match the message")
-        async for event in self._dispatch_principal(message, principal):
-            yield event
+            raise ChannelAdmissionError(
+                "authenticated Web identity does not match the message"
+            )
+        async with aclosing(self._dispatch_principal(message, principal)) as source:
+            async for event in source:
+                yield event
 
     async def _dispatch_principal(
         self,
@@ -244,7 +273,9 @@ class EnterpriseChannelGateway:
                     or len(trusted_scope) > 1024
                     or "\x00" in trusted_scope
                 ):
-                    raise ChannelAdmissionError("trusted channel session scope is invalid")
+                    raise ChannelAdmissionError(
+                        "trusted channel session scope is invalid"
+                    )
                 session_scope_id = trusted_scope
         session_values = [message.channel.value, session_scope_id, product_id]
         if not self._share_conversation_sessions:
@@ -252,7 +283,10 @@ class EnterpriseChannelGateway:
         session_id = self._safe_id("session", *session_values)
         request_id = self._safe_id("request", message.channel.value, message.event_id)
         correlation_id = self._safe_id(
-            "correlation", message.channel.value, message.conversation_id, message.message_id
+            "correlation",
+            message.channel.value,
+            message.conversation_id,
+            message.message_id,
         )
         agent_id = self._agent_ids.get(product_id, "default")
         session_owner_id = (
@@ -281,8 +315,9 @@ class EnterpriseChannelGateway:
             correlation_id=correlation_id,
             session_owner_id=session_owner_id,
         )
-        async for event in self._application.handle(message, scope):
-            yield event
+        async with aclosing(self._application.handle(message, scope)) as source:
+            async for event in source:
+                yield event
 
     async def _authorize(
         self,

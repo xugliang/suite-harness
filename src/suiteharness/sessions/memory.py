@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.sessions.protocols import SessionStore
+
 import asyncio
 import copy
 import hashlib
@@ -30,6 +32,7 @@ from suiteharness.sessions.models import (
     TranscriptEvent,
     TranscriptEventType,
     canonical_json,
+    memory_invalidation_source,
     utc_now,
 )
 
@@ -41,7 +44,7 @@ def _digest(value: JsonValue) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-class InMemorySessionStore:
+class InMemorySessionStore(SessionStore):
     """Reference implementation with atomic append and checkpoint CAS."""
 
     def __init__(
@@ -160,6 +163,8 @@ class InMemorySessionStore:
     ) -> TranscriptEvent:
         event_type = TranscriptEventType(event_type)
         payload_copy = copy.deepcopy(payload)
+        source = (memory_invalidation_source(payload_copy)
+                  if event_type is TranscriptEventType.MEMORY_INVALIDATED else None)
         payload_bytes = canonical_json(payload_copy).encode("utf-8")
         if len(payload_bytes) > self._limits.max_transcript_payload_bytes:
             raise SessionPayloadTooLargeError(
@@ -176,6 +181,11 @@ class InMemorySessionStore:
                             "event idempotency key was reused with different content"
                         )
                     return prior[1].model_copy(deep=True)
+            if source is not None and source[1] <= record.memory_source_versions.get(source[0], 0):
+                # The comparison and watermark update share this store lock;
+                # a delayed older outbox delivery cannot invalidate newer work.
+                return next(event.model_copy(deep=True) for event in self._events[identity]
+                            if event.revision == record.memory_invalidated_revision)
             if (identity, event_id) in self._event_ids:
                 raise SessionIdempotencyConflictError("event_id already exists in this session")
             self._check_revision(record, expected_revision)
@@ -208,6 +218,12 @@ class InMemorySessionStore:
             self._sessions[identity] = record.model_copy(
                 update={
                     "revision": revision,
+                    "memory_invalidated_revision": (
+                        revision if event_type is TranscriptEventType.MEMORY_INVALIDATED
+                        else record.memory_invalidated_revision
+                    ),
+                    "memory_source_versions": (record.memory_source_versions if source is None else
+                                               {**record.memory_source_versions, source[0]: source[1]}),
                     "updated_at": max(record.updated_at, event.occurred_at),
                 }
             )

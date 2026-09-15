@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.memory.protocols import KnowledgeProvider
+
 import hashlib
 import json
 import re
@@ -53,7 +55,7 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-class InMemoryKnowledgeProvider:
+class InMemoryKnowledgeProvider(KnowledgeProvider):
     """Product-private lexical store; useful for tests and local prototypes.
 
     This deliberately is not a vector database. It defines authorization,
@@ -202,8 +204,6 @@ class InMemoryKnowledgeProvider:
             for key in keys:
                 del self._documents[key]
 
-    def close(self) -> None:
-        return None
 
 
 __all__ = ["InMemoryKnowledgeProvider"]

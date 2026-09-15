@@ -16,6 +16,7 @@ from suiteharness.agents import (
     NoOpReflectionStrategy,
     ProductRoutedReActWorkflow,
 )
+from suiteharness.agents.protocols import ProductModelRouteResolver
 from suiteharness.channels import (
     CompanyChannelAuthorizationPolicy,
     InteractiveApprovalCoordinator,
@@ -27,10 +28,10 @@ from suiteharness.config import (
     DirectFetchConfig,
     DockerSandboxConfig,
     FoundrySearchConfig,
+    HtmlSearchConfig,
     LoadedSuiteHarnessConfig,
     ManagedProxyFetchConfig,
     SandboxLimitsConfig,
-    validate_secret_references,
 )
 from suiteharness.execution import (
     PROMPT_STRATEGY,
@@ -74,6 +75,8 @@ from suiteharness.sandbox import (
     SandboxProcessTransport,
     SandboxUnavailable,
 )
+from suiteharness.sandbox.remote import RemoteSandboxBackend
+from suiteharness.mcp.defaults import build_default_mcp_adapters
 from suiteharness.sessions import SQLiteSessionStore
 from suiteharness.tools import (
     BashToolConfig,
@@ -92,6 +95,8 @@ from suiteharness.web import (
     FetchTransportBinding,
     FetchTransportRegistry,
     FoundryGroundingClient,
+    HtmlSearchClient,
+    HtmlSearchProvider,
     ManagedProxyConfig,
     ManagedProxyHttpTransport,
     MicrosoftFoundryGroundingProvider,
@@ -120,13 +125,13 @@ from .extensions import (
 
 
 def _secret_value(value: SecretStr | None, label: str) -> SecretStr:
-    if value is None or not value.get_secret_value().strip():
+    if value is None:
         raise ValueError(f"{label} is missing from the secrets file")
     return value
 
 
 @dataclass(frozen=True, slots=True)
-class ModelRuntime:
+class ModelRuntime(ProductModelRouteResolver):
     gateway: ModelGateway
     transport: ModelHttpTransport
     default_route: str
@@ -178,10 +183,15 @@ class FoundationStartupError(RuntimeError):
     """A required server dependency failed its startup gate."""
 
 
-def _build_model_runtime(
+def build_model_runtime(
     loaded: LoadedSuiteHarnessConfig,
-    transport: ModelHttpTransport | None,
+    transport: ModelHttpTransport | None = None,
 ) -> ModelRuntime:
+    """Build the shared model gateway for interactive or standalone server work.
+
+    Includes every built-in provider and its configured server credential bridge.
+    The returned runtime closes only a transport it creates itself.
+    """
     registry = create_builtin_provider_registry()
     secret_values: dict[str, SecretStr] = {}
     profiles: dict[str, ModelProfile] = {}
@@ -190,7 +200,9 @@ def _build_model_runtime(
         profiles[profile.profile_id] = profile
         descriptor = registry.descriptor(profile.provider_id)
         if descriptor is None:
-            raise ValueError(f"model profile references unknown provider {profile.provider_id!r}")
+            raise ValueError(
+                f"model profile references unknown provider {profile.provider_id!r}"
+            )
         credentials = (
             None
             if profile.credential_ref is None
@@ -198,11 +210,16 @@ def _build_model_runtime(
         )
         if descriptor.auth is ProviderAuthKind.API_KEY:
             if profile.credential_ref is None or credentials is None:
-                raise ValueError(f"model profile {profile.profile_id!r} requires credentials_ref")
+                raise ValueError(
+                    f"model profile {profile.profile_id!r} requires credentials_ref"
+                )
             secret_values[profile.credential_ref] = _secret_value(
                 credentials.api_key, f"API key for model profile {profile.profile_id!r}"
             )
-        elif descriptor.auth is ProviderAuthKind.INTERNAL_NONE and credentials is not None:
+        elif (
+            descriptor.auth is ProviderAuthKind.INTERNAL_NONE
+            and credentials is not None
+        ):
             candidate = credentials.api_key or credentials.endpoint_credential
             if candidate is not None and profile.credential_ref is not None:
                 secret_values[profile.credential_ref] = candidate
@@ -272,6 +289,10 @@ def _build_model_runtime(
     )
 
 
+# Compatibility for existing internal callers while public consumers migrate.
+_build_model_runtime = build_model_runtime
+
+
 def _build_fetch_registry(
     loaded: LoadedSuiteHarnessConfig,
     browser_workers: Mapping[str, BrowserWorkerClient],
@@ -286,7 +307,8 @@ def _build_fetch_registry(
             if route.credentials_ref is not None:
                 credentials = loaded.secrets.services[route.credentials_ref]
                 headers = {
-                    name: value.get_secret_value() for name, value in credentials.headers.items()
+                    name: value.get_secret_value()
+                    for name, value in credentials.headers.items()
                 }
             transport = ManagedProxyHttpTransport(
                 ManagedProxyConfig(endpoint=route.endpoint, headers=headers)
@@ -296,7 +318,9 @@ def _build_fetch_registry(
             try:
                 client = browser_workers[route.name]
             except KeyError as exc:
-                raise ValueError(f"browser worker route {route.name!r} has no client adapter") from exc
+                raise ValueError(
+                    f"browser worker route {route.name!r} has no client adapter"
+                ) from exc
             transport = BrowserWorkerHttpTransport(client)
             kind = FetchRoute.BROWSER_WORKER
         else:  # pragma: no cover - closed discriminated union
@@ -315,16 +339,10 @@ def _build_web_tools(
     *,
     browser_workers: Mapping[str, BrowserWorkerClient],
     foundry_clients: Mapping[str, FoundryGroundingClient],
-    search_provider_ids: frozenset[str] | None = None,
 ) -> WebToolRuntime:
     transports = _build_fetch_registry(loaded, browser_workers)
     providers: list[WebSearchProvider] = []
     for configured in loaded.config.web_tools.search.providers:
-        if (
-            search_provider_ids is not None
-            and configured.provider_id not in search_provider_ids
-        ):
-            continue
         if isinstance(configured, BaiduQianfanSearchConfig):
             credentials = loaded.secrets.services[configured.credentials_ref]
             token = credentials.token or credentials.api_key
@@ -346,21 +364,30 @@ def _build_web_tools(
                     f"Foundry search provider {configured.provider_id!r} has no client adapter"
                 ) from exc
             provider = MicrosoftFoundryGroundingProvider(client)
+        elif isinstance(configured, HtmlSearchConfig):
+            provider = HtmlSearchProvider(
+                HtmlSearchClient(
+                    transports,
+                    egress_profile=configured.egress_profile,
+                ),
+                provider_id=configured.provider_id,
+                engine=configured.engine,
+                endpoint=configured.endpoint,
+            )
         else:  # pragma: no cover - closed discriminated union
             raise TypeError("unsupported search provider")
         providers.append(provider)
     default_id = loaded.config.web_tools.search.default_provider
-    default = next(
-        (item for item in providers if item.provider_id == default_id),
-        None,
-    )
+    default = next(item for item in providers if item.provider_id == default_id)
     search_registry = SearchProviderRegistry(default)
-    registered_default_id = None if default is None else default.provider_id
     for provider in providers:
-        if provider.provider_id != registered_default_id:
+        if provider.provider_id != default_id:
             search_registry.register(provider)
     return WebToolRuntime(
-        search=WebSearchService(search_registry),
+        search=WebSearchService(
+            search_registry,
+            fallback_provider_ids=loaded.config.web_tools.search.fallback_providers,
+        ),
         fetch=WebFetchService(transports),
     )
 
@@ -387,17 +414,11 @@ class FoundationRuntime:
         sandbox_transport: SandboxProcessTransport | None = None,
         browser_workers: Mapping[str, BrowserWorkerClient] | None = None,
         foundry_clients: Mapping[str, FoundryGroundingClient] | None = None,
-        search_provider_ids: frozenset[str] | None = None,
         interactive_approvals: InteractiveApprovalCoordinator | None = None,
         plugin_adapters: PluginHostAdapters | None = None,
         mcp_adapters: McpHostAdapters | None = None,
     ) -> None:
         self.config = loaded.config
-        validate_secret_references(
-            loaded.config,
-            loaded.secrets,
-            search_provider_ids=search_provider_ids,
-        )
         self._selected_products = frozenset(
             item.product_id for item in self.config.customer_bundle.products
         )
@@ -418,8 +439,11 @@ class FoundationRuntime:
         self.workspace_bindings = MappingWorkspaceBindingResolver()
         process_transport = sandbox_transport or AsyncioProcessTransport()
         sandbox_config = self.config.sandbox
-        if isinstance(sandbox_config, DockerSandboxConfig):
-            self.sandbox: SandboxBackend = DockerSandboxBackend(
+        self.sandbox: SandboxBackend
+        if isinstance(sandbox_config, DockerSandboxConfig) and sandbox_config.broker_socket is not None:
+            self.sandbox = RemoteSandboxBackend(sandbox_config.broker_socket)
+        elif isinstance(sandbox_config, DockerSandboxConfig):
+            self.sandbox = DockerSandboxBackend(
                 DockerBackendConfig(
                     image=sandbox_config.image,
                     allowed_host_roots=(self.config.workspace.root,),
@@ -431,6 +455,7 @@ class FoundationRuntime:
                 ),
                 process_transport,
                 quarantine_store=self.sandbox_quarantine,
+                probe_limits=_limits(sandbox_config.limits),
             )
         else:
             self.sandbox = LocalDevelopmentSandboxBackend(
@@ -440,12 +465,11 @@ class FoundationRuntime:
                 ),
                 process_transport,
             )
-        self.models = _build_model_runtime(loaded, model_transport)
+        self.models = build_model_runtime(loaded, model_transport)
         self.web_tools = _build_web_tools(
             loaded,
             browser_workers=browser_workers or {},
             foundry_clients=foundry_clients or {},
-            search_provider_ids=search_provider_ids,
         )
         self.sessions = SQLiteSessionStore(
             self.config.storage.sessions_path(),
@@ -453,6 +477,10 @@ class FoundationRuntime:
         )
         self.audit = SQLiteAuditJournal(self.config.storage.audit_path())
         self.tools = InMemoryToolRegistry()
+        from suiteharness.execution.results import SQLiteToolResultStore
+        self.tool_results = SQLiteToolResultStore(
+            self.config.storage.sessions_path().parent / "tool-results.sqlite3"
+        )
         rules = tuple(
             WorkspaceWriteRule(root.space, root.path)
             for root in self.config.channels.feishu.writable_roots
@@ -478,6 +506,7 @@ class FoundationRuntime:
             capabilities=self.capabilities,
             approvals=self.approvals,
             journal=self.audit,
+            tool_results=self.tool_results,
             tool_authorization_policy=CompanyChannelAuthorizationPolicy(
                 feishu_writable_roots=rules
             ),
@@ -500,9 +529,12 @@ class FoundationRuntime:
             bash_config=BashToolConfig(
                 production=self.config.deployment.environment == "production",
                 limits=limits,
-                allowed_egress_profiles=frozenset(sandbox_config.network.egress_profiles),
+                allowed_egress_profiles=frozenset(
+                    sandbox_config.network.egress_profiles
+                ),
             ),
             egress_policy=self.egress_policy,
+            tool_results=self.tool_results,
         )
         self.workspace_files_production_safe = (
             builtin_installer.workspace_files_production_safe
@@ -515,7 +547,7 @@ class FoundationRuntime:
             tools=self.tools,
             product_workspace=self.prepare_product_workspace,
             plugin_adapters=plugin_adapters,
-            mcp_adapters=mcp_adapters,
+            mcp_adapters=(build_default_mcp_adapters(loaded) if mcp_adapters is None else mcp_adapters),
             mcp_resume_store=self.mcp_resume,
         )
 
@@ -528,7 +560,6 @@ class FoundationRuntime:
         sandbox_transport: SandboxProcessTransport | None = None,
         browser_workers: Mapping[str, BrowserWorkerClient] | None = None,
         foundry_clients: Mapping[str, FoundryGroundingClient] | None = None,
-        search_provider_ids: frozenset[str] | None = None,
         interactive_approvals: InteractiveApprovalCoordinator | None = None,
         plugin_adapters: PluginHostAdapters | None = None,
         mcp_adapters: McpHostAdapters | None = None,
@@ -544,7 +575,6 @@ class FoundationRuntime:
                 sandbox_transport=sandbox_transport,
                 browser_workers=browser_workers,
                 foundry_clients=foundry_clients,
-                search_provider_ids=search_provider_ids,
                 interactive_approvals=interactive_approvals,
                 plugin_adapters=plugin_adapters,
                 mcp_adapters=mcp_adapters,
@@ -633,7 +663,9 @@ class FoundationRuntime:
         if self._closed:
             raise RuntimeError("foundation runtime is closed")
         if product_id not in self._selected_products:
-            raise ValueError("product workspace is outside the configured customer bundle")
+            raise ValueError(
+                "product workspace is outside the configured customer bundle"
+            )
         if product_id in self._prepared_products:
             return self.workspaces.paths_for(
                 self.config.deployment.tenant_id, product_id
@@ -731,7 +763,9 @@ class FoundationRuntime:
             except BaseException as exc:
                 errors.append(exc)
             if errors:
-                raise BaseExceptionGroup("foundation shutdown reported failures", errors)
+                raise BaseExceptionGroup(
+                    "foundation shutdown reported failures", errors
+                )
 
     async def _close_initialized_components(self) -> list[BaseException]:
         """Best-effort rollback used when construction did not reach a full object."""
@@ -772,4 +806,5 @@ __all__ = [
     "FoundationStartupError",
     "ModelRuntime",
     "WebToolRuntime",
+    "build_model_runtime",
 ]

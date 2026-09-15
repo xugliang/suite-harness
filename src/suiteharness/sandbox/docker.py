@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from suiteharness.sandbox.protocols import SandboxBackend
+
 import asyncio
 import json
 import logging
 import re
 import secrets
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
@@ -18,12 +20,13 @@ from .models import (
     SandboxAvailability,
     SandboxCleanupError,
     SandboxConfigurationError,
+    SandboxLimits,
     SandboxNetworkMode,
     SandboxRequest,
     SandboxResult,
     SandboxUnavailable,
 )
-from .protocols import SandboxProcessTransport, SandboxQuarantineStore
+from .protocols import SandboxProcessTransport, SandboxQuarantineStore, SandboxSession
 
 _DIGEST_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 _DOCKER_RESOURCE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
@@ -87,22 +90,7 @@ class DockerCommandBuilder:
         self._config = config
 
     def build(self, request: SandboxRequest) -> tuple[str, ...]:
-        limits = request.limits
-        command = [
-            *self._config.command_prefix,
-            "run",
-            "--rm",
-            f"--name={self.container_name(request.request_id)}",
-            "--init",
-            "--read-only",
-            "--cap-drop=ALL",
-            "--security-opt=no-new-privileges=true",
-            "--user=65532:65532",
-            f"--cpus={limits.cpu_count:g}",
-            f"--memory={limits.memory_mb}m",
-            f"--pids-limit={limits.pids}",
-            f"--tmpfs=/tmp:rw,noexec,nosuid,nodev,size={limits.tmpfs_mb}m",
-        ]
+        command = self._run_prefix(request.request_id, request.limits)
         if request.network.mode is SandboxNetworkMode.NONE:
             command.append("--network=none")
         else:
@@ -119,13 +107,34 @@ class DockerCommandBuilder:
             if mount.read_only:
                 option += ",readonly"
             command.extend(("--mount", option))
-        # Docker copies these values from the host process environment. Values
-        # remain outside argv, where process listings could expose them.
+        # Values stay outside argv, where process listings could expose them.
         for key in sorted(request.environment):
             command.append(f"--env={key}")
         command.extend((f"--workdir={request.working_directory}", self._config.image))
         command.extend(request.argv)
         return tuple(command)
+
+    def build_probe(self, request_id: str, limits: SandboxLimits) -> tuple[str, ...]:
+        """Trusted smoke command with the same isolation and no host mounts."""
+        return (*self._run_prefix(request_id, limits), "--network=none", "--workdir=/tmp",
+                self._config.image, "/bin/sh", "-c", "exit 0")
+
+    def _run_prefix(self, request_id: str, limits: SandboxLimits) -> list[str]:
+        return [
+            *self._config.command_prefix,
+            "run",
+            "--rm",
+            f"--name={self.container_name(request_id)}",
+            "--init",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges=true",
+            "--user=65532:65532",
+            f"--cpus={limits.cpu_count:g}",
+            f"--memory={limits.memory_mb}m",
+            f"--pids-limit={limits.pids}",
+            f"--tmpfs=/tmp:rw,noexec,nosuid,nodev,size={limits.tmpfs_mb}m",
+        ]
 
     @staticmethod
     def container_name(request_id: str) -> str:
@@ -133,7 +142,7 @@ class DockerCommandBuilder:
         return f"suiteharness-sandbox-{digest}"
 
 
-class DockerSandboxBackend:
+class DockerSandboxBackend(SandboxBackend):
     """Production backend; every execution first verifies Docker availability."""
 
     def __init__(
@@ -143,6 +152,7 @@ class DockerSandboxBackend:
         *,
         quarantine_store: SandboxQuarantineStore | None = None,
         probe_clock: Callable[[], float] | None = None,
+        probe_limits: SandboxLimits | None = None,
     ) -> None:
         if config.production and quarantine_store is None:
             raise SandboxConfigurationError(
@@ -160,6 +170,9 @@ class DockerSandboxBackend:
         self._probe_lock = asyncio.Lock()
         self._cached_probe: SandboxAvailability | None = None
         self._cached_probe_expires_at = 0.0
+        limits = probe_limits or SandboxLimits()
+        self._probe_limits = replace(limits, timeout_seconds=min(limits.timeout_seconds, 5.0),
+                                     output_bytes=min(limits.output_bytes, 4096))
 
     @property
     def backend_id(self) -> str:
@@ -174,7 +187,7 @@ class DockerSandboxBackend:
         quarantine = await self._quarantine_availability()
         if quarantine is not None:
             return quarantine
-        daemon = await self._probe_daemon_cached()
+        daemon = await self._probe_readiness_cached()
         # A cleanup may become uncertain while a daemon probe is in flight.
         # Recheck the fail-closed state so a cached healthy result can never
         # mask newly recorded quarantine state.
@@ -195,18 +208,19 @@ class DockerSandboxBackend:
             )
         return None
 
-    async def _probe_daemon_cached(self, *, force: bool = False) -> SandboxAvailability:
-        """Coalesce daemon probes and briefly reuse their non-secret result."""
+    async def _probe_readiness_cached(self) -> SandboxAvailability:
+        """Coalesce full execution probes and briefly reuse their result."""
 
         async with self._probe_lock:
             now = self._probe_clock()
             if (
-                not force
-                and self._cached_probe is not None
+                self._cached_probe is not None
                 and now < self._cached_probe_expires_at
             ):
                 return self._cached_probe
             result = await self._probe_daemon()
+            if result.available:
+                result = await self._probe_execution()
             ttl = (
                 _HEALTHY_PROBE_TTL_SECONDS
                 if result.available
@@ -291,44 +305,86 @@ class DockerSandboxBackend:
                 )
         return SandboxAvailability(True)
 
+    async def _probe_execution(self) -> SandboxAvailability:
+        request_id = "readiness-" + secrets.token_hex(16)
+        try:
+            result = await self._execute(
+                request_id, self._builder.build_probe(request_id, self._probe_limits),
+                limits=self._probe_limits, environment={}, stdin=None,
+            )
+        except Exception:
+            return SandboxAvailability(False, "Docker constrained execution probe failed")
+        if result.timed_out:
+            return SandboxAvailability(False, "Docker constrained execution probe timed out")
+        if result.exit_code != 0:
+            return SandboxAvailability(False, "Docker constrained execution is unavailable")
+        return SandboxAvailability(True)
+
     async def run(self, request: SandboxRequest) -> SandboxResult:
         available = await self.availability()
         if not available.available:
             raise SandboxUnavailable(available.detail)
         command = self._builder.build(request)
-        lease_token = await self._record_active_lease(request.request_id)
+        return await self._execute(request.request_id, command, limits=request.limits,
+                                   environment=request.environment, stdin=request.stdin)
+
+    async def open_session(self, request: SandboxRequest) -> SandboxSession:
+        available = await self.availability()
+        if not available.available:
+            raise SandboxUnavailable(available.detail)
+        command = list(self._builder.build(request))
+        command.insert(command.index("run") + 1, "--interactive")
+        lease = await self._record_active_lease(request.request_id)
+        try:
+            session = await self._transport.open_session(
+                tuple(command), environment=request.environment,
+                timeout_seconds=request.limits.timeout_seconds,
+                output_bytes=request.limits.output_bytes,
+            )
+        except BaseException:
+            await asyncio.shield(self._force_remove(request.request_id, owner_token=lease))
+            raise
+        return _DockerSession(session, lambda: self._force_remove(request.request_id, owner_token=lease))
+
+    async def _execute(self, request_id: str, command: tuple[str, ...], *,
+                       limits: SandboxLimits, environment: Mapping[str, str],
+                       stdin: bytes | None) -> SandboxResult:
+        lease_token = await self._record_active_lease(request_id)
         try:
             result = await self._transport.execute(
                 command,
                 working_directory=None,
-                environment=request.environment,
-                stdin=request.stdin,
-                timeout_seconds=request.limits.timeout_seconds,
-                output_bytes=request.limits.output_bytes,
+                environment=environment,
+                stdin=stdin,
+                timeout_seconds=limits.timeout_seconds,
+                output_bytes=limits.output_bytes,
             )
         except BaseException as cause:
+            self._cached_probe = None
             # Cancelling the Docker CLI does not guarantee that the daemon also
             # stopped the already-created container. Always target the one
             # deterministic name before propagating cancellation/failure.
             try:
                 await asyncio.shield(
-                    self._force_remove(request.request_id, owner_token=lease_token)
+                    self._force_remove(request_id, owner_token=lease_token)
                 )
             except SandboxCleanupError as cleanup_error:
                 cause.add_note(str(cleanup_error))
             raise
-        if result.timed_out:
+        if result.exit_code != 0 or result.timed_out:
+            self._cached_probe = None
+        if result.timed_out or result.exit_code != 0:
             # Killing ``docker run`` does not reliably stop the container. The
-            # deterministic name lets the trusted supervisor remove that exact
-            # container without broad Docker enumeration.
-            await self._force_remove(request.request_id, owner_token=lease_token)
+            # CLI may also fail after creation. Remove only this exact name
+            # before clearing its lease in either failure case.
+            await self._force_remove(request_id, owner_token=lease_token)
         else:
             await self._clear_persisted_lease(
-                self._builder.container_name(request.request_id),
+                self._builder.container_name(request_id),
                 owner_token=lease_token,
             )
         return SandboxResult(
-            request_id=request.request_id,
+            request_id=request_id,
             exit_code=result.exit_code,
             stdout=result.stdout,
             stderr=result.stderr,
@@ -499,7 +555,9 @@ class DockerSandboxBackend:
         async with self._quarantine_lock:
             if self._quarantine_load_error is not None:
                 return SandboxAvailability(False, self._quarantine_load_error)
-        daemon = await self._probe_daemon_cached(force=True)
+        # Reconciliation must not create a new container before old leases are cleared.
+        self._cached_probe = None
+        daemon = await self._probe_daemon()
         if not daemon.available:
             return daemon
         async with self._quarantine_lock:
@@ -577,6 +635,43 @@ class DockerSandboxBackend:
                         )
                 self._quarantined.pop(name, None)
         return await self.availability()
+
+
+class _DockerSession(SandboxSession):
+    def __init__(self, session, cleanup):
+        self._session = session
+        self._cleanup = cleanup
+        self._close_task = None
+        self._watcher = asyncio.create_task(self._watch())
+
+    async def _watch(self):
+        await self._session.wait_closed()
+        try:
+            await self.close()
+        except SandboxCleanupError:
+            # Backend persists quarantine; subsequent availability fails closed.
+            pass
+
+    async def send_line(self, payload):
+        await self._session.send_line(payload)
+
+    async def receive_line(self):
+        return await self._session.receive_line()
+
+    async def _finish(self):
+        try:
+            await self._session.close()
+        finally:
+            await self._cleanup()
+
+    async def close(self):
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish())
+        await asyncio.shield(self._close_task)
+
+    async def wait_closed(self):
+        await self._session.wait_closed()
+        await self.close()
 
 
 __all__ = ["DockerBackendConfig", "DockerCommandBuilder", "DockerSandboxBackend"]

@@ -44,7 +44,7 @@ from .protocols import (
 T = TypeVar("T")
 
 
-class _DurableResumeTransport:
+class _DurableResumeTransport(McpTransport):
     """Serialize remote operations with revisioned resume-state commits."""
 
     def __init__(
@@ -62,7 +62,9 @@ class _DurableResumeTransport:
             raise McpTransportError("durable MCP checkpoint revision must be positive")
         expected = HttpResumeState() if checkpoint is None else checkpoint.state
         if transport.resume_state != expected:
-            raise McpTransportError("MCP transport did not accept its durable resume state")
+            raise McpTransportError(
+                "MCP transport did not accept its durable resume state"
+            )
         self._transport = transport
         self._store = store
         self._tenant_id = tenant_id
@@ -95,7 +97,9 @@ class _DurableResumeTransport:
     def set_protocol_version(self, version: str) -> None:
         setter = getattr(self._transport, "set_protocol_version", None)
         if not callable(setter):
-            raise McpTransportError("resumable MCP transport cannot set protocol version")
+            raise McpTransportError(
+                "resumable MCP transport cannot set protocol version"
+            )
         setter(version)
 
     async def request(
@@ -222,7 +226,9 @@ class McpClientManager:
         tasks: McpClientTaskHandler | None = None,
         resume_store: McpHttpResumeStore | None = None,
     ) -> None:
-        if resume_store is not None and not isinstance(resume_store, McpHttpResumeStore):
+        if resume_store is not None and not isinstance(
+            resume_store, McpHttpResumeStore
+        ):
             raise TypeError("resume_store must implement McpHttpResumeStore")
         self._factory = transport_factory
         self._base_capabilities = client_capabilities
@@ -247,19 +253,23 @@ class McpClientManager:
             if server.transport is not McpTransportKind.STREAMABLE_HTTP:
                 continue
             if server.legacy_sse is not LegacySseCompatibility.DISABLED:
-                raise ValueError("durable resume is unsupported for legacy SSE adapters")
-            if self._resume_store is None:
                 raise ValueError(
-                    "resume_sessions=true requires an McpHttpResumeStore"
+                    "durable resume is unsupported for legacy SSE adapters"
                 )
+            if self._resume_store is None:
+                raise ValueError("resume_sessions=true requires an McpHttpResumeStore")
         self._configs[key] = config
 
-    async def connect_product(self, tenant_id: str, product_id: str) -> tuple[McpClient, ...]:
+    async def connect_product(
+        self, tenant_id: str, product_id: str
+    ) -> tuple[McpClient, ...]:
         product_key = (tenant_id, product_id)
         try:
             product = self._configs[product_key]
         except KeyError as exc:
-            raise LookupError(f"MCP product is not configured: {product_key!r}") from exc
+            raise LookupError(
+                f"MCP product is not configured: {product_key!r}"
+            ) from exc
         async with self._lock:
             existing = tuple(
                 client
@@ -411,7 +421,9 @@ class McpClientManager:
         tool_name: str,
         arguments: dict[str, JsonValue],
     ) -> CallToolResult:
-        return await self.client(scope, server_id).call_tool(scope, tool_name, arguments)
+        return await self.client(scope, server_id).call_tool(
+            scope, tool_name, arguments
+        )
 
     def health(self, tenant_id: str, product_id: str) -> Mapping[str, McpServerHealth]:
         product = self._configs.get((tenant_id, product_id))
@@ -442,13 +454,17 @@ class McpClientManager:
             ]
             for key, _client in selected:
                 self._clients.pop(key, None)
-            await asyncio.gather(*(client.close() for _, client in selected), return_exceptions=False)
+            await asyncio.gather(
+                *(client.close() for _, client in selected), return_exceptions=False
+            )
 
     async def close(self) -> None:
         async with self._lock:
             selected = tuple(self._clients.items())
             self._clients.clear()
-            await asyncio.gather(*(client.close() for _, client in selected), return_exceptions=False)
+            await asyncio.gather(
+                *(client.close() for _, client in selected), return_exceptions=False
+            )
 
     def _capabilities_for(self, features) -> ClientCapabilities:
         elicitation = self._base_capabilities.elicitation

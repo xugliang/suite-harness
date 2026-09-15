@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import AsyncIterator, Awaitable, Callable
+from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from contextlib import aclosing
 from datetime import UTC, datetime
-from typing import Protocol
 from urllib.parse import urlsplit
 
-from suiteharness.channels.approvals import ApprovalChallenge, InteractiveApprovalCoordinator
+from suiteharness.channels.approvals import (
+    ApprovalChallenge,
+    InteractiveApprovalCoordinator,
+)
+from suiteharness.channels.dispatch import WebSocketDispatcher
 from suiteharness.channels.models import (
     AuthenticatedPrincipal,
     ChannelKind,
     InboundMessage,
-    OutboundEvent,
 )
 from suiteharness.execution import RunRequest
 
@@ -35,19 +39,24 @@ from .models import (
     WebSocketProtocolError,
     parse_client_frame,
 )
+from .tasks import ConnectionTaskGroup
 
 
-class WebSocketConnection(Protocol):
+class WebSocketConnection(ABC):
+    @abstractmethod
     async def accept(self, *, subprotocol: str | None = None) -> None: ...
 
+    @abstractmethod
     async def receive(self) -> WebSocketPacket: ...
 
+    @abstractmethod
     async def send_text(self, text: str) -> None: ...
 
+    @abstractmethod
     async def close(self, *, code: int, reason: str = "") -> None: ...
 
 
-class WebSocketAuthenticator(Protocol):
+class WebSocketAuthenticator(ABC):
     """Authenticate only company-managed server credentials from the handshake.
 
     The server invokes this method both at the handshake and before every later
@@ -55,12 +64,13 @@ class WebSocketAuthenticator(Protocol):
     claims instead of caching a successful result for the connection lifetime.
     """
 
+    @abstractmethod
     async def authenticate(
         self, handshake: WebSocketHandshake
     ) -> AuthenticatedPrincipal | None: ...
 
 
-class WebSocketSessionRevalidator(Protocol):
+class WebSocketSessionRevalidator(ABC):
     """Revalidate mutable company session and directory state for one socket.
 
     Deployments can use the original handshake credential (for example, a
@@ -70,19 +80,12 @@ class WebSocketSessionRevalidator(Protocol):
     the identity established at the handshake.
     """
 
+    @abstractmethod
     async def revalidate(
         self,
         handshake: WebSocketHandshake,
         established_principal: AuthenticatedPrincipal,
     ) -> AuthenticatedPrincipal | None: ...
-
-
-class WebSocketDispatcher(Protocol):
-    def dispatch_authenticated(
-        self,
-        message: InboundMessage,
-        principal: AuthenticatedPrincipal,
-    ) -> AsyncIterator[OutboundEvent]: ...
 
 
 def _canonical_origin(value: str) -> str:
@@ -111,7 +114,9 @@ def _canonical_origin(value: str) -> str:
 class OriginPolicy:
     """Exact allowlist; wildcard and reflected origins are intentionally unsupported."""
 
-    def __init__(self, allowed_origins: tuple[str, ...], *, allow_missing: bool = False) -> None:
+    def __init__(
+        self, allowed_origins: tuple[str, ...], *, allow_missing: bool = False
+    ) -> None:
         if not allowed_origins:
             raise ValueError("allowed_origins must not be empty")
         canonical: list[str] = []
@@ -171,13 +176,21 @@ class WebSocketApprovalHub:
 
     async def publish(self, request: RunRequest, challenge: ApprovalChallenge) -> None:
         if request.scope.channel_id != "web":
-            raise RuntimeError("interactive approval is available only to the Web channel")
+            raise RuntimeError(
+                "interactive approval is available only to the Web channel"
+            )
         if request.scope.principal_id != challenge.principal_id:
-            raise RuntimeError("approval challenge principal does not match its request")
+            raise RuntimeError(
+                "approval challenge principal does not match its request"
+            )
         async with self._lock:
             senders = tuple(
                 sender
-                for (tenant_id, principal_id, _connection_id), sender in self._connections.items()
+                for (
+                    tenant_id,
+                    principal_id,
+                    _connection_id,
+                ), sender in self._connections.items()
                 if tenant_id == request.scope.tenant_id
                 and principal_id == challenge.principal_id
             )
@@ -228,7 +241,9 @@ class WebSocketSession:
             or not isinstance(session_revalidation_interval_seconds, int | float)
             or not (0 < session_revalidation_interval_seconds <= 300)
         ):
-            raise ValueError("WebSocket session revalidation interval must be in (0, 300]")
+            raise ValueError(
+                "WebSocket session revalidation interval must be in (0, 300]"
+            )
         self._connection = connection
         self._connection_id = connection_id
         self._principal = principal
@@ -248,7 +263,7 @@ class WebSocketSession:
         self._max_messages = max_messages_per_connection
         self._send_lock = asyncio.Lock()
         self._seen_message_ids: set[str] = set()
-        self._runs: dict[str, asyncio.Task[None]] = {}
+        self._tasks = ConnectionTaskGroup(max_concurrent=max_concurrent_messages)
 
     async def run(self) -> None:
         await self._approval_hub.register(
@@ -272,7 +287,9 @@ class WebSocketSession:
                 assert packet.text is not None
                 if len(packet.text.encode("utf-8")) > self._max_frame_bytes:
                     raise WebSocketProtocolError(
-                        "frame_too_large", "WebSocket frame is too large", close_code=1009
+                        "frame_too_large",
+                        "WebSocket frame is too large",
+                        close_code=1009,
                     )
                 frame = parse_client_frame(packet.text)
                 await self._handle_frame(frame)
@@ -285,12 +302,14 @@ class WebSocketSession:
             finally:
                 await self._connection.close(code=exc.close_code, reason=exc.code)
         finally:
-            await self._approval_hub.unregister(
-                self._principal.tenant_id,
-                self._principal.principal_id,
-                self._connection_id,
-            )
-            await self._cancel_runs()
+            try:
+                await self._approval_hub.unregister(
+                    self._principal.tenant_id,
+                    self._principal.principal_id,
+                    self._connection_id,
+                )
+            finally:
+                await self._cancel_runs()
 
     async def _receive_with_periodic_revalidation(self) -> WebSocketPacket:
         """Keep one receive alive while periodically enforcing ticket revocation."""
@@ -316,7 +335,9 @@ class WebSocketSession:
     async def _revalidate_session(self) -> None:
         try:
             async with asyncio.timeout(self._authentication_timeout):
-                ticket_principal = await self._authenticator.authenticate(self._handshake)
+                ticket_principal = await self._authenticator.authenticate(
+                    self._handshake
+                )
                 self._require_unchanged_principal(ticket_principal)
                 if self._revalidator is None:
                     return
@@ -349,12 +370,7 @@ class WebSocketSession:
             )
 
     async def _cancel_runs(self) -> None:
-        running = tuple(self._runs.values())
-        for task in running:
-            task.cancel()
-        if running:
-            await asyncio.gather(*running, return_exceptions=True)
-        self._runs.clear()
+        await self._tasks.aclose()
 
     async def _handle_frame(
         self,
@@ -393,7 +409,7 @@ class WebSocketSession:
                 "connection_message_limit",
                 "WebSocket connection message limit was reached",
             )
-        if len(self._runs) >= self._max_concurrent:
+        if self._tasks.active_count >= self._max_concurrent:
             await self._send_frame(
                 ErrorFrame(
                     code="too_many_active_messages",
@@ -404,14 +420,7 @@ class WebSocketSession:
             return
         self._seen_message_ids.add(client_id)
         await self._send_frame(AckFrame(client_message_id=client_id))
-        task = asyncio.create_task(self._dispatch(frame), name=f"suiteharness-web-{client_id}")
-        self._runs[client_id] = task
-        task.add_done_callback(lambda finished, key=client_id: self._run_finished(key, finished))
-
-    def _run_finished(self, client_id: str, task: asyncio.Task[None]) -> None:
-        self._runs.pop(client_id, None)
-        if not task.cancelled():
-            task.exception()
+        self._tasks.try_start(lambda: self._dispatch(frame), name=f"suiteharness-web-{client_id}")
 
     async def _dispatch(self, frame: MessageFrame) -> None:
         message = InboundMessage(
@@ -427,13 +436,14 @@ class WebSocketSession:
             metadata={"connection_id": self._connection_id},
         )
         try:
-            async for event in self._dispatcher.dispatch_authenticated(
+            async with aclosing(self._dispatcher.dispatch_authenticated(
                 message,
                 self._principal,
-            ):
-                await self._send_frame(
-                    EventFrame(client_message_id=frame.client_message_id, event=event)
-                )
+            )) as source:
+                async for event in source:
+                    await self._send_frame(
+                        EventFrame(client_message_id=frame.client_message_id, event=event)
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -480,7 +490,11 @@ class EnterpriseWebSocketServer:
     ) -> None:
         if not tenant_id or len(tenant_id) > 128 or "\x00" in tenant_id:
             raise ValueError("invalid WebSocket deployment tenant_id")
-        if not subprotocol or len(subprotocol) > 128 or any(char.isspace() for char in subprotocol):
+        if (
+            not subprotocol
+            or len(subprotocol) > 128
+            or any(char.isspace() for char in subprotocol)
+        ):
             raise ValueError("invalid WebSocket subprotocol")
         if (
             isinstance(authentication_timeout_seconds, bool)
@@ -493,7 +507,9 @@ class EnterpriseWebSocketServer:
             or not isinstance(session_revalidation_interval_seconds, int | float)
             or not (0 < session_revalidation_interval_seconds <= 300)
         ):
-            raise ValueError("WebSocket session revalidation interval must be in (0, 300]")
+            raise ValueError(
+                "WebSocket session revalidation interval must be in (0, 300]"
+            )
         if not callable(getattr(authenticator, "authenticate", None)):
             raise TypeError("authenticator must implement async authenticate")
         if session_revalidator is not None and not callable(

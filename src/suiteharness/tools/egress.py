@@ -67,7 +67,7 @@ class ProductEgressArgumentPolicy:
         self,
         context: ToolCallContext,
         requested: str | None,
-    ) -> str:
+    ) -> str | None:
         selected = requested or self.default_search_provider
         allowed = self.search_providers_by_product.get(
             context.scope.product_id,
@@ -75,7 +75,9 @@ class ProductEgressArgumentPolicy:
         )
         if selected not in allowed:
             raise PermissionError("requested search provider is not allowed for this product")
-        return selected
+        # Preserve omission so WebSearchService can execute the administrator-
+        # owned default fallback chain. Explicit model choices stay explicit.
+        return requested
 
     def authorize_fetch(
         self,

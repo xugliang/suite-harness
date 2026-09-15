@@ -9,6 +9,7 @@ from suiteharness.execution import ToolEffect, ToolHandler, ToolIdentity, ToolSp
 from suiteharness.sandbox import SandboxBackend
 from suiteharness.web import WebFetchService, WebSearchService
 from suiteharness.workspace import SecurePosixWorkspaceFileSystem
+from suiteharness.execution.results import ToolResultStore
 
 from .egress import ProductEgressArgumentPolicy
 from .shell import BashTool, BashToolConfig
@@ -75,6 +76,16 @@ def _specs() -> dict[str, ToolSpec]:
     write = frozenset({ToolEffect.WRITE})
     external_read = frozenset({ToolEffect.READ, ToolEffect.EXTERNAL})
     return {
+        "suiteharness.result.read": ToolSpec(
+            name="suiteharness.result.read",
+            description="分页读取本次执行已保存的完整工具结果；offset 为字符位置，其他用户/会话/执行不可读取。",
+            effects=read,
+            input_schema=_object_schema({
+                "result_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 4096},
+            }, required=("result_id",)),
+        ),
         "suiteharness.fs.list": ToolSpec(
             name="suiteharness.fs.list",
             description="列出当前产品或共享工作区中的目录；结果数量受限。",
@@ -90,7 +101,7 @@ def _specs() -> dict[str, ToolSpec]:
         ),
         "suiteharness.fs.read": ToolSpec(
             name="suiteharness.fs.read",
-            description="读取工作区文本文件，支持 UTF-8、GBK、GB18030。",
+            description="分页读取工作区文本文件，支持 UTF-8、GBK、GB18030。续读时传回 next_offset 作为 offset（字节位置）。",
             effects=read,
             required_capabilities=frozenset({"workspace.read"}),
             input_schema=_object_schema(
@@ -99,6 +110,7 @@ def _specs() -> dict[str, ToolSpec]:
                     "path": _PATH,
                     "encoding": {"type": "string", "enum": ["utf-8", "gbk", "gb18030"]},
                     "max_bytes": {"type": "integer", "minimum": 1},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
                 },
                 required=("path",),
             ),
@@ -229,8 +241,10 @@ class BuiltinToolInstaller:
         secure_filesystem: SecurePosixWorkspaceFileSystem | None = None,
         bash_config: BashToolConfig | None = None,
         egress_policy: ProductEgressArgumentPolicy | None = None,
+        tool_results: ToolResultStore | None = None,
     ) -> None:
         self._registry = registry
+        self._tool_results = tool_results
         files = WorkspaceFileTools(
             workspaces,
             file_limits,
@@ -248,11 +262,18 @@ class BuiltinToolInstaller:
             "suiteharness.web.search": WebSearchTool(web_search, egress_policy),
             "suiteharness.web.fetch": WebFetchTool(web_fetch, egress_policy),
         }
+        if tool_results is not None:
+            async def read_result(context, arguments):
+                return await tool_results.read(context.scope, context.run_id, arguments["result_id"],
+                    offset=arguments.get("offset", 0), limit=arguments.get("limit", 2048))
+            self._handlers["suiteharness.result.read"] = read_result
 
     def install(self) -> BuiltinRegistrationSet:
         handles: list[RegistrationHandle] = []
         try:
             for name, spec in _specs().items():
+                if name == "suiteharness.result.read" and self._tool_results is None:
+                    continue
                 family = name.split(".", 2)[1]
                 identity = ToolIdentity(
                     namespace="suiteharness",

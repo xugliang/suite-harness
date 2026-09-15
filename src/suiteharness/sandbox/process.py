@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.sandbox.protocols import SandboxProcessTransport
+
 import asyncio
 import contextlib
 import os
@@ -10,7 +12,8 @@ import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
-from .models import ProcessResult
+from .models import ProcessResult, SandboxUnavailable
+from .protocols import SandboxSession
 
 _READ_CHUNK_BYTES = 64 * 1024
 _PROBE_OUTPUT_BYTES = 64 * 1024
@@ -89,12 +92,25 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-class AsyncioProcessTransport:
+class AsyncioProcessTransport(SandboxProcessTransport):
     """Execute argv directly, drain both pipes, and enforce time/output bounds.
 
     This supervisor is trusted host code. It never invokes a command shell and
     treats ``environment`` as an overlay on the service process environment.
     """
+
+    async def open_session(self, argv: tuple[str, ...], *, environment: Mapping[str, str],
+                           timeout_seconds: float, output_bytes: int) -> SandboxSession:
+        process_environment = os.environ.copy()
+        process_environment.update(environment)
+        options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                   else {"start_new_session": True})
+        process = await asyncio.create_subprocess_exec(
+            *argv, env=process_environment, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            limit=output_bytes + 1, **options,
+        )
+        return _PersistentProcessSession(process, timeout_seconds, output_bytes)
 
     async def probe(self, argv: tuple[str, ...], *, timeout_seconds: float) -> ProcessResult:
         return await self.execute(
@@ -157,6 +173,64 @@ class AsyncioProcessTransport:
             timed_out=timed_out,
             output_truncated=budget.truncated,
         )
+
+
+class _PersistentProcessSession(SandboxSession):
+    def __init__(self, process, timeout_seconds, output_bytes):
+        self._process = process
+        self._limit = output_bytes
+        self._closed = asyncio.Event()
+        self._closing = False
+        self._stderr = asyncio.create_task(self._drain_stderr())
+        self._watcher = asyncio.create_task(self._watch(timeout_seconds))
+
+    async def _drain_stderr(self):
+        # Drain continuously without retaining potentially secret diagnostics.
+        while await self._process.stderr.read(65536):
+            pass
+
+    async def _watch(self, timeout_seconds):
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout_seconds)
+        except TimeoutError:
+            pass
+        finally:
+            await self.close()
+
+    async def send_line(self, payload):
+        if self._closing or len(payload) > self._limit or b'\n' in payload or b'\r' in payload:
+            raise SandboxUnavailable("persistent session closed or invalid outbound line")
+        try:
+            self._process.stdin.write(payload + b'\n')
+            await asyncio.wait_for(self._process.stdin.drain(), 10)
+        except (OSError, TimeoutError) as exc:
+            await self.close()
+            raise SandboxUnavailable("persistent stdin failed") from exc
+
+    async def receive_line(self):
+        try:
+            line = await self._process.stdout.readline()
+            if len(line) > self._limit + 1:
+                raise ValueError("oversized line")
+            return line.rstrip(b'\r\n') if line else None
+        except (ValueError, OSError) as exc:
+            await self.close()
+            raise SandboxUnavailable("persistent stdout exceeded bounds or failed") from exc
+
+    async def close(self):
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            self._process.stdin.close()
+            await _stop_process(self._process)
+            self._stderr.cancel()
+            await asyncio.gather(self._stderr, return_exceptions=True)
+        finally:
+            self._closed.set()
+
+    async def wait_closed(self):
+        await self._closed.wait()
 
 
 __all__ = ["AsyncioProcessTransport"]

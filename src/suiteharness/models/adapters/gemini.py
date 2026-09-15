@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.models.protocols import ModelProvider
+
 from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import quote
@@ -29,7 +31,7 @@ from suiteharness.models.types import (
 )
 
 
-class GeminiAdapter:
+class GeminiAdapter(ModelProvider):
     def __init__(
         self,
         descriptor: ProviderDescriptor,
@@ -208,12 +210,16 @@ class GeminiAdapter:
                         arguments=arguments,
                     )
                 )
-        return text, calls, finish_reason(candidate.get("finishReason"))
+        reason = finish_reason(candidate.get("finishReason"))
+        if calls and reason is FinishReason.STOP:
+            reason = FinishReason.TOOL_CALLS
+        return text, calls, reason
 
     async def _stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         identifier: str | None = None
         reason = FinishReason.UNKNOWN
         usage = ModelUsage()
+        has_calls = False
         async for payload in iter_sse_json(self._transport.stream(self._request(request, stream=True))):
             if identifier is None:
                 identifier = response_id(payload.get("responseId"))
@@ -222,6 +228,7 @@ class GeminiAdapter:
                     response_id=identifier,
                 )
             values, calls, current_reason = self._candidate(payload)
+            has_calls |= bool(calls)
             if current_reason is not FinishReason.UNKNOWN:
                 reason = current_reason
             for value in values:
@@ -248,7 +255,7 @@ class GeminiAdapter:
         yield ModelStreamEvent(
             type=ModelStreamEventType.MESSAGE_END,
             response_id=identifier,
-            finish_reason=reason,
+            finish_reason=FinishReason.TOOL_CALLS if has_calls and reason is FinishReason.STOP else reason,
             usage=usage,
         )
 

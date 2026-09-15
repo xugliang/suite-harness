@@ -1,0 +1,9 @@
+# Dependencies only; run the framework directly from src, without installing it.
+pydantic>=2.7,<3
+jsonschema>=4.23,<5
+packaging>=24.0
+httpx>=0.27,<1
+PyYAML>=6.0,<7
+starlette>=1.3.1,<2
+uvicorn[standard]>=0.30,<1
+regex>=2024.5.15

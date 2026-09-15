@@ -46,6 +46,8 @@ from .protocols import (
     McpHttpExchange,
     McpTokenProvider,
     McpTransport,
+    McpTransportFactory,
+    ResumableMcpHttpTransport,
     SandboxedStdioSession,
     SandboxedStdioSessionFactory,
     ServerSentEvent,
@@ -59,7 +61,9 @@ _MAX_HTTP_HEADER_COUNT = 128
 _HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
 
-def encode_message(message: JsonRpcRequest | JsonRpcNotification | JsonRpcResponse) -> bytes:
+def encode_message(
+    message: JsonRpcRequest | JsonRpcNotification | JsonRpcResponse,
+) -> bytes:
     """Encode exactly one compact UTF-8 JSON-RPC message."""
 
     if isinstance(message, JsonRpcResponse):
@@ -78,7 +82,9 @@ def encode_message(message: JsonRpcRequest | JsonRpcNotification | JsonRpcRespon
     ).encode("utf-8")
 
 
-def decode_message(payload: bytes | str) -> JsonRpcRequest | JsonRpcNotification | JsonRpcResponse:
+def decode_message(
+    payload: bytes | str,
+) -> JsonRpcRequest | JsonRpcNotification | JsonRpcResponse:
     """Decode one non-batch JSON-RPC message and reject ambiguous envelopes."""
 
     try:
@@ -242,26 +248,14 @@ def _validated_http_response(
     return response
 
 
-class SandboxedStdioTransport:
-    """Persistent newline-delimited stdio transport launched inside a sandbox."""
+class _SessionRpcTransport(McpTransport):
+    """Correlate JSON-RPC over a lifecycle-owned, bounded message session."""
 
     def __init__(
         self,
         config: McpServerConfig,
-        *,
-        sandbox: SandboxBackend,
-        session_factory: SandboxedStdioSessionFactory,
-        product_workspace: Path,
     ) -> None:
-        if config.transport is not McpTransportKind.STDIO:
-            raise ValueError("SandboxedStdioTransport requires stdio configuration")
-        root = Path(product_workspace)
-        if not root.is_absolute() or not root.exists() or not root.is_dir():
-            raise ValueError("product_workspace must be an existing absolute directory")
         self._config = config
-        self._sandbox = sandbox
-        self._factory = session_factory
-        self._root = root.resolve(strict=True)
         self._session: SandboxedStdioSession | None = None
         self._request_handler: InboundRequestHandler | None = None
         self._notification_handler: InboundNotificationHandler | None = None
@@ -275,32 +269,24 @@ class SandboxedStdioTransport:
         self._reader_failure: BaseException | None = None
         self._closed = False
 
+    @property
+    def operational(self) -> bool:
+        return not self._closed and self._session is not None and self._reader_failure is None
+
     def set_protocol_version(self, version: str) -> None:
         """Stdio negotiation is carried by initialize; no HTTP header is needed."""
 
         del version
 
-    async def start(
+    def _start_reader(
         self,
+        session,
         request_handler: InboundRequestHandler,
         notification_handler: InboundNotificationHandler,
     ) -> None:
-        if self._closed:
-            raise McpTransportError("stdio transport is closed")
-        if self._session is not None:
-            return
-        availability = await self._sandbox.availability()
-        if not availability.available:
-            raise McpTransportError(f"sandbox unavailable: {availability.detail}")
-        if self._config.require_production_sandbox and not self._sandbox.production_safe:
-            raise McpTransportError("production MCP stdio requires a production-safe sandbox")
         self._request_handler = request_handler
         self._notification_handler = notification_handler
-        self._session = await self._factory.open(
-            self._config,
-            sandbox=self._sandbox,
-            product_workspace=self._root,
-        )
+        self._session = session
         self._reader = asyncio.create_task(
             self._read_loop(), name=f"mcp-stdio:{self._config.server_id}"
         )
@@ -351,9 +337,7 @@ class SandboxedStdioTransport:
         self._require_started()
         await self._send(JsonRpcNotification(method=method, params=params))
 
-    async def _send(
-        self, message: JsonRpcRequest | JsonRpcNotification | JsonRpcResponse
-    ) -> None:
+    async def _send(self, message: JsonRpcRequest | JsonRpcNotification | JsonRpcResponse) -> None:
         session = self._require_started()
         payload = encode_message(message)
         if len(payload) > self._config.max_message_bytes:
@@ -408,10 +392,12 @@ class SandboxedStdioTransport:
                 for future in tuple(self._pending.values()):
                     if not future.done():
                         future.set_exception(failure)
+                try:
+                    await self._session.close()
+                except Exception as cleanup_error:
+                    failure.add_note(f"MCP session cleanup failed: {type(cleanup_error).__name__}")
 
-    async def _handle_request(
-        self, request: JsonRpcRequest, context: RequestScope | None
-    ) -> None:
+    async def _handle_request(self, request: JsonRpcRequest, context: RequestScope | None) -> None:
         if self._request_handler is None:
             response = JsonRpcResponse(
                 id=request.id,
@@ -454,7 +440,37 @@ class SandboxedStdioTransport:
         self._pending.clear()
 
 
-class StreamableHttpTransport:
+class SandboxedStdioTransport(_SessionRpcTransport):
+    """Persistent JSON-RPC launched exclusively through the selected sandbox."""
+
+    def __init__(self, config, *, sandbox, session_factory, product_workspace):
+        if config.transport is not McpTransportKind.STDIO:
+            raise ValueError("SandboxedStdioTransport requires stdio configuration")
+        root = Path(product_workspace)
+        if not root.is_absolute() or not root.exists() or not root.is_dir():
+            raise ValueError("product_workspace must be an existing absolute directory")
+        super().__init__(config)
+        self._sandbox = sandbox
+        self._factory = session_factory
+        self._root = root.resolve(strict=True)
+
+    async def start(self, request_handler, notification_handler):
+        if self._closed:
+            raise McpTransportError("stdio transport is closed")
+        if self._session is not None:
+            return
+        availability = await self._sandbox.availability()
+        if not availability.available:
+            raise McpTransportError(f"sandbox unavailable: {availability.detail}")
+        if self._config.require_production_sandbox and not self._sandbox.production_safe:
+            raise McpTransportError("production MCP stdio requires a production-safe sandbox")
+        session = await self._factory.open(
+            self._config, sandbox=self._sandbox, product_workspace=self._root
+        )
+        self._start_reader(session, request_handler, notification_handler)
+
+
+class StreamableHttpTransport(ResumableMcpHttpTransport):
     """MCP Streamable HTTP orchestrator over an injected guarded exchange."""
 
     def __init__(
@@ -476,7 +492,12 @@ class StreamableHttpTransport:
         self._tenant_id = tenant_id
         self._product_id = product_id
         self._policy = egress_policy
-        self._exchange = exchange
+        binder = getattr(exchange, "bind", None)
+        self._exchange = (
+            binder(tenant_id=tenant_id, product_id=product_id, config=config)
+            if callable(binder)
+            else exchange
+        )
         self._token_provider = token_provider
         self._endpoint: str | None = None
         self._session_id = None if resume is None else resume.session_id
@@ -507,11 +528,19 @@ class StreamableHttpTransport:
         if self._endpoint is not None:
             return
         assert self._config.endpoint is not None
-        approved = await self._policy.authorize(
-            self._config.endpoint,
-            tenant_id=self._tenant_id,
-            product_id=self._product_id,
-        )
+        authorize_server = getattr(self._policy, "authorize_server", None)
+        if authorize_server is not None:
+            approved = await authorize_server(
+                self._config,
+                tenant_id=self._tenant_id,
+                product_id=self._product_id,
+            )
+        else:
+            approved = await self._policy.authorize(
+                self._config.endpoint,
+                tenant_id=self._tenant_id,
+                product_id=self._product_id,
+            )
         if approved != self._config.endpoint:
             raise McpTransportError("egress policy must not rewrite the MCP endpoint")
         parsed = urlparse(approved)
@@ -544,6 +573,8 @@ class StreamableHttpTransport:
                 response = await self._wait_event_response(
                     request_id, context=context, timeout_seconds=timeout_seconds
                 )
+            if response.id != request_id:
+                raise McpProtocolError("MCP HTTP response id does not match the request")
             return _response_result(response)
 
     async def notify(
@@ -594,6 +625,8 @@ class StreamableHttpTransport:
         body = encode_message(message)
         if len(body) > self._config.max_message_bytes:
             raise McpProtocolError("outbound MCP message exceeds max_message_bytes")
+        if callable(getattr(self._exchange, "open_response", None)):
+            return await self._post_streaming(message, body, context, timeout_seconds)
         response = _validated_http_response(
             await self._exchange.send(
                 HttpRequest(
@@ -650,6 +683,62 @@ class StreamableHttpTransport:
             )
         raise McpProtocolError(f"unsupported MCP HTTP content type: {content_type!r}")
 
+    async def _post_streaming(self, message, body, context, timeout_seconds):
+        from .streaming import iter_sse, read_bounded
+
+        async with asyncio.timeout(timeout_seconds):
+            for attempt in range(2):
+                request = HttpRequest(
+                    "POST",
+                    self._require_started(),
+                    await self._headers("application/json"),
+                    body,
+                    timeout_seconds,
+                )
+                async with self._exchange.open_response(request) as streamed:
+                    response = _validated_http_response(
+                        HttpResponse(streamed.status, streamed.headers, b""),
+                        max_message_bytes=self._config.max_message_bytes,
+                    )
+                    if response.status == 401 and attempt == 0 and self._config.credential_ref:
+                        invalidate = getattr(self._token_provider, "invalidate", None)
+                        if callable(invalidate):
+                            result = invalidate(
+                                self._config.credential_ref, endpoint=self._require_started()
+                            )
+                            if inspect.isawaitable(result):
+                                await result
+                            continue
+                    self._capture_session(response.headers)
+                    if response.status == 202:
+                        return None
+                    if not 200 <= response.status < 300:
+                        raise McpTransportError(
+                            f"MCP HTTP request failed with status {response.status}"
+                        )
+                    content_type = (
+                        _header(response.headers, "content-type").split(";", 1)[0].strip().lower()
+                    )
+                    if content_type == "application/json":
+                        data = await read_bounded(streamed.chunks, self._config.max_message_bytes)
+                        return await self._consume(decode_message(data), context=context)
+                    if content_type == "text/event-stream":
+                        expected = message.id if isinstance(message, JsonRpcRequest) else None
+                        async for event in iter_sse(
+                            streamed.chunks,
+                            max_message_bytes=self._config.max_message_bytes,
+                            max_events=self._config.max_stream_events,
+                        ):
+                            result = await self._consume_events((event,), expected, context)
+                            if result is not None:
+                                return result
+                        if expected is not None:
+                            raise McpTransportError(
+                                "MCP POST event stream ended before its response"
+                            )
+                        return None
+                    raise McpProtocolError(f"unsupported MCP HTTP content type: {content_type!r}")
+
     async def _consume_events(
         self,
         events: tuple[ServerSentEvent, ...],
@@ -704,8 +793,7 @@ class StreamableHttpTransport:
         self._capture_session(callback_response.headers)
         if not 200 <= callback_response.status < 300:
             raise McpTransportError(
-                "MCP HTTP callback response failed with status "
-                f"{callback_response.status}"
+                f"MCP HTTP callback response failed with status {callback_response.status}"
             )
         return None
 
@@ -730,17 +818,18 @@ class StreamableHttpTransport:
 
         async def receive() -> JsonRpcResponse:
             event_count = 0
-            async for event in self._exchange.open_events(request):
-                event_count += 1
-                if event_count > self._config.max_stream_events:
-                    raise McpProtocolError("MCP HTTP stream exceeds max_stream_events")
-                _validate_sse_event(
-                    event,
-                    max_message_bytes=self._config.max_message_bytes,
-                )
-                result = await self._consume_events((event,), request_id, context)
-                if result is not None:
-                    return result
+            async with contextlib.aclosing(self._exchange.open_events(request)) as events:
+                async for event in events:
+                    event_count += 1
+                    if event_count > self._config.max_stream_events:
+                        raise McpProtocolError("MCP HTTP stream exceeds max_stream_events")
+                    _validate_sse_event(
+                        event,
+                        max_message_bytes=self._config.max_message_bytes,
+                    )
+                    result = await self._consume_events((event,), request_id, context)
+                    if result is not None:
+                        return result
             raise McpTransportError("MCP HTTP event stream ended before its response")
 
         try:
@@ -809,7 +898,7 @@ def _response_result(response: JsonRpcResponse) -> JsonValue:
     return cast(JsonValue, response.result)
 
 
-class SecureMcpTransportFactory:
+class SecureMcpTransportFactory(McpTransportFactory):
     """Select guarded transports; unsupported legacy SSE fails explicitly."""
 
     def __init__(
@@ -859,9 +948,7 @@ class SecureMcpTransportFactory:
                 resume=resume,
             )
         if self._egress_policy is None or self._http_exchange is None:
-            raise McpTransportError(
-                "Streamable HTTP requires McpEgressPolicy and McpHttpExchange"
-            )
+            raise McpTransportError("Streamable HTTP requires McpEgressPolicy and McpHttpExchange")
         return StreamableHttpTransport(
             config,
             tenant_id=tenant_id,

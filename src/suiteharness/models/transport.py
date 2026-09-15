@@ -7,11 +7,13 @@ headers from ``repr`` because they may contain credentials.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 import codecs
 import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
 from pydantic import JsonValue
 
@@ -43,15 +45,17 @@ class HttpResponse:
             ) from exc
 
 
-class HttpTransport(Protocol):
+class HttpTransport(ABC):
+    @abstractmethod
     async def send(self, request: HttpRequest) -> HttpResponse:
         """Send one buffered request."""
 
+    @abstractmethod
     def stream(self, request: HttpRequest) -> AsyncIterator[bytes]:
         """Yield raw response chunks after validating the HTTP status."""
 
 
-class HttpxTransport:
+class HttpxTransport(HttpTransport):
     """Production async transport backed by ``httpx``.
 
     The dependency is imported lazily so model conversion and registry tests do

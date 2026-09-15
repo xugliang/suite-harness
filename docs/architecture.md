@@ -108,7 +108,7 @@ RootContext
 - 公司工作区布局和 Web/飞书路径策略；
 - Docker 生产沙箱或显式确认不安全的本地开发沙箱；
 - 模型供应商注册表、路由和传输；
-- 百度/Foundry 搜索与受控抓取服务；
+- Bing/百度普通网页搜索、可选百度千帆/Foundry 结构化搜索与受控抓取服务；
 - SQLite 会话、审计，以及共用运行数据库中的产品状态、MCP HTTP 恢复游标和 Docker 清理隔离清单；
 - 进程内工具注册、能力授权和审批存储；
 - Root 默认的产品路由 ReAct、提示词和无操作反思；
@@ -233,7 +233,7 @@ suiteharness.web.search              suiteharness.web.fetch
 
 Bash 通过 `bash -lc` 在 `SandboxBackend`（沙箱后端）中执行。生产只接受摘要固定的 Docker 镜像，容器使用只读根文件系统、非特权用户、移除 Linux capabilities（内核特权能力）、禁止提权、限制 CPU/内存/进程/临时盘/时间/输出，网络默认关闭。若需要访问外部服务，只能选择运维预建的出口网络。部署可用严格校验的 `sandbox.context` 显式选择服务账号的 rootless Docker 上下文；运行、探测、清理和恢复始终使用同一 context，避免环境默认值漂移。每次启动 Docker 前先持久化准确容器名的 active lease（活动租约）；租约写入失败则不启动容器，正常完成或确认删除后才清除。进程硬崩溃、超时、取消、Docker CLI 异常或清理不确定都会留下租约，使重启后的整个 Docker 后端失败关闭，直到管理员按准确名称核对、必要时强制删除、再次确认容器消失并成功清除记录。
 
-`web_search` 使用结构化搜索接口：百度千帆已有具体实现，Foundry Bing 保留注入客户端的适配面。`web_fetch` 可直连、通过公司 HTTP CONNECT 代理或浏览器工作进程；它对每次跳转重新解析地址、阻止私网/回环/链路本地等目标并要求对端 IP 证明，限制跳转、压缩、解压和文本大小。
+`web_search` 对模型只暴露统一工具。默认可配置为 Bing 普通搜索网页，并在连接失败、HTTP 错误、验证码页或空结果时回退到百度普通搜索网页；显式选择 provider 时不自动换源，网络策略拒绝也不会被回退绕过。网页搜索复用固定 DNS/对端 IP 校验、HTTPS、超时和响应上限；百度千帆与 Foundry Bing 结构化适配器仍保留。`web_fetch` 可直连、通过公司 HTTP CONNECT 代理或浏览器工作进程；它对每次跳转重新解析地址、阻止私网/回环/链路本地等目标并要求对端 IP 证明，限制跳转、压缩、解压和文本大小。
 
 Root 内置工具虽然共用，模型可选择的出口参数仍按产品检查：Bash 网络必须通过 `sandbox.network.allowed_profiles_by_product` 精确放行；搜索/抓取未配置产品条目时只允许公司默认 provider/route，非默认出口必须逐产品声明，显式空列表可连默认出口也禁用。例如 AB 可只允许 A 选择 `china-web` 网络，而 B 始终 `network=none`。
 

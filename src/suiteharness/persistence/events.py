@@ -9,6 +9,8 @@ import weakref
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
+from suiteharness.channels.feishu.processor import EventDeduplicator
+
 from .database import SQLiteDatabase
 from .errors import PersistenceCapacityError
 from .models import ChannelEventScope, utc_now
@@ -97,7 +99,7 @@ def _epoch_us(value: datetime) -> int:
     return int(value.astimezone(UTC).timestamp() * 1_000_000)
 
 
-class SQLiteChannelEventDeduplicator:
+class SQLiteChannelEventDeduplicator(EventDeduplicator):
     """Durable bounded implementation of the Feishu ``EventDeduplicator`` protocol.
 
     Bind one instance to a validated scope, then pass it directly to

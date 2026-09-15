@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from collections.abc import Collection
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -279,10 +278,20 @@ class DockerSandboxConfig(_FrozenConfig):
     required: Literal[True] = True
     binary: str = "docker"
     context: str | None = None
+    broker_socket: Path | None = None
     require_rootless: bool = False
     image: str
     limits: SandboxLimitsConfig = Field(default_factory=SandboxLimitsConfig)
     network: SandboxNetworkConfig = Field(default_factory=SandboxNetworkConfig)
+
+    @field_validator("broker_socket")
+    @classmethod
+    def validate_broker_socket(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        if "\x00" in str(value) or ".." in value.parts:
+            raise ValueError("sandbox broker socket must be a normalized path without NUL")
+        return _absolute_path(value, "sandbox broker socket")
 
     @field_validator("binary")
     @classmethod
@@ -751,16 +760,83 @@ class FoundrySearchConfig(_FrozenConfig):
     provider_id: Literal["microsoft-foundry-bing-grounding"] = (
         "microsoft-foundry-bing-grounding"
     )
+    credentials_ref: str
+    project_endpoint: str
+    connection_id: str
+
+    @field_validator("connection_id")
+    @classmethod
+    def validate_connection_id(cls, value: str) -> str:
+        if not value.strip() or len(value) > 2048 or "\x00" in value:
+            raise ValueError("Foundry connection_id must be a bounded non-blank identifier")
+        return value
+
+    @field_validator("credentials_ref")
+    @classmethod
+    def validate_credentials_ref(cls, value: str) -> str:
+        return _secret_ref(value, "Foundry credentials_ref")
+
+    @field_validator("project_endpoint")
+    @classmethod
+    def validate_project_endpoint(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("Foundry project_endpoint must be an absolute HTTPS URL")
+        return value
+
+
+class HtmlSearchConfig(_FrozenConfig):
+    kind: Literal["html"] = "html"
+    provider_id: str
+    engine: Literal["bing", "baidu"]
+    endpoint: str
+    egress_profile: str | None = None
+
+    @field_validator("provider_id")
+    @classmethod
+    def validate_provider_id(cls, value: str) -> str:
+        return _identifier(value, "HTML search provider_id")
+
+    @field_validator("egress_profile")
+    @classmethod
+    def validate_egress_profile(cls, value: str | None) -> str | None:
+        return None if value is None else _identifier(value, "search egress_profile")
+
+    @model_validator(mode="after")
+    def validate_endpoint(self) -> HtmlSearchConfig:
+        parsed = urlsplit(self.endpoint)
+        host = (parsed.hostname or "").lower()
+        expected_domain = "bing.com" if self.engine == "bing" else "baidu.com"
+        expected_path = "/search" if self.engine == "bing" else "/s"
+        if (
+            parsed.scheme != "https"
+            or (host != expected_domain and not host.endswith(f".{expected_domain}"))
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != expected_path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "HTML search endpoint must be the HTTPS search page for the selected engine"
+            )
+        return self
 
 
 SearchProviderConfig = Annotated[
-    BaiduQianfanSearchConfig | FoundrySearchConfig,
+    BaiduQianfanSearchConfig | FoundrySearchConfig | HtmlSearchConfig,
     Field(discriminator="kind"),
 ]
 
 
 class WebSearchConfig(_FrozenConfig):
     default_provider: str
+    fallback_providers: tuple[str, ...] = ()
     providers: tuple[SearchProviderConfig, ...]
 
     @model_validator(mode="after")
@@ -770,6 +846,12 @@ class WebSearchConfig(_FrozenConfig):
             raise ValueError("search providers must be non-empty and unique")
         if self.default_provider not in ids:
             raise ValueError("default search provider is not configured")
+        if len(self.fallback_providers) != len(set(self.fallback_providers)):
+            raise ValueError("fallback search providers must be unique")
+        if self.default_provider in self.fallback_providers:
+            raise ValueError("default search provider cannot also be a fallback")
+        if missing := set(self.fallback_providers) - set(ids):
+            raise ValueError(f"fallback search providers are not configured: {sorted(missing)}")
         return self
 
 
@@ -1017,6 +1099,17 @@ class McpConfig(_FrozenConfig):
         return self
 
 
+class ProductPluginBindings(_FrozenConfig):
+    """Explicit contribution selection; omitted slots keep product/default behavior."""
+
+    memory: str | None = None
+    knowledge: str | None = None
+    workflow: str | None = None
+    reflection: str | None = None
+    prompt: str | None = None
+    tools: tuple[str, ...] = ()
+
+
 class PluginsConfig(_FrozenConfig):
     """Closed plugin inventory for one source-deployed server installation."""
 
@@ -1024,6 +1117,7 @@ class PluginsConfig(_FrozenConfig):
     sources: tuple[PluginSourceDeclaration, ...] = ()
     trusted_in_process_plugins: frozenset[str] = frozenset()
     require_signatures: bool = True
+    bindings_by_product: dict[str, ProductPluginBindings] = Field(default_factory=dict)
 
     @field_validator("allowed_roots")
     @classmethod
@@ -1056,6 +1150,26 @@ class PluginsConfig(_FrozenConfig):
         return self
 
 
+class ConversationMemoryConfig(_FrozenConfig):
+    """Derived memory; ordinary persistent chat is never disabled by this switch."""
+
+    short_term_pairs: int = Field(default=12, ge=1, le=100)
+    max_short_term_bytes: int = Field(default=131072, ge=1024, le=1048576)
+    max_summary_chars: int = Field(default=12000, ge=100, le=12000)
+    model_summary_enabled: bool = True
+    summary_route: str | None = None
+    long_term_enabled: bool = False
+    archive_root: Path | None = None
+
+    @model_validator(mode='after')
+    def valid_archive(self):
+        if self.archive_root is not None:
+            _absolute_path(self.archive_root, 'memory.archive_root')
+        if self.long_term_enabled and self.archive_root is None:
+            raise ValueError('memory.archive_root required when long-term memory enabled')
+        return self
+
+
 class SuiteHarnessConfig(_FrozenConfig):
     """Non-secret deployment configuration."""
 
@@ -1071,9 +1185,12 @@ class SuiteHarnessConfig(_FrozenConfig):
     mcp: McpConfig = Field(default_factory=McpConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+    memory: ConversationMemoryConfig = Field(default_factory=ConversationMemoryConfig)
 
     @model_validator(mode="after")
     def validate_environment(self) -> SuiteHarnessConfig:
+        if self.memory.summary_route is not None and self.memory.summary_route not in {route.route_id for route in self.models.routes}:
+            raise ValueError('memory.summary_route must name a configured model route')
         selected_products = {
             product.product_id for product in self.customer_bundle.products
         }
@@ -1126,15 +1243,19 @@ class SuiteHarnessConfig(_FrozenConfig):
             )
         fetch_routes = {route.name: route for route in self.web_tools.fetch.routes}
         for provider in self.web_tools.search.providers:
-            if not isinstance(provider, BaiduQianfanSearchConfig):
+            route_name = getattr(provider, "egress_profile", None)
+            if route_name is None and not isinstance(provider, FoundrySearchConfig):
+                route_name = self.web_tools.fetch.default_route
+            if route_name is None:
                 continue
-            route_name = provider.egress_profile or self.web_tools.fetch.default_route
             route = fetch_routes[route_name] if route_name in fetch_routes else None
             if route is None:
                 raise ValueError(
                     f"search egress_profile references an unknown fetch route: {route_name!r}"
                 )
-            if isinstance(route, BrowserWorkerFetchConfig):
+            if isinstance(provider, BaiduQianfanSearchConfig) and isinstance(
+                route, BrowserWorkerFetchConfig
+            ):
                 raise ValueError("structured search cannot use a GET-only browser_worker route")
         if not self.workspace.shared_enabled and any(
             root.space == "shared" for root in self.channels.feishu.writable_roots
@@ -1252,19 +1373,8 @@ class SuiteHarnessSecrets(_FrozenConfig):
         return value
 
 
-def validate_secret_references(
-    config: SuiteHarnessConfig,
-    secrets: SuiteHarnessSecrets,
-    *,
-    search_provider_ids: Collection[str] | None = None,
-) -> None:
-    """Validate cross-file credential references without exposing secret values.
-
-    Search providers are activated from trusted tool grants at server startup.
-    Passing an explicit collection validates only providers reachable through
-    those grants; ``None`` preserves the conservative all-provider behaviour
-    for direct callers.
-    """
+def validate_secret_references(config: SuiteHarnessConfig, secrets: SuiteHarnessSecrets) -> None:
+    """Validate cross-file credential references without exposing secret values."""
 
     if config.channels.web.enabled:
         ref = config.channels.web.credentials_ref
@@ -1289,21 +1399,11 @@ def validate_secret_references(
             raise ValueError(
                 f"model credentials_ref {profile.credentials_ref!r} was not found in the secrets file"
             )
-    configured_search = {
-        provider.provider_id: provider for provider in config.web_tools.search.providers
-    }
-    selected_search = (
-        set(configured_search) if search_provider_ids is None else set(search_provider_ids)
-    )
-    if unknown_search := selected_search - set(configured_search):
-        raise ValueError(
-            f"authorized search providers were not configured: {sorted(unknown_search)!r}"
-        )
     service_refs: set[str] = set()
-    for provider_id in selected_search:
-        provider = configured_search[provider_id]
-        if isinstance(provider, BaiduQianfanSearchConfig):
-            service_refs.add(provider.credentials_ref)
+    for provider in config.web_tools.search.providers:
+        ref = getattr(provider, "credentials_ref", None)
+        if ref is not None:
+            service_refs.add(ref)
     for route in config.web_tools.fetch.routes:
         ref = getattr(route, "credentials_ref", None)
         if ref is not None:
@@ -1341,6 +1441,7 @@ __all__ = [
     "ModelsConfig",
     "BaiduQianfanSearchConfig",
     "FoundrySearchConfig",
+    "HtmlSearchConfig",
     "WebSearchConfig",
     "DirectFetchConfig",
     "ManagedProxyFetchConfig",

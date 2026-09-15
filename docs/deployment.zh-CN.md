@@ -318,9 +318,9 @@ workspace:
 
 ### 8.1 搜索
 
-默认示例使用百度千帆结构化 Web Search API，密钥放 `services` 密钥映射。另一选项是 Microsoft Foundry Bing，但需要部署项目注入 `FoundryGroundingClient`。
+默认示例使用 Bing 普通搜索网页，并把百度普通搜索网页配置为无结果或可恢复故障时的后备来源，两者都不需要搜索 API 密钥。这里的百度是 `www.baidu.com/s`，不是百度千帆。网页结构和反爬策略可能变化，因此解析器只读取标题、公开链接和摘要，验证码页视为来源失败，并必须配套契约测试和运行监控。
 
-不要通过抓取百度/Bing 搜索结果 HTML 实现搜索；页面结构、反爬策略和结果完整性都不稳定。
+模型仍只看到 `suiteharness.web.search`。只有模型未显式选择 provider 时，服务器配置的 `fallback_providers` 才会生效；显式选择不换源，SSRF/内网地址等策略拒绝也不回退。所有网页请求仍经过 HTTPS 端点限制、DNS 与对端地址校验、超时和响应大小限制。需要更稳定 SLA 时可改用百度千帆结构化 Web Search API，密钥放 `services` 密钥映射；也可注入 Microsoft Foundry Bing 的 `FoundryGroundingClient`。
 
 ### 8.2 抓取
 
@@ -405,13 +405,6 @@ application = create_company_asgi_app(bootstrap)
 ```
 
 只传启用功能所需的可选适配器：Web 关闭时不能传 `web_authenticator`；飞书关闭时通常不传 `feishu_adapters`；未配置插件/MCP/Foundry/浏览器工作器时相应项可省略。Web 开启则必须传 `CompanyHttpAuthenticator`；共享 Web 会话还必须传可信 `ConversationAuthorizer`。若不同部门只能使用部分产品，Web 和飞书共用的 `ProductAccessAuthorizer` 必须连接公司 IAM/ACL；它在产品路由之后、创建作用域之前逐消息执行，拒绝、异常、超时或非严格 `True` 都失败关闭。两个 ACL 适配器共用 `channels.authorization_timeout_seconds`。省略产品 ACL 等价于“全部已认证公司用户可访问组合内全部产品”，部署评审必须明确接受。飞书必须使用 `FeishuHostAdapters(directory, outbound_sink, webhook_decryptor=...)` 或 `FeishuHostAdapters(..., long_connection_sdk=...)`，按配置传输二选一。
-
-Foundry 搜索配置只声明固定的 `provider_id`；项目端点、Bing 项目连接和 Microsoft Entra（微软
-云身份）认证由可信宿主在预绑定 `FoundryGroundingClient` 时提供，不写入 SuiteHarness 的通用
-service secrets，也不能用任意非空 token 冒充认证成功。宿主应使用公司托管身份与 RBAC（基于
-角色的访问控制）或等价服务器凭据，并确保客户端绑定到预期项目和连接。框架启动时会拒绝缺失
-或未实现 `grounded_search` 的客户端，运行时仍按 `provider_id` 执行产品工具授权和出口隔离。
-目前宿主负责创建该客户端；未来需要按配置懒创建时，应另行实现显式 factory（工厂）接口。
 
 `build()` 内部顺序固定为：解析客户组合 → 创建唯一 Web 审批回路 → `FoundationRuntime.create()` 并探测底座 → 准备产品工作区 → 激活产品 → 启动插件/MCP → 按已发现 MCP 清单组合渠道 → 启动可选飞书长连接 → 聚合就绪。任何阶段失败都反向回滚并保持不接流量；标准路径还把 `foundation.runtime_database` 复用给渠道去重。只有需要实现自定义公司宿主时才直接使用 `FoundationRuntime`、`CompanyChannelRuntime` 等低层接口。
 
@@ -666,7 +659,7 @@ sandbox:
 
 web_tools:
   search_providers_by_product:
-    product-a: [baidu-qianfan]
+    product-a: [bing-html]
     product-b: []             # B 连公司默认搜索也不能用
   fetch_routes_by_product:
     product-a: [direct]
@@ -726,7 +719,7 @@ ASGI lifespan 会在开始接收渠道流量前完成配置、Foundation、产�
 - [ ] Web 写入、Bash和其他破坏性动作走一次性审批；
 - [ ] 每产品画像/知识/工作流/提示词/反思/MCP 均验证隔离；
 - [ ] `customer360` 默认为 isolated；curated 规则有治理依据；
-- [ ] 搜索使用百度/Foundry 结构化接口；
+- [ ] 搜索来源及回退链已验证；HTML 来源有结构变化/验证码监控，结构化来源的密钥和 SLA 已核验；
 - [ ] 抓取/代理/浏览器工作器通过 SSRF 和出口测试；
 - [ ] 模型厂商逐模型做契约与数据合规测试；
 - [ ] 插件摘要、签名、权限和隔离启动器完成；

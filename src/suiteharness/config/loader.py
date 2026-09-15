@@ -295,11 +295,7 @@ class SuiteHarnessConfigLoader:
             # a raw credential even though SecretStr would later redact it.
             raise ConfigLoadError("secrets file validation failed") from exc
         try:
-            # Search credentials are selected from trusted runtime grants, which
-            # are deliberately not part of the public YAML.  Keep validating
-            # every supplied secret's structure here and defer only the
-            # reachability-dependent existence check to server startup.
-            validate_secret_references(config, secrets, search_provider_ids=())
+            validate_secret_references(config, secrets)
         except ValueError as exc:
             raise ConfigLoadError(str(exc)) from exc
         _validate_production_placeholders(config, secrets)

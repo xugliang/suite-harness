@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 from datetime import datetime
-from typing import Protocol
+
 
 from pydantic import JsonValue
 
@@ -19,11 +21,14 @@ from suiteharness.sessions.models import (
 )
 
 
-class SessionStore(Protocol):
+class SessionStore(ABC):
+    @abstractmethod
     async def create(self, identity: SessionIdentity) -> SessionRecord: ...
 
+    @abstractmethod
     async def get(self, identity: SessionIdentity) -> SessionRecord | None: ...
 
+    @abstractmethod
     async def claim_run(
         self,
         identity: SessionIdentity,
@@ -33,6 +38,7 @@ class SessionStore(Protocol):
         lease_seconds: float,
     ) -> SessionRunClaimState: ...
 
+    @abstractmethod
     async def finalize_run(
         self,
         identity: SessionIdentity,
@@ -42,6 +48,7 @@ class SessionStore(Protocol):
         lease_seconds: float,
     ) -> bool: ...
 
+    @abstractmethod
     async def append(
         self,
         identity: SessionIdentity,
@@ -54,6 +61,7 @@ class SessionStore(Protocol):
         occurred_at: datetime | None = None,
     ) -> TranscriptEvent: ...
 
+    @abstractmethod
     async def save_checkpoint(
         self,
         identity: SessionIdentity,
@@ -64,6 +72,7 @@ class SessionStore(Protocol):
         idempotency_key: str,
     ) -> SessionCheckpoint: ...
 
+    @abstractmethod
     async def set_status(
         self,
         identity: SessionIdentity,
@@ -72,6 +81,7 @@ class SessionStore(Protocol):
         expected_revision: int,
     ) -> SessionRecord: ...
 
+    @abstractmethod
     async def recent_transcript(
         self,
         identity: SessionIdentity,
@@ -79,4 +89,5 @@ class SessionStore(Protocol):
         limit: int,
     ) -> tuple[TranscriptEvent, ...]: ...
 
+    @abstractmethod
     async def resume(self, identity: SessionIdentity) -> SessionSnapshot | None: ...

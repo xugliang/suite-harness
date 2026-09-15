@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -32,6 +33,7 @@ from suiteharness.channels.feishu import (
     RawEventDecryptor,
     create_starlette_feishu_route,
 )
+from suiteharness.channels.gateway import PrincipalAuthenticator
 from suiteharness.channels.websocket import (
     EnterpriseWebSocketServer,
     HmacSessionTokenCodec,
@@ -43,6 +45,11 @@ from suiteharness.channels.websocket import (
 )
 from suiteharness.config import LoadedSuiteHarnessConfig
 from suiteharness.execution import ToolRegistry
+from suiteharness.memory.markdown_archive import MarkdownArchive
+from suiteharness.memory.resolver import ProductSessionMemoryResolver
+from suiteharness.memory.session_memory import SessionConversationMemory
+from suiteharness.memory.summarization import GatewayMemorySummarizer
+from suiteharness.models import MODEL_GATEWAY
 from suiteharness.persistence import (
     ChannelEventScope,
     SQLiteChannelEventDeduplicator,
@@ -86,15 +93,19 @@ class ChannelHostConfigurationError(ValueError):
     """Safe configuration failure before any channel begins accepting traffic."""
 
 
-class _RejectingAuthenticator:
-    async def authenticate(self, _message: InboundMessage) -> AuthenticatedPrincipal | None:
+class _RejectingAuthenticator(PrincipalAuthenticator):
+    async def authenticate(
+        self, _message: InboundMessage
+    ) -> AuthenticatedPrincipal | None:
         return None
 
 
 class _HostedEnterpriseChannelGateway(EnterpriseChannelGateway):
     """Reject new channel traffic as soon as its owning host begins shutdown."""
 
-    def __init__(self, *args: Any, host_closed: Callable[[], bool], **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, host_closed: Callable[[], bool], **kwargs: Any
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._host_closed = host_closed
 
@@ -104,8 +115,9 @@ class _HostedEnterpriseChannelGateway(EnterpriseChannelGateway):
 
     async def dispatch(self, message: InboundMessage) -> AsyncIterator[OutboundEvent]:
         self._require_open()
-        async for event in super().dispatch(message):
-            yield event
+        async with aclosing(super().dispatch(message)) as source:
+            async for event in source:
+                yield event
 
     async def dispatch_authenticated(
         self,
@@ -113,8 +125,9 @@ class _HostedEnterpriseChannelGateway(EnterpriseChannelGateway):
         principal: AuthenticatedPrincipal,
     ) -> AsyncIterator[OutboundEvent]:
         self._require_open()
-        async for event in super().dispatch_authenticated(message, principal):
-            yield event
+        async with aclosing(super().dispatch_authenticated(message, principal)) as source:
+            async for event in source:
+                yield event
 
 
 class WebApprovalRuntime:
@@ -198,8 +211,12 @@ class CompanyChannelRuntime:
     def __init__(self) -> None:
         self._closed = False
         self._close_lock = asyncio.Lock()
-        self._web_route_factory: StarletteRouteFactory = create_starlette_websocket_route
-        self._feishu_route_factory: StarletteRouteFactory = create_starlette_feishu_route
+        self._web_route_factory: StarletteRouteFactory = (
+            create_starlette_websocket_route
+        )
+        self._feishu_route_factory: StarletteRouteFactory = (
+            create_starlette_feishu_route
+        )
 
     @classmethod
     async def create(
@@ -308,7 +325,10 @@ class CompanyChannelRuntime:
             "save_checkpoint",
             "set_status",
         )
-        if any(not callable(getattr(sessions, name, None)) for name in required_session_methods):
+        if any(
+            not callable(getattr(sessions, name, None))
+            for name in required_session_methods
+        ):
             raise TypeError("sessions does not implement the SessionStore contract")
         if not callable(getattr(tools, "resolve", None)):
             raise TypeError("tools does not implement the ToolRegistry contract")
@@ -316,15 +336,17 @@ class CompanyChannelRuntime:
             not callable(getattr(capabilities, name, None))
             for name in ("issue", "revoke")
         ):
-            raise TypeError("capabilities does not implement the grant authority contract")
+            raise TypeError(
+                "capabilities does not implement the grant authority contract"
+            )
         if not callable(getattr(activation, "run", None)):
-            raise TypeError("activation does not implement the customer bundle run contract")
+            raise TypeError(
+                "activation does not implement the customer bundle run contract"
+            )
         if product_access_authorizer is not None and not callable(
             getattr(product_access_authorizer, "authorize", None)
         ):
-            raise TypeError(
-                "product_access_authorizer must implement async authorize"
-            )
+            raise TypeError("product_access_authorizer must implement async authorize")
         self._validate_activation(loaded, activation)
         product_ids = tuple(item.product_id for item in config.customer_bundle.products)
         enabled_channels: set[str] = set()
@@ -340,7 +362,9 @@ class CompanyChannelRuntime:
         actual_templates = {
             (template.channel_id, template.product_id) for template in grant_templates
         }
-        if actual_templates != expected_templates or len(actual_templates) != len(grant_templates):
+        if actual_templates != expected_templates or len(actual_templates) != len(
+            grant_templates
+        ):
             missing = sorted(expected_templates - actual_templates)
             unexpected = sorted(actual_templates - expected_templates)
             raise ChannelHostConfigurationError(
@@ -364,7 +388,9 @@ class CompanyChannelRuntime:
         material: dict[str, AdditionalGrantMaterial] = {}
         for product_id, item in mcp_grant_material.items():
             if not isinstance(item, McpGrantMaterial):
-                raise TypeError("mcp_grant_material must contain McpGrantMaterial values")
+                raise TypeError(
+                    "mcp_grant_material must contain McpGrantMaterial values"
+                )
             expected_origin = (
                 f"scope:product:{config.deployment.tenant_id}:{product_id}"
             )
@@ -380,9 +406,10 @@ class CompanyChannelRuntime:
                 for server in config.mcp.servers_by_product.get(product_id, ())
                 if server.enabled
             }
-            if unknown_servers := {
-                tool.server_id for tool in item.tools
-            } - configured_servers:
+            if (
+                unknown_servers := {tool.server_id for tool in item.tools}
+                - configured_servers
+            ):
                 raise ChannelHostConfigurationError(
                     "MCP grant material references unconfigured servers: "
                     f"{sorted(unknown_servers)!r}"
@@ -439,11 +466,35 @@ class CompanyChannelRuntime:
             additional_material_by_product=material,
             mcp_access_by_route=mcp_access,
         )
+        memory_config = config.memory
+        summarizer = None
+        if memory_config.model_summary_enabled:
+            product = next(iter(activation.products.values()))
+            try:
+                gateway = product.resolve(MODEL_GATEWAY)
+            except LookupError as exc:
+                raise ChannelHostConfigurationError('model summaries require the foundation model gateway') from exc
+            summarizer = GatewayMemorySummarizer(
+                gateway, memory_config.summary_route or config.models.default_route,
+                max_chars=memory_config.max_summary_chars,
+            )
+        memory = SessionConversationMemory(
+            short_term_pairs=memory_config.short_term_pairs,
+            max_short_term_bytes=memory_config.max_short_term_bytes,
+            max_summary_chars=memory_config.max_summary_chars,
+            summary_callback=summarizer,
+        )
+        archive = None
+        if memory_config.long_term_enabled:
+            assert memory_config.archive_root is not None
+            archive = MarkdownArchive(memory_config.archive_root, long_term_enabled=True)
         self.application = ChannelApplication(
             activation=activation,
             sessions=sessions,
             grants=self.grants,
             input_builder=input_builder,
+            memory_resolver=ProductSessionMemoryResolver(activation.products, memory),
+            archive=archive,
         )
         self._loaded = loaded
         self._activation = activation
@@ -500,7 +551,9 @@ class CompanyChannelRuntime:
             )
         credentials = loaded.secrets.web.get(config.channels.web.credentials_ref)
         if credentials is None:
-            raise ChannelHostConfigurationError("configured Web credentials are unavailable")
+            raise ChannelHostConfigurationError(
+                "configured Web credentials are unavailable"
+            )
         if not config.channels.web.allowed_origins:
             raise ChannelHostConfigurationError(
                 "enabled Web channel requires an explicit origin allowlist"
@@ -560,7 +613,9 @@ class CompanyChannelRuntime:
             )
         credentials = loaded.secrets.feishu.get(config.channels.feishu.credentials_ref)
         if credentials is None:
-            raise ChannelHostConfigurationError("configured Feishu credentials are unavailable")
+            raise ChannelHostConfigurationError(
+                "configured Feishu credentials are unavailable"
+            )
         tenant_id = config.deployment.tenant_id
         selected_products = {
             item.product_id for item in config.customer_bundle.products
@@ -617,7 +672,10 @@ class CompanyChannelRuntime:
         self.feishu_long_connection = None
 
         if config.channels.feishu.transport == "webhook":
-            if credentials.verification_token is None or credentials.encrypt_key is None:
+            if (
+                credentials.verification_token is None
+                or credentials.encrypt_key is None
+            ):
                 raise ChannelHostConfigurationError(
                     "Feishu webhook credentials require verification_token and encrypt_key"
                 )
@@ -711,7 +769,9 @@ class CompanyChannelRuntime:
                 except BaseException as exc:
                     failures.append(exc)
             if failures:
-                raise BaseExceptionGroup("company channel shutdown reported failures", failures)
+                raise BaseExceptionGroup(
+                    "company channel shutdown reported failures", failures
+                )
 
     @staticmethod
     def _validate_activation(
@@ -720,7 +780,9 @@ class CompanyChannelRuntime:
     ) -> None:
         config = loaded.config
         if activation.closed:
-            raise ChannelHostConfigurationError("cannot host a closed customer activation")
+            raise ChannelHostConfigurationError(
+                "cannot host a closed customer activation"
+            )
         if activation.tenant_id != config.deployment.tenant_id:
             raise ChannelHostConfigurationError(
                 "customer activation tenant does not match deployment"
@@ -735,7 +797,9 @@ class CompanyChannelRuntime:
                 "active products do not exactly match the configured customer bundle"
             )
         for product_id, product in activation.products.items():
-            if product.path != ScopePath.product(config.deployment.tenant_id, product_id):
+            if product.path != ScopePath.product(
+                config.deployment.tenant_id, product_id
+            ):
                 raise ChannelHostConfigurationError(
                     "active product context does not match its configured scope"
                 )

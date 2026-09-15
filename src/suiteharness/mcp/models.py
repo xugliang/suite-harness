@@ -8,6 +8,7 @@ while security-sensitive configuration stays strict and closed by default.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from datetime import UTC, datetime
 from enum import Enum
@@ -930,6 +931,7 @@ class McpServerConfig(_FrozenModel):
     credential_ref: str | None = None
     enabled: bool = True
     timeout_seconds: float = Field(default=60.0, gt=0.0, le=3600.0)
+    session_lifetime_seconds: float = Field(default=86400.0, gt=0.0, le=86400.0)
     discovery_timeout_seconds: float = Field(default=120.0, gt=0.0, le=600.0)
     max_message_bytes: int = Field(default=4_194_304, ge=1_024, le=67_108_864)
     max_stream_events: int = Field(default=256, ge=1, le=10_000)
@@ -940,6 +942,7 @@ class McpServerConfig(_FrozenModel):
     legacy_sse: LegacySseCompatibility = LegacySseCompatibility.DISABLED
     protocol_versions: tuple[str, ...] = (LATEST_PROTOCOL_VERSION,)
     features: McpFeatureFlags = Field(default_factory=McpFeatureFlags)
+    allowed_private_networks: tuple[str, ...] = ()
 
     @field_validator(
         "max_message_bytes",
@@ -966,6 +969,16 @@ class McpServerConfig(_FrozenModel):
     def valid_credential_ref(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("credential_ref must not be blank")
+        return value
+
+    @field_validator("allowed_private_networks")
+    @classmethod
+    def valid_allowed_private_networks(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for item in value:
+            try:
+                ipaddress.ip_network(item, strict=False)
+            except ValueError as exc:
+                raise ValueError("allowed_private_networks must contain CIDR ranges") from exc
         return value
 
     @model_validator(mode="after")

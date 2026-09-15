@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
@@ -71,7 +72,9 @@ class ToolAccessTemplate:
         if len(aliases) != len(set(aliases)):
             raise ValueError("an alias may occur in only one access category")
         if self.lifetime <= timedelta(0) or self.lifetime > timedelta(hours=1):
-            raise ValueError("tool grants must live for more than zero and at most one hour")
+            raise ValueError(
+                "tool grants must live for more than zero and at most one hour"
+            )
         if self.channel_id == "feishu":
             if self.destructive_aliases:
                 raise ValueError("Feishu templates cannot enable destructive tools")
@@ -128,8 +131,7 @@ class McpChannelAccessRule:
             if not names:
                 raise ValueError("MCP per-server tool access must not be empty")
             if any(
-                not name.strip() or len(name) > 256 or "\x00" in name
-                for name in names
+                not name.strip() or len(name) > 256 or "\x00" in name for name in names
             ):
                 raise ValueError("MCP remote tool names must be bounded and non-blank")
         object.__setattr__(self, "server_ids", servers)
@@ -175,7 +177,9 @@ class AdditionalGrantMaterial:
     def __post_init__(self) -> None:
         tools = tuple(self.tools)
         if any(not isinstance(item, AdditionalGrantTool) for item in tools):
-            raise TypeError("additional material must contain AdditionalGrantTool values")
+            raise TypeError(
+                "additional material must contain AdditionalGrantTool values"
+            )
         identities = [item.identity for item in tools]
         remote_keys = [(item.server_id, item.remote_name) for item in tools]
         if len(identities) != len(set(identities)):
@@ -185,13 +189,16 @@ class AdditionalGrantMaterial:
         object.__setattr__(self, "tools", tools)
 
 
-class ChannelGrantIssuer(Protocol):
+class ChannelGrantIssuer(ABC):
     """Injectable application contract for a revocable grant lease."""
 
-    def lease(self, scope: RequestScope) -> AbstractAsyncContextManager[IssuedToolGrant]: ...
+    @abstractmethod
+    def lease(
+        self, scope: RequestScope
+    ) -> AbstractAsyncContextManager[IssuedToolGrant]: ...
 
 
-class ConfiguredGrantIssuer:
+class ConfiguredGrantIssuer(ChannelGrantIssuer):
     """Resolve aliases at request scope, then grant only concrete identities.
 
     Templates are selected by the exact ``(channel_id, product_id)`` pair.  A
@@ -208,10 +215,10 @@ class ConfiguredGrantIssuer:
         registry: ToolRegistry,
         authority: GrantAuthority,
         templates: Iterable[ToolAccessTemplate],
-        additional_material_by_product: Mapping[str, AdditionalGrantMaterial] | None = None,
-        mcp_access_by_route: Mapping[
-            tuple[str, str], McpChannelAccessRule
-        ] | None = None,
+        additional_material_by_product: Mapping[str, AdditionalGrantMaterial]
+        | None = None,
+        mcp_access_by_route: Mapping[tuple[str, str], McpChannelAccessRule]
+        | None = None,
     ) -> None:
         self._registry = registry
         self._authority = authority
@@ -229,7 +236,9 @@ class ConfiguredGrantIssuer:
             if not _IDENTIFIER.fullmatch(product_id):
                 raise ValueError("invalid additional grant material product_id")
             if not isinstance(item, AdditionalGrantMaterial):
-                raise TypeError("additional material must contain AdditionalGrantMaterial values")
+                raise TypeError(
+                    "additional material must contain AdditionalGrantMaterial values"
+                )
         self._additional_material = material
         access: dict[tuple[str, str], McpChannelAccessRule] = {}
         for key, rule in dict(mcp_access_by_route or {}).items():
@@ -239,15 +248,23 @@ class ConfiguredGrantIssuer:
                 or not all(isinstance(item, str) for item in key)
                 or not all(_IDENTIFIER.fullmatch(item) for item in key)
             ):
-                raise ValueError("MCP access routes must be (channel_id, product_id) pairs")
+                raise ValueError(
+                    "MCP access routes must be (channel_id, product_id) pairs"
+                )
             if key not in indexed:
-                raise ValueError("MCP access route has no matching tool access template")
+                raise ValueError(
+                    "MCP access route has no matching tool access template"
+                )
             if not isinstance(rule, McpChannelAccessRule):
-                raise TypeError("MCP access routes must contain McpChannelAccessRule values")
+                raise TypeError(
+                    "MCP access routes must contain McpChannelAccessRule values"
+                )
             access[key] = rule
         self._mcp_access = access
 
-    def lease(self, scope: RequestScope) -> AbstractAsyncContextManager[IssuedToolGrant]:
+    def lease(
+        self, scope: RequestScope
+    ) -> AbstractAsyncContextManager[IssuedToolGrant]:
         if not isinstance(scope, RequestScope):
             raise TypeError("scope must be a RequestScope")
         return self._lease(scope)
@@ -256,7 +273,9 @@ class ConfiguredGrantIssuer:
     async def _lease(self, scope: RequestScope) -> AsyncIterator[IssuedToolGrant]:
         template = self._templates.get((scope.channel_id, scope.product_id))
         if template is None:
-            raise ToolAccessError("no tool access template matches this channel and product")
+            raise ToolAccessError(
+                "no tool access template matches this channel and product"
+            )
 
         identities: list[ToolIdentity] = []
         capabilities: set[str] = set()
@@ -325,7 +344,9 @@ class ConfiguredGrantIssuer:
         if expected == "read":
             matches = registered.spec.is_read
         elif expected == "write":
-            matches = ToolEffect.WRITE in effects and ToolEffect.DESTRUCTIVE not in effects
+            matches = (
+                ToolEffect.WRITE in effects and ToolEffect.DESTRUCTIVE not in effects
+            )
         else:
             matches = ToolEffect.WRITE in effects and ToolEffect.DESTRUCTIVE in effects
         if not matches:
@@ -339,7 +360,9 @@ class ConfiguredGrantIssuer:
                 and identity.namespace == "suiteharness"
                 and identity.origin == "suiteharness.builtin.fs"
             ):
-                raise ToolAccessError("Feishu write access requires an exact built-in file tool")
+                raise ToolAccessError(
+                    "Feishu write access requires an exact built-in file tool"
+                )
         return registered.identity, registered.spec.required_capabilities
 
     def _resolve_mcp(
@@ -349,7 +372,9 @@ class ConfiguredGrantIssuer:
     ) -> tuple[list[ToolIdentity], set[str], bool]:
         material = self._additional_material.get(scope.product_id)
         if material is None:
-            raise ToolAccessError("configured MCP access has no connected product inventory")
+            raise ToolAccessError(
+                "configured MCP access has no connected product inventory"
+            )
         requested_tools = {
             (server_id, remote_name)
             for server_id, names in rule.tools_by_server.items()
@@ -361,14 +386,20 @@ class ConfiguredGrantIssuer:
         has_write = False
         for item in sorted(
             material.tools,
-            key=lambda tool: (tool.server_id, tool.remote_name, tool.identity.canonical_id),
+            key=lambda tool: (
+                tool.server_id,
+                tool.remote_name,
+                tool.identity.canonical_id,
+            ),
         ):
             key = item.server_id, item.remote_name
             if item.server_id not in rule.server_ids and key not in requested_tools:
                 continue
             registered = self._registry.resolve(scope, item.identity.name)
             if registered is None or registered.identity != item.identity:
-                raise ToolAccessError("MCP grant material contains a stale tool identity")
+                raise ToolAccessError(
+                    "MCP grant material contains a stale tool identity"
+                )
             if registered.spec.required_capabilities != item.capabilities:
                 raise ToolAccessError(
                     "MCP grant material capabilities do not match its exact tool"

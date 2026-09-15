@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from suiteharness.execution.events import WorkflowEvent
+
+import json
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from pydantic import JsonValue
 
 from suiteharness.execution.models import (
+    ConversationMessage,
+    PromptMessage,
     ApprovalBinding,
     ApprovalTarget,
     AuditEvent,
@@ -20,6 +27,7 @@ from suiteharness.execution.models import (
     WorkflowDecision,
     WorkflowFrame,
 )
+from suiteharness.runtime.effects import EffectScope
 from suiteharness.runtime.scopes import (
     RequestScope,
     ScopeKind,
@@ -41,6 +49,7 @@ class ToolCallContext:
 
 @runtime_checkable
 class ToolHandler(Protocol):
+    """Structural callable contract so plain async functions remain supported."""
     async def __call__(
         self,
         context: ToolCallContext,
@@ -49,6 +58,7 @@ class ToolHandler(Protocol):
 
 
 class ToolInputValidator(Protocol):
+    """Structural view of third-party jsonschema validator instances."""
     def validate(self, instance: object) -> None: ...
 
 
@@ -61,15 +71,31 @@ class RegisteredTool:
     input_validator: ToolInputValidator
 
 
-class ToolRegistry(Protocol):
+class ToolRegistry(ABC):
     """Root-owned registry; callers can only resolve through a RequestScope."""
 
+    @abstractmethod
     def resolve(self, scope: RequestScope, tool_name: str) -> RegisteredTool | None: ...
 
 
-class CapabilityAuthority(Protocol):
+class ScopedToolRegistry(ToolRegistry):
+    """Root-owned registry surface exposed narrowly during trusted install."""
+
+    @abstractmethod
+    def register_owned(
+        self,
+        scope: ScopePath,
+        effects: EffectScope,
+        spec: ToolSpec,
+        handler: ToolHandler,
+    ) -> object: ...
+
+
+class CapabilityAuthority(ABC):
+    @abstractmethod
     async def resolve(self, grant_id: str) -> CapabilityGrant | None: ...
 
+    @abstractmethod
     async def bind_activation(
         self,
         tenant_id: str,
@@ -77,12 +103,16 @@ class CapabilityAuthority(Protocol):
         owner_token: str,
     ) -> None:
         """Make subsequent grants belong to one kernel-owned activation."""
+        raise NotImplementedError
 
+    @abstractmethod
     async def release_activation(self, owner_token: str) -> None:
         """Revoke grants and remove scopes owned by an exact activation."""
+        raise NotImplementedError
 
 
-class ApprovalStore(Protocol):
+class ApprovalStore(ABC):
+    @abstractmethod
     async def consume_if_matches(
         self,
         token: str,
@@ -90,9 +120,10 @@ class ApprovalStore(Protocol):
     ) -> ApprovalBinding | None: ...
 
 
-class InteractiveApprovalBroker(Protocol):
+class InteractiveApprovalBroker(ABC):
     """Ask an authenticated interactive channel about one exact pending call."""
 
+    @abstractmethod
     async def request_approval(
         self,
         request: RunRequest,
@@ -102,9 +133,10 @@ class InteractiveApprovalBroker(Protocol):
     ) -> ApprovalBinding | None: ...
 
 
-class ToolAuthorizationPolicy(Protocol):
+class ToolAuthorizationPolicy(ABC):
     """Trusted host policy; products and model output cannot replace it."""
 
+    @abstractmethod
     def evaluate(
         self,
         request: RunRequest,
@@ -114,12 +146,19 @@ class ToolAuthorizationPolicy(Protocol):
     ) -> ToolAuthorization: ...
 
 
-class AuditJournal(Protocol):
+class AuditJournal(ABC):
+    @abstractmethod
     async def append(self, event: AuditEvent) -> None: ...
 
 
-@runtime_checkable
-class Workflow(Protocol):
+class Workflow(ABC):
+    async def stream(
+        self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
+    ) -> AsyncIterator[WorkflowEvent | WorkflowDecision]:
+        """Default for atomic business steps; incremental workflows override this."""
+        yield await self.next(request, frame, prompt)
+
+    @abstractmethod
     async def next(
         self,
         request: RunRequest,
@@ -128,19 +167,83 @@ class Workflow(Protocol):
     ) -> WorkflowDecision: ...
 
 
-@runtime_checkable
-class PromptStrategy(Protocol):
-    async def render(self, request: RunRequest, frame: WorkflowFrame) -> PromptEnvelope: ...
+class PromptStrategy(ABC):
+    """Generic bounded conversation renderer, customizable by subclasses."""
+
+    system_prompt: str = (
+        "You are an enterprise AI agent. Follow company policy, use only the tools "
+        "provided to you, and never claim that a tool ran before receiving its result."
+    )
+
+    async def render(self, request: RunRequest, frame: WorkflowFrame) -> PromptEnvelope:
+        del frame
+        participant_aliases: dict[str, str] = {}
+        history: list[PromptMessage] = []
+        for item in request.conversation.messages:
+            alias: str | None = None
+            if item.role == "user" and item.principal_id != request.scope.principal_id:
+                assert item.principal_id is not None
+                alias = participant_aliases.setdefault(
+                    item.principal_id,
+                    f"participant-{len(participant_aliases) + 1}",
+                )
+            history.append(self._history_message(item, participant_alias=alias))
+        memory_messages = ()
+        if request.conversation.working_summary or request.conversation.long_term_context:
+            memory_messages = (PromptMessage(role='user', content=json.dumps({
+                'context_type': 'untrusted_conversation_memory',
+                'working_summary': request.conversation.working_summary,
+                'long_term_context': request.conversation.long_term_context,
+                'degraded': request.conversation.memory_degraded,
+            }, ensure_ascii=False)),)
+        return PromptEnvelope(
+            messages=(
+                PromptMessage(role="system", content=self.system_prompt),
+                *history,
+                *memory_messages,
+                PromptMessage(role="user", content=self._text(request.input)),
+            ),
+            metadata={
+                "run_id": request.run_id,
+                "tenant_id": request.scope.tenant_id,
+                "product_id": request.scope.product_id,
+                "conversation_truncated": request.conversation.truncated,
+                "memory_degraded": request.conversation.memory_degraded,
+            },
+        )
+
+    @classmethod
+    def _history_message(
+        cls,
+        message: ConversationMessage,
+        *,
+        participant_alias: str | None,
+    ) -> PromptMessage:
+        content = cls._text(message.content)
+        if participant_alias is not None:
+            # Stable only inside this bounded prompt window: the external model
+            # can distinguish speakers without receiving company principal ids.
+            content = f"[authenticated {participant_alias}]\n{content}"
+        return PromptMessage(role=message.role, content=content)
+
+    @staticmethod
+    def _text(value: object) -> str:
+        return (
+            value
+            if isinstance(value, str)
+            else json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
 
 
-@runtime_checkable
-class ReflectionStrategy(Protocol):
+class ReflectionStrategy(ABC):
     async def review(
         self,
         request: RunRequest,
         frame: WorkflowFrame,
         decision: WorkflowDecision,
-    ) -> WorkflowDecision: ...
+    ) -> WorkflowDecision:
+        """Accept the decision unchanged unless a reviewer overrides this hook."""
+        return decision
 
 
 # Strategies may be supplied by a product.  There is intentionally no ServiceKey

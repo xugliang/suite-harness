@@ -7,6 +7,7 @@ import http.client
 import ipaddress
 import socket
 import ssl
+from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -22,17 +23,19 @@ from .models import (
 )
 
 
-class DnsResolver(Protocol):
+class DnsResolver(ABC):
+    @abstractmethod
     async def resolve(self, hostname: str, port: int) -> frozenset[str]: ...
 
 
-class HttpTransport(Protocol):
+class HttpTransport(ABC):
     """Direct/proxy/browser contract with target-address attestation."""
 
+    @abstractmethod
     async def send(self, request: HttpRequest) -> HttpResponse: ...
 
 
-class SystemDnsResolver:
+class SystemDnsResolver(DnsResolver):
     async def resolve(self, hostname: str, port: int) -> frozenset[str]:
         def lookup() -> frozenset[str]:
             records = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
@@ -65,7 +68,11 @@ class PublicNetworkPolicy:
         self._resolver = resolver or SystemDnsResolver()
 
     async def validate(self, url: str) -> ValidatedTarget:
-        if not isinstance(url, str) or len(url) > 8_192 or any(char in url for char in "\r\n\x00"):
+        if (
+            not isinstance(url, str)
+            or len(url) > 8_192
+            or any(char in url for char in "\r\n\x00")
+        ):
             raise WebPolicyDenied("invalid outbound URL")
         parsed = urlsplit(url)
         if parsed.scheme.lower() not in {"http", "https"}:
@@ -78,7 +85,9 @@ class PublicNetworkPolicy:
             hostname = parsed.hostname.encode("idna").decode("ascii").lower()
         except UnicodeError as exc:
             raise WebPolicyDenied("invalid international hostname") from exc
-        if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".localhost"):
+        if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(
+            ".localhost"
+        ):
             raise WebPolicyDenied("local hostnames are forbidden")
         try:
             port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
@@ -104,9 +113,13 @@ class PublicNetworkPolicy:
             connected = ipaddress.ip_address(connected_ip)
             allowed = {ipaddress.ip_address(value) for value in target.addresses}
         except ValueError as exc:
-            raise WebPolicyDenied("transport returned an invalid target address") from exc
+            raise WebPolicyDenied(
+                "transport returned an invalid target address"
+            ) from exc
         if connected not in allowed:
-            raise WebPolicyDenied("outbound target address changed after DNS validation")
+            raise WebPolicyDenied(
+                "outbound target address changed after DNS validation"
+            )
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
@@ -122,7 +135,9 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, hostname: str, ip: str, port: int, timeout: float) -> None:
-        super().__init__(hostname, port, timeout=timeout, context=ssl.create_default_context())
+        super().__init__(
+            hostname, port, timeout=timeout, context=ssl.create_default_context()
+        )
         self._pinned_ip = ip
 
     def connect(self) -> None:
@@ -132,7 +147,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
 
 
-class DirectHttpTransport:
+class DirectHttpTransport(HttpTransport):
     """Direct transport with no environment proxy and no automatic redirect."""
 
     async def send(self, request: HttpRequest) -> HttpResponse:
@@ -145,7 +160,9 @@ class DirectHttpTransport:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         ip = sorted(request.allowed_target_ips)[0]
         connection_type = (
-            _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
+            _PinnedHTTPSConnection
+            if parsed.scheme == "https"
+            else _PinnedHTTPConnection
         )
         connection = connection_type(hostname, ip, port, request.timeout_seconds)
         path = parsed.path or "/"
@@ -186,9 +203,13 @@ class ManagedProxyConfig:
         if parsed.scheme != "http" or not parsed.hostname:
             raise ValueError("managed proxy endpoint must be an absolute http URL")
         if parsed.username is not None or parsed.password is not None:
-            raise ValueError("managed proxy credentials must use secret headers, not URL userinfo")
+            raise ValueError(
+                "managed proxy credentials must use secret headers, not URL userinfo"
+            )
         if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
-            raise ValueError("managed proxy endpoint cannot contain a path, query, or fragment")
+            raise ValueError(
+                "managed proxy endpoint cannot contain a path, query, or fragment"
+            )
         clean: dict[str, str] = {}
         for key, value in self.headers.items():
             if not key or any(char in key for char in "\r\n:"):
@@ -199,7 +220,7 @@ class ManagedProxyConfig:
         object.__setattr__(self, "headers", MappingProxyType(clean))
 
 
-class ManagedProxyHttpTransport:
+class ManagedProxyHttpTransport(HttpTransport):
     """Pinned-target HTTP/CONNECT transport through one explicit proxy."""
 
     def __init__(self, config: ManagedProxyConfig) -> None:
@@ -227,7 +248,9 @@ class ManagedProxyHttpTransport:
         target_headers.setdefault("Accept-Encoding", "identity")
         try:
             if target.scheme == "https":
-                connection.set_tunnel(pinned_ip, target_port, headers=dict(self._config.headers))
+                connection.set_tunnel(
+                    pinned_ip, target_port, headers=dict(self._config.headers)
+                )
                 connection.connect()
                 assert connection.sock is not None
                 connection.sock = ssl.create_default_context().wrap_socket(
@@ -240,7 +263,9 @@ class ManagedProxyHttpTransport:
                 ip_netloc = f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
                 if target_port != 80:
                     ip_netloc = f"{ip_netloc}:{target_port}"
-                request_target = urlunsplit(("http", ip_netloc, target.path or "/", target.query, ""))
+                request_target = urlunsplit(
+                    ("http", ip_netloc, target.path or "/", target.query, "")
+                )
                 outgoing_headers = {**self._config.headers, **target_headers}
             connection.request(
                 request.method,
@@ -270,7 +295,7 @@ class BrowserWorkerClient(Protocol):
     async def fetch(self, request: HttpRequest) -> HttpResponse: ...
 
 
-class BrowserWorkerHttpTransport:
+class BrowserWorkerHttpTransport(HttpTransport):
     """Optional JavaScript-rendering route; the browser remains out of process."""
 
     def __init__(self, client: BrowserWorkerClient) -> None:

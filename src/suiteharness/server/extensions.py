@@ -50,10 +50,12 @@ from suiteharness.plugins import (
     PluginManager,
     PluginManifest,
     PluginPlan,
+    PythonEntrypointLoader,
     SignatureVerifier,
     TrustedPluginLoader,
     TrustMode,
 )
+from suiteharness.plugins.discovery import TrustPolicy
 from suiteharness.runtime import ProductContext, RequestScope, ScopePath
 from suiteharness.sandbox import SandboxBackend
 
@@ -128,9 +130,7 @@ class McpGrantMaterial:
     @property
     def capabilities(self) -> frozenset[str]:
         return frozenset(
-            capability
-            for tool in self.tools
-            for capability in tool.capabilities
+            capability for tool in self.tools for capability in tool.capabilities
         )
 
 
@@ -142,7 +142,9 @@ class ExtensionActivation:
     mcp_by_product: Mapping[str, McpGrantMaterial]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "mcp_by_product", MappingProxyType(dict(self.mcp_by_product)))
+        object.__setattr__(
+            self, "mcp_by_product", MappingProxyType(dict(self.mcp_by_product))
+        )
 
     def grant_material(self, product_id: str) -> McpGrantMaterial:
         return self.mcp_by_product.get(product_id, McpGrantMaterial())
@@ -166,7 +168,7 @@ class ExtensionStartupError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class _ConfiguredPluginTrustPolicy:
+class _ConfiguredPluginTrustPolicy(TrustPolicy):
     """Bind trust to exact configured paths and digests, never directory scans."""
 
     sources: Mapping[Path, str]
@@ -259,10 +261,17 @@ class ServerExtensionHost:
         )
         enabled = self._enabled_mcp_servers()
         mcp_ready = not enabled
-        if enabled and self._mcp_manager is not None and self._attached_bundle is not None:
+        if (
+            enabled
+            and self._mcp_manager is not None
+            and self._attached_bundle is not None
+        ):
             mcp_ready = not self._attached_bundle.closed
             tenant_id = self._loaded.config.deployment.tenant_id
-            for product_id, servers in self._loaded.config.mcp.servers_by_product.items():
+            for (
+                product_id,
+                servers,
+            ) in self._loaded.config.mcp.servers_by_product.items():
                 health = self._mcp_manager.health(tenant_id, product_id)
                 for server in servers:
                     if not server.enabled:
@@ -311,9 +320,7 @@ class ServerExtensionHost:
             try:
                 await self._attach_mcp_locked(activation)
             except BaseException as exc:
-                rollback = (
-                    [] if mcp_was_attached else await self._rollback_mcp_locked()
-                )
+                rollback = [] if mcp_was_attached else await self._rollback_mcp_locked()
                 if rollback:
                     raise ExtensionStartupError(exc, tuple(rollback)) from exc
                 raise
@@ -350,7 +357,9 @@ class ServerExtensionHost:
             failures = await self._rollback_mcp_locked()
             failures.extend(await self._rollback_plugins_locked())
             if failures:
-                raise BaseExceptionGroup("extension shutdown reported failures", failures)
+                raise BaseExceptionGroup(
+                    "extension shutdown reported failures", failures
+                )
 
     async def _start_plugins_locked(self) -> tuple[str, ...]:
         declarations = self._loaded.config.plugins.sources
@@ -359,12 +368,9 @@ class ServerExtensionHost:
         if self._plugin_manager is not None:
             return self._plugin_manager.active_plugin_ids
         adapters = self._plugin_adapters
-        if adapters is None:
-            raise ExtensionConfigurationError(
-                "configured plugins require explicit PluginHostAdapters"
-            )
         plugin_config = self._loaded.config.plugins
-        if plugin_config.require_signatures and adapters.signature_verifier is None:
+        verifier = adapters.signature_verifier if adapters is not None else None
+        if plugin_config.require_signatures and verifier is None:
             raise ExtensionConfigurationError(
                 "require_signatures=true requires an explicit SignatureVerifier"
             )
@@ -380,8 +386,15 @@ class ServerExtensionHost:
         discovery = PluginDiscovery(
             allowed_roots=plugin_config.allowed_roots,
             trust_policy=trust,
-            signature_verifier=adapters.signature_verifier,
+            signature_verifier=verifier,
         )
+        if adapters is None:
+            # Only an explicitly trusted, digest-pinned Python plugin can use
+            # this loader. Other trust modes still require a sandbox launcher.
+            adapters = PluginHostAdapters(
+                trusted_loader=PythonEntrypointLoader(discovery),
+                signature_verifier=verifier,
+            )
         registry = (
             adapters.contribution_registry
             if adapters.contribution_registry is not None
@@ -441,7 +454,9 @@ class ServerExtensionHost:
             if server.transport is McpTransportKind.STREAMABLE_HTTP
             and server.credential_ref is not None
         }
-        missing_secret_refs = configured_secret_refs - set(self._loaded.secrets.services)
+        missing_secret_refs = configured_secret_refs - set(
+            self._loaded.secrets.services
+        )
         if missing_secret_refs:
             raise ExtensionConfigurationError(
                 "MCP credential references must resolve through server secrets: "
@@ -486,9 +501,8 @@ class ServerExtensionHost:
             try:
                 product.effects.callback(
                     f"mcp-connections:{product_id}",
-                    lambda tenant_id=tenant_id, product_id=product_id: manager.close_product(
-                        tenant_id, product_id
-                    ),
+                    lambda tenant_id=tenant_id,
+                    product_id=product_id: manager.close_product(tenant_id, product_id),
                 )
             except BaseException:
                 await manager.close_product(tenant_id, product_id)
@@ -507,9 +521,9 @@ class ServerExtensionHost:
                     client.config.server_id,
                     registration_scope=product.path,
                     overrides=(
-                        self._loaded.config.mcp.tool_security_overrides
-                        .get(product_id, {})
-                        .get(client.config.server_id)
+                        self._loaded.config.mcp.tool_security_overrides.get(
+                            product_id, {}
+                        ).get(client.config.server_id)
                     ),
                     effects=product.effects,
                 )
@@ -530,7 +544,9 @@ class ServerExtensionHost:
 
     def _snapshot(self) -> ExtensionActivation:
         plugin_ids = (
-            () if self._plugin_manager is None else self._plugin_manager.active_plugin_ids
+            ()
+            if self._plugin_manager is None
+            else self._plugin_manager.active_plugin_ids
         )
         return ExtensionActivation(plugin_ids, dict(self._mcp_material))
 
@@ -539,10 +555,14 @@ class ServerExtensionHost:
             raise RuntimeError("cannot attach MCP to a closed customer activation")
         expected_tenant = self._loaded.config.deployment.tenant_id
         if activation.tenant_id != expected_tenant:
-            raise ValueError("customer activation tenant does not match server configuration")
+            raise ValueError(
+                "customer activation tenant does not match server configuration"
+            )
         expected_bundle = self._loaded.config.customer_bundle.customer_bundle_id
         if activation.customer_bundle_id != expected_bundle:
-            raise ValueError("active customer bundle does not match server configuration")
+            raise ValueError(
+                "active customer bundle does not match server configuration"
+            )
         configured_products = {
             selection.product_id
             for selection in self._loaded.config.customer_bundle.products
@@ -553,14 +573,18 @@ class ServerExtensionHost:
             )
         for product_id, product in activation.products.items():
             if product.path != ScopePath.product(expected_tenant, product_id):
-                raise ValueError("active product context does not match its configured scope")
+                raise ValueError(
+                    "active product context does not match its configured scope"
+                )
 
     @staticmethod
     def _validate_plugin_launchers(
         plan: PluginPlan,
         adapters: PluginHostAdapters,
     ) -> None:
-        configured_modes = {launcher.trust_mode for launcher in adapters.isolated_launchers}
+        configured_modes = {
+            launcher.trust_mode for launcher in adapters.isolated_launchers
+        }
         missing = sorted(
             {
                 source.manifest.trust_mode.value

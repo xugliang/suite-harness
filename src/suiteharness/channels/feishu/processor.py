@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 import heapq
 import hmac
 import json
@@ -12,11 +13,13 @@ import secrets
 import time
 import unicodedata
 import weakref
+from abc import ABC, abstractmethod
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
-from typing import Any, Protocol, TypeAlias
+from typing import Any, TypeAlias
 
+from suiteharness.channels.dispatch import FeishuDispatcher
 from suiteharness.channels.models import (
     ChannelKind,
     InboundMessage,
@@ -29,7 +32,12 @@ from .models import (
     FeishuPayloadError,
     FeishuWebhookResponse,
 )
-from .security import BoundedDecryptor, IdentityDecryptor, RawEventDecryptor, RawSignatureVerifier
+from .security import (
+    BoundedDecryptor,
+    IdentityDecryptor,
+    RawEventDecryptor,
+    RawSignatureVerifier,
+)
 
 JsonObject: TypeAlias = dict[str, Any]
 OutboundSink: TypeAlias = Callable[[InboundMessage, OutboundEvent], Awaitable[None]]
@@ -64,7 +72,12 @@ def decode_json_object(body: bytes) -> JsonObject:
         )
     except FeishuPayloadError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
         raise FeishuPayloadError("Feishu event is not valid UTF-8 JSON") from exc
     if not isinstance(parsed, dict):
         raise FeishuPayloadError("Feishu event JSON must be an object")
@@ -88,29 +101,32 @@ def _string(
     value = parent.get(key)
     if value is None and not required:
         return None
-    if not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or "\x00" in value
+    ):
         raise FeishuPayloadError(f"Feishu event field {key!r} is invalid")
     return value
 
 
-class FeishuDispatcher(Protocol):
-    """Usually implemented by :class:`EnterpriseChannelGateway`."""
-
-    def dispatch(self, message: InboundMessage) -> AsyncIterator[OutboundEvent]: ...
-
-
-class EventDeduplicator(Protocol):
+class EventDeduplicator(ABC):
     @property
+    @abstractmethod
     def processing_lease_seconds(self) -> float: ...
 
+    @abstractmethod
     async def claim(self, event_id: str) -> bool: ...
 
+    @abstractmethod
     async def complete(self, event_id: str) -> None: ...
 
+    @abstractmethod
     async def release(self, event_id: str) -> None: ...
 
 
-class InMemoryEventDeduplicator:
+class InMemoryEventDeduplicator(EventDeduplicator):
     """Atomic process-local event reservation with bounded retention."""
 
     def __init__(
@@ -151,9 +167,9 @@ class InMemoryEventDeduplicator:
         self._clock = clock
         self._entries: OrderedDict[str, tuple[float, str, bool]] = OrderedDict()
         self._expirations: list[tuple[float, str, str]] = []
-        self._owned_claims: weakref.WeakKeyDictionary[asyncio.Task[object], dict[str, str]] = (
-            weakref.WeakKeyDictionary()
-        )
+        self._owned_claims: weakref.WeakKeyDictionary[
+            asyncio.Task[object], dict[str, str]
+        ] = weakref.WeakKeyDictionary()
         self._lock = asyncio.Lock()
 
     @property
@@ -209,7 +225,11 @@ class InMemoryEventDeduplicator:
             owned = self._owned_claims.get(task)
             owner_token = None if owned is None else owned.pop(event_id, None)
             current = self._entries.get(event_id)
-            if owner_token is not None and current is not None and current[1] == owner_token:
+            if (
+                owner_token is not None
+                and current is not None
+                and current[1] == owner_token
+            ):
                 self._entries.pop(event_id, None)
 
     @staticmethod
@@ -297,9 +317,10 @@ class FeishuEventProcessor:
                 if message is None:
                     await self._deduplicator.complete(event_id)
                     return FeishuEventOutcome.IGNORED
-                async for outbound in self._dispatcher.dispatch(message):
-                    if self._outbound_sink is not None:
-                        await self._outbound_sink(message, outbound)
+                async with aclosing(self._dispatcher.dispatch(message)) as source:
+                    async for outbound in source:
+                        if self._outbound_sink is not None:
+                            await self._outbound_sink(message, outbound)
                 await self._deduplicator.complete(event_id)
         except BaseException:
             await self._deduplicator.release(event_id)
@@ -349,7 +370,9 @@ class FeishuEventProcessor:
             raise FeishuPayloadError("Feishu text message content is invalid")
         for key in mention_keys:
             text = text.replace(key, " ")
-        text = unicodedata.normalize("NFC", text.replace("\r\n", "\n").replace("\r", "\n")).strip()
+        text = unicodedata.normalize(
+            "NFC", text.replace("\r\n", "\n").replace("\r", "\n")
+        ).strip()
         if not text:
             return None
 
@@ -409,7 +432,12 @@ class FeishuEventProcessor:
 def _first_id(values: Mapping[str, Any], names: tuple[str, ...]) -> str:
     for name in names:
         value = values.get(name)
-        if isinstance(value, str) and value and len(value) <= 1024 and "\x00" not in value:
+        if (
+            isinstance(value, str)
+            and value
+            and len(value) <= 1024
+            and "\x00" not in value
+        ):
             return value
     raise FeishuPayloadError("Feishu sender has no usable company identity")
 
@@ -428,7 +456,9 @@ def _event_time(
         try:
             result = datetime.fromtimestamp(int(value) / 1000, tz=UTC)
         except (OverflowError, OSError, ValueError) as exc:
-            raise FeishuPayloadError("Feishu event create_time is out of range") from exc
+            raise FeishuPayloadError(
+                "Feishu event create_time is out of range"
+            ) from exc
     if result.tzinfo is None or result.utcoffset() is None:
         raise FeishuPayloadError("Feishu event clock returned a naive datetime")
     return result.astimezone(UTC)

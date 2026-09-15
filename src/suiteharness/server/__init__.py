@@ -48,6 +48,7 @@ from .foundation import (
     FoundationStartupError,
     ModelRuntime,
     WebToolRuntime,
+    build_model_runtime,
 )
 from .host import (
     ActivatedCustomerBundleView,
@@ -103,5 +104,6 @@ __all__ = [
     "WebApprovalRuntime",
     "WebSocketSessionRevalidator",
     "default_run_input",
+    "build_model_runtime",
     "create_company_asgi_app",
 ]

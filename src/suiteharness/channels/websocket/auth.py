@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from suiteharness.channels.models import AuthenticatedPrincipal
 
 from .models import WebSocketHandshake
+from .server import WebSocketAuthenticator
 
 _BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 _COOKIE_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -106,7 +107,12 @@ def _decode_json_object(value: bytes) -> dict[str, Any]:
         )
     except SessionTokenError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
         raise SessionTokenError("invalid company session ticket JSON") from exc
     if not isinstance(parsed, dict):
         raise SessionTokenError("company session ticket JSON must be an object")
@@ -138,7 +144,10 @@ class HmacSessionTokenCodec:
             raise ValueError("session token key must contain at least 32 bytes")
         if not isinstance(max_lifetime_seconds, int) or max_lifetime_seconds <= 0:
             raise ValueError("max_lifetime_seconds must be a positive integer")
-        if not isinstance(future_clock_skew_seconds, int) or future_clock_skew_seconds < 0:
+        if (
+            not isinstance(future_clock_skew_seconds, int)
+            or future_clock_skew_seconds < 0
+        ):
             raise ValueError("future_clock_skew_seconds must be a non-negative integer")
         if not isinstance(max_token_chars, int) or max_token_chars <= 0:
             raise ValueError("max_token_chars must be a positive integer")
@@ -234,7 +243,10 @@ class HmacSessionTokenCodec:
         roles = payload["roles"]
         issued_at = payload["iat"]
         expires_at = payload["exp"]
-        if not all(isinstance(item, str) for item in (issuer, audience, tenant_id, principal_id)):
+        if not all(
+            isinstance(item, str)
+            for item in (issuer, audience, tenant_id, principal_id)
+        ):
             raise SessionTokenError("invalid company session ticket claims")
         if not hmac.compare_digest(issuer, self._issuer):
             raise SessionTokenError("company session ticket issuer mismatch")
@@ -311,7 +323,7 @@ def _cookie_token(header: str | None, name: str | None) -> tuple[str | None, boo
     return token, True
 
 
-class ServerSessionWebSocketAuthenticator:
+class ServerSessionWebSocketAuthenticator(WebSocketAuthenticator):
     """Authenticate a bearer header or one exact, configured session cookie."""
 
     def __init__(
@@ -333,7 +345,11 @@ class ServerSessionWebSocketAuthenticator:
         cookie, valid_cookie = _cookie_token(handshake.cookie_header, self._cookie_name)
         if not valid_authorization or not valid_cookie:
             return None
-        if bearer is not None and cookie is not None and not hmac.compare_digest(bearer, cookie):
+        if (
+            bearer is not None
+            and cookie is not None
+            and not hmac.compare_digest(bearer, cookie)
+        ):
             return None
         token = bearer or cookie
         if token is None:

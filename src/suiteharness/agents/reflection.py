@@ -6,26 +6,18 @@ import json
 from dataclasses import dataclass
 
 from suiteharness.agents.protocols import ModelGatewayLike
-from suiteharness.execution import RunRequest, WorkflowDecision, WorkflowDecisionKind, WorkflowFrame
+from suiteharness.execution import ReflectionStrategy, RunRequest, WorkflowDecision, WorkflowDecisionKind, WorkflowFrame
 from suiteharness.models import ModelMessage, ModelRequest, ModelRole, TextContent
 
 
 @dataclass(frozen=True, slots=True)
-class NoOpReflectionStrategy:
+class NoOpReflectionStrategy(ReflectionStrategy):
     """Explicitly disable reflection while retaining the replaceable contract."""
 
-    async def review(
-        self,
-        request: RunRequest,
-        frame: WorkflowFrame,
-        decision: WorkflowDecision,
-    ) -> WorkflowDecision:
-        del request, frame
-        return decision
 
 
 @dataclass(frozen=True, slots=True)
-class SinglePassModelReflectionStrategy:
+class SinglePassModelReflectionStrategy(ReflectionStrategy):
     """Ask a separate route to accept or revise a final answer exactly once.
 
     The reviewer receives no tools.  It can only return ``accept=true`` or a

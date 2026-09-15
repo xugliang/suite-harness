@@ -7,6 +7,8 @@ an outbox, encryption or a persistent audit log.
 
 from __future__ import annotations
 
+from suiteharness.memory.protocols import Customer360Provider
+
 import hashlib
 import json
 from collections.abc import Callable, Mapping
@@ -231,7 +233,7 @@ def _remember(
     return deepcopy(result)
 
 
-class InMemoryProfileProvider:
+class InMemoryProfileProvider(ProfileProvider):
     """Private product profile store with hard tenant/product ownership checks."""
 
     name = "memory-profile-reference"
@@ -364,11 +366,9 @@ class InMemoryProfileProvider:
             and claim.space.owner_product_id == scope.product_id
         )
 
-    def close(self) -> None:
-        return None
 
 
-class InMemoryProfileDirectory:
+class InMemoryProfileDirectory(ProfileProviderResolver):
     """Reference resolver for separately instantiated product profile providers.
 
     The directory routes only from a trusted ``RequestScope``. It does not own or
@@ -412,7 +412,7 @@ class InMemoryProfileDirectory:
         return provider
 
 
-class InMemoryCustomer360Provider:
+class InMemoryCustomer360Provider(Customer360Provider):
     """Reference implementation of an explicit candidate/curation sharing boundary."""
 
     name = "customer360-reference"
@@ -1109,6 +1109,3 @@ class InMemoryCustomer360Provider:
             self._entity_revisions[key] = revision
             revisions.append(EntityRevision(entity_id=entity_id, revision=revision))
         return tuple(revisions)
-
-    def close(self) -> None:
-        return None

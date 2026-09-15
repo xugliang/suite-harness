@@ -34,7 +34,7 @@ class _Record:
     registration: ContributionRegistration
 
 
-class _RegistryHandle:
+class _RegistryHandle(ContributionHandle):
     def __init__(
         self,
         registry: InMemoryContributionRegistry,

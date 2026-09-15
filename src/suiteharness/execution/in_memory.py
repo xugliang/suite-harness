@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.execution.protocols import ScopedToolRegistry, CapabilityAuthority, ApprovalStore, AuditJournal
+
 import asyncio
 import hashlib
 import secrets
@@ -41,7 +43,7 @@ def _at_utc(value: datetime, label: str) -> datetime:
     return value.astimezone(UTC)
 
 
-class InMemoryToolRegistry:
+class InMemoryToolRegistry(ScopedToolRegistry):
     """Scope-aware registry suitable for tests and single processes.
 
     Products may use the same logical tool name with different implementations.
@@ -277,7 +279,7 @@ def _reject_remote_references(schema: object) -> None:
             _reject_remote_references(value)
 
 
-class InMemoryCapabilityAuthority:
+class InMemoryCapabilityAuthority(CapabilityAuthority):
     """Trusted control-plane grant store with explicit revocation."""
 
     def __init__(self) -> None:
@@ -390,7 +392,7 @@ class InMemoryCapabilityAuthority:
                 self._grant_owners.pop(grant_id, None)
 
 
-class InMemoryApprovalStore:
+class InMemoryApprovalStore(ApprovalStore):
     """Opaque bearer approvals stored by token digest and atomically consumed."""
 
     def __init__(self) -> None:
@@ -447,7 +449,7 @@ class InMemoryApprovalStore:
             return self._pending.pop(token_digest, None) is not None
 
 
-class InMemoryAuditJournal:
+class InMemoryAuditJournal(AuditJournal):
     """Append-only process-local journal; production adapters should be durable."""
 
     def __init__(self) -> None:

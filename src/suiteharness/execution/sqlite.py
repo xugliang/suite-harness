@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.execution.protocols import AuditJournal
+
 import asyncio
 import os
 import sqlite3
@@ -14,7 +16,7 @@ class AuditConflictError(RuntimeError):
     """An immutable audit event identifier was already committed."""
 
 
-class SQLiteAuditJournal:
+class SQLiteAuditJournal(AuditJournal):
     """Persist detached audit events; the public API intentionally has no update/delete."""
 
     def __init__(self, database: str | Path) -> None:

@@ -6,10 +6,10 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 from .models import OAuthTokenSet
-from .protocols import OAuthTokenIssuer
+from .protocols import McpTokenProvider, OAuthTokenIssuer
 
 
-class ServerManagedOAuthTokenProvider:
+class ServerManagedOAuthTokenProvider(McpTokenProvider):
     """Cache scoped Bearer tokens obtained from a trusted credential issuer.
 
     This adapter has no browser, device-code or personal-account flow. The

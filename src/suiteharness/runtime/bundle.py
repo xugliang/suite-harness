@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 from collections.abc import Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import TypeVar
 
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
@@ -65,12 +67,12 @@ class BundleInstallContext:
         return await self._effects.enter(label, resource)
 
 
-@runtime_checkable
-class Bundle(Protocol):
+class Bundle(ABC):
     """New bundle contract: metadata first, all installation effects scoped."""
 
     manifest: BundleManifest
 
+    @abstractmethod
     async def install(self, context: BundleInstallContext) -> None: ...
 
 

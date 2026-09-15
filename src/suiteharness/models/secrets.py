@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from suiteharness.models.protocols import SecretResolver
+
 from collections.abc import Mapping
 
 from pydantic import SecretStr
 
 
-class MappingSecretResolver:
+class MappingSecretResolver(SecretResolver):
     """Resolve already-loaded secrets without exposing them through repr."""
 
     def __init__(self, values: Mapping[str, SecretStr | str]) -> None:

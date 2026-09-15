@@ -215,6 +215,7 @@ class SecurePosixWorkspaceFileSystem:
         leaf: str,
         relative_path: str,
         max_bytes: int,
+        offset: int = 0,
     ) -> tuple[bytes, tuple[int, int]]:
         try:
             descriptor = os.open(leaf, self._file_flags, dir_fd=parent_fd)
@@ -224,6 +225,9 @@ class SecurePosixWorkspaceFileSystem:
             snapshot = os.fstat(descriptor)
             if not stat.S_ISREG(snapshot.st_mode):
                 raise ValueError("workspace read target must be a regular file")
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise ValueError("read offset must be a non-negative byte offset")
+            os.lseek(descriptor, offset, os.SEEK_SET)
             remaining = max_bytes + 1
             chunks: list[bytes] = []
             while remaining:
@@ -236,10 +240,10 @@ class SecurePosixWorkspaceFileSystem:
         finally:
             os.close(descriptor)
 
-    def read_file(self, root: Path, relative_path: str, max_bytes: int) -> bytes:
+    def read_file(self, root: Path, relative_path: str, max_bytes: int, *, offset: int = 0) -> bytes:
         with self._open_parent(root, relative_path) as (parent_fd, leaf):
             content, _identity = self._read_at(
-                parent_fd, leaf, relative_path, max_bytes
+                parent_fd, leaf, relative_path, max_bytes, offset
             )
             return content
 

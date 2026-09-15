@@ -9,6 +9,7 @@ import math
 import time
 import uuid
 from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import cast
 
@@ -51,6 +52,9 @@ from suiteharness.execution.protocols import (
     ToolRegistry,
 )
 from suiteharness.runtime.scopes import RequestScope, ScopePath
+from suiteharness.execution.environment import with_runtime_environment
+from suiteharness.execution.events import RunEvent, WorkflowEvent
+from suiteharness.execution.results import ToolResultStore
 
 _JSON = TypeAdapter(JsonValue)
 _ABSOLUTE_BYTE_LIMITS = {
@@ -122,6 +126,7 @@ class ExecutionPolicy:
 class _RunState:
     started_at: datetime
     started_monotonic: float
+    publish: Callable[..., Awaitable[None]]
     iterations_used: int = 0
     tool_calls_used: int = 0
     observations: list[ToolObservation] = field(default_factory=list)
@@ -151,6 +156,7 @@ class ExecutionRunner:
         policy: ExecutionPolicy | None = None,
         authorization_policy: ToolAuthorizationPolicy | None = None,
         interactive_approvals: InteractiveApprovalBroker | None = None,
+        tool_results: ToolResultStore | None = None,
     ) -> None:
         self.__tools = tools
         self.__capabilities = capabilities
@@ -159,6 +165,7 @@ class ExecutionRunner:
         self.__policy = policy or ExecutionPolicy()
         self.__authorization_policy = authorization_policy
         self.__interactive_approvals = interactive_approvals
+        self.__tool_results = tool_results
         self.__active: dict[tuple[ScopePath, str, str], _ActiveRun] = {}
         self.__active_lock = asyncio.Lock()
 
@@ -174,9 +181,80 @@ class ExecutionRunner:
             return True
 
     async def run(self, request: RunRequest, strategies: ExecutionStrategies) -> RunResult:
+        """Collect the same event stream consumed by interactive channels."""
+        result = None
+        async with contextlib.aclosing(self.stream(request, strategies)) as source:
+            async for event in source:
+                if event.result is not None:
+                    result = event.result
+        if result is None:
+            raise RuntimeError('execution stream ended without a result')
+        return result
+
+    async def stream(
+        self, request: RunRequest, strategies: ExecutionStrategies,
+    ) -> AsyncIterator[RunEvent]:
+        queue: asyncio.Queue[RunEvent | BaseException | None] = asyncio.Queue(maxsize=16)
+        sequence = 0
+        text_bytes = 0
+        closed = False
+
+        async def publish(kind, text='', data=None, result=None):
+            nonlocal sequence, text_bytes
+            if closed or asyncio.current_task().cancelling():
+                raise asyncio.CancelledError
+            if kind == 'delta':
+                text_bytes += len(text.encode('utf-8'))
+                if text_bytes > self.__policy.max_final_output_bytes:
+                    raise ValueError('stream output exceeds configured byte limit')
+            if len(canonical_json(data or {})) > self.__policy.max_tool_result_bytes:
+                raise ValueError('event metadata exceeds configured byte limit')
+            sequence += 1
+            await queue.put(RunEvent(run_id=request.run_id, sequence=sequence,
+                                     kind=kind, text=text, data=data or {}, result=result))
+
+        async def produce():
+            try:
+                await publish('started')
+                result = await self._run(request, strategies, publish)
+                # _run translates cancellation into a structured result. Do not
+                # block writing that result into an abandoned full queue.
+                if asyncio.current_task().cancelling():
+                    return
+                kind = ('completed' if result.status is RunStatus.SUCCEEDED else
+                        'cancelled' if result.status is RunStatus.CANCELLED else 'failed')
+                await publish(kind, result=result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not asyncio.current_task().cancelling():
+                    await queue.put(exc)
+            finally:
+                if not asyncio.current_task().cancelling():
+                    await queue.put(None)
+
+        producer = asyncio.create_task(produce())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                if isinstance(event, BaseException):
+                    raise event
+                yield event
+        finally:
+            closed = True
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+
+    async def _run(
+        self, request: RunRequest, strategies: ExecutionStrategies,
+        publish: Callable[..., Awaitable[None]],
+    ) -> RunResult:
         """Execute one run with an overall timeout and structured termination."""
 
-        state = _RunState(started_at=_utcnow(), started_monotonic=time.monotonic())
+        state = _RunState(started_at=_utcnow(), started_monotonic=time.monotonic(), publish=publish)
         cancel_event = asyncio.Event()
         run_key = self._run_key(request.scope, request.run_id)
         async with self.__active_lock:
@@ -332,10 +410,21 @@ class ExecutionRunner:
                         "prompt strategy returned an invalid result",
                         iteration,
                     )
-                prompt = prompt.model_copy(deep=True)
+                prompt = with_runtime_environment(prompt, instant=state.started_at)
 
             try:
-                decision = await strategies.workflow.next(request, frame, prompt)
+                decision = None
+                source = strategies.workflow.stream(request, frame, prompt)
+                async with contextlib.aclosing(source):
+                    async for event in source:
+                        if decision is not None:
+                            raise ValueError('workflow emitted after its decision')
+                        if isinstance(event, WorkflowDecision):
+                            decision = event
+                        elif isinstance(event, WorkflowEvent):
+                            await state.publish(event.kind, event.text, event.data)
+                        else:
+                            raise TypeError('invalid workflow stream event')
             except Exception:
                 return await self._strategy_failure(
                     request,
@@ -475,13 +564,18 @@ class ExecutionRunner:
 
         async def execute(intent: ToolIntent, duplicate: bool) -> ToolObservation:
             async with semaphore:
-                return await self._execute_intent(
+                observation = await self._execute_intent(
                     request,
                     intent,
                     iteration,
                     state,
                     duplicate=duplicate,
                 )
+                await state.publish('tool_completed', data={
+                    'call_id': intent.call_id, 'tool_name': intent.tool_name,
+                    'status': observation.status.value,
+                })
+                return observation
 
         tasks = [
             asyncio.create_task(execute(intent, duplicate))
@@ -694,6 +788,9 @@ class ExecutionRunner:
             tool_identity=registered.identity,
             data=started_data,
         )
+        await state.publish('tool_started', data={
+            'call_id': intent.call_id, 'tool_name': intent.tool_name,
+        })
         context = ToolCallContext(
             scope=request.scope,
             run_id=request.run_id,
@@ -757,6 +854,19 @@ class ExecutionRunner:
             JsonValue,
             json.loads(result_payload.decode("utf-8")),
         )
+
+        reader = self.__tools.resolve(request.scope, "suiteharness.result.read")
+        can_read_result = (reader is not None and reader.identity in grant.tool_identities
+                           and reader.identity.namespace == "suiteharness"
+                           and reader.identity.origin == "suiteharness.builtin.result")
+        if (self.__tool_results is not None and can_read_result
+                and intent.tool_name != "suiteharness.result.read" and len(result_payload) > 16 * 1024):
+            try:
+                reference = await self.__tool_results.put(request.scope, request.run_id, result_payload.decode("utf-8"))
+            except Exception:
+                return await self._tool_failure(request, intent, iteration, started_at,
+                    FailureCode.TOOL_ERROR, "tool result storage unavailable", tool_identity=registered.identity)
+            result = {"result_reference": reference, "preview": result_payload[:1024].decode("utf-8", errors="ignore"), "truncated": True}
 
         finished_at = _utcnow()
         await self._emit(

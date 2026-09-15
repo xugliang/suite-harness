@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import math
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Protocol
 
 from suiteharness.models import ImageContent, TextContent
 from suiteharness.runtime.resources import (
@@ -32,8 +32,11 @@ class ResolvedAttachment:
     content: bytes = field(repr=False)
 
 
-class AttachmentResolver(Protocol):
-    async def resolve(self, scope: RequestScope, attachment_id: str) -> ResolvedAttachment:
+class AttachmentResolver(ABC):
+    @abstractmethod
+    async def resolve(
+        self, scope: RequestScope, attachment_id: str
+    ) -> ResolvedAttachment:
         """Recheck ownership in the storage operation and return validated stored media.
 
         Never fetch a client-supplied URL or file path. Upload handlers must validate
@@ -53,7 +56,9 @@ class AttachmentContentBuilder:
 
     def __post_init__(self) -> None:
         limits = (self.max_attachments, self.max_attachment_bytes, self.max_total_bytes)
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in limits):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in limits
+        ):
             raise ValueError("attachment limits must be integers")
         if min(limits) < 1:
             raise ValueError("attachment limits must be positive")
@@ -80,14 +85,19 @@ class AttachmentContentBuilder:
                 self.authorizer,
                 scope,
                 ResourceRef(
-                    scope.tenant_id, scope.product_id, "attachment", reference.attachment_id
+                    scope.tenant_id,
+                    scope.product_id,
+                    "attachment",
+                    reference.attachment_id,
                 ),
                 action="read",
                 timeout_seconds=self.timeout_seconds,
             )
             try:
                 async with asyncio.timeout(self.timeout_seconds):
-                    resolved = await self.resolver.resolve(scope, reference.attachment_id)
+                    resolved = await self.resolver.resolve(
+                        scope, reference.attachment_id
+                    )
             except Exception:
                 raise ResourceAccessDenied("resource not found") from None
             if not isinstance(resolved, ResolvedAttachment) or (
@@ -106,7 +116,9 @@ class AttachmentContentBuilder:
             # Client metadata is never the source of truth for type or size.
             media_type = resolved.media_type.lower()
             if media_type == "text/plain":
-                result.append(TextContent(text=resolved.content.decode("utf-8", errors="strict")))
+                result.append(
+                    TextContent(text=resolved.content.decode("utf-8", errors="strict"))
+                )
             elif media_type in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
                 result.append(
                     ImageContent(

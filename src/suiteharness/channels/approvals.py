@@ -17,6 +17,7 @@ from suiteharness.execution import (
     RunRequest,
     ToolSpec,
 )
+from suiteharness.execution.protocols import InteractiveApprovalBroker
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,10 +45,12 @@ class _Pending:
     future: asyncio.Future[str | None]
 
 
-class InteractiveApprovalCoordinator:
+class InteractiveApprovalCoordinator(InteractiveApprovalBroker):
     """One-shot broker used by the runner and an authenticated WebSocket UI."""
 
-    def __init__(self, publish: ApprovalPublisher, *, timeout_seconds: float = 60.0) -> None:
+    def __init__(
+        self, publish: ApprovalPublisher, *, timeout_seconds: float = 60.0
+    ) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 600:
             raise ValueError("approval timeout_seconds must be in (0, 600]")
         self._publish = publish

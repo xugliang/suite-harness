@@ -7,11 +7,12 @@ principal.  Message metadata is deliberately absent from the directory lookup.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Protocol
 
 from pydantic import ValidationError
 
+from .gateway import PrincipalAuthenticator
 from .models import AuthenticatedPrincipal, ChannelKind, InboundMessage
 
 
@@ -37,13 +38,14 @@ class CompanyIdentity:
         object.__setattr__(self, "roles", checked.roles)
 
 
-class CompanyIdentityDirectory(Protocol):
+class CompanyIdentityDirectory(ABC):
     """Resolve a provider-owned Feishu identity inside one tenant.
 
     Production implementations commonly query an HR directory, IAM service or
     a synchronized database.  Unknown and disabled users must return ``None``.
     """
 
+    @abstractmethod
     async def resolve_feishu_identity(
         self,
         *,
@@ -52,7 +54,7 @@ class CompanyIdentityDirectory(Protocol):
     ) -> CompanyIdentity | None: ...
 
 
-class FeishuCompanyAuthenticator:
+class FeishuCompanyAuthenticator(PrincipalAuthenticator):
     """Map an already verified Feishu sender through a company directory."""
 
     def __init__(self, *, tenant_id: str, directory: CompanyIdentityDirectory) -> None:
@@ -67,7 +69,9 @@ class FeishuCompanyAuthenticator:
         self._tenant_id = checked.tenant_id
         self._directory = directory
 
-    async def authenticate(self, message: InboundMessage) -> AuthenticatedPrincipal | None:
+    async def authenticate(
+        self, message: InboundMessage
+    ) -> AuthenticatedPrincipal | None:
         if message.channel is not ChannelKind.FEISHU:
             return None
         identity = await self._directory.resolve_feishu_identity(

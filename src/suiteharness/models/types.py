@@ -47,6 +47,7 @@ class ModelStreamEventType(str, Enum):
     TOOL_CALL_DELTA = "tool_call_delta"
     USAGE = "usage"
     MESSAGE_END = "message_end"
+    CONTEXT_COMPACTED = "context_compacted"
 
 
 class ProviderAuthKind(str, Enum):
@@ -235,6 +236,9 @@ class ModelStreamEvent(_FrozenModel):
     tool_call: ModelToolCall | None = None
     usage: ModelUsage | None = None
     finish_reason: FinishReason | None = None
+    context_info: dict[str, JsonValue] | None = None
+    # Gateway-to-workflow state only; never serialize into channel/event payloads.
+    prepared_messages: tuple[ModelMessage, ...] | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def event_payload(self) -> ModelStreamEvent:
@@ -244,6 +248,7 @@ class ModelStreamEvent(_FrozenModel):
             ModelStreamEventType.TOOL_CALL_DELTA: self.tool_call,
             ModelStreamEventType.USAGE: self.usage,
             ModelStreamEventType.MESSAGE_END: self.finish_reason,
+            ModelStreamEventType.CONTEXT_COMPACTED: self.context_info,
         }
         if self.type in expected and expected[self.type] is None:
             raise ValueError(f"{self.type.value} event is missing its payload")

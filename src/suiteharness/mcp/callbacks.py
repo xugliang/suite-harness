@@ -69,7 +69,9 @@ def operation_context(scope: RequestScope) -> McpOperationContext:
 class ProductRootProvider:
     """Expose exactly one canonical product workspace root to an MCP server."""
 
-    def __init__(self, product_workspace: Path, *, display_name: str | None = None) -> None:
+    def __init__(
+        self, product_workspace: Path, *, display_name: str | None = None
+    ) -> None:
         root = Path(product_workspace)
         if not root.is_absolute() or not root.exists() or not root.is_dir():
             raise ValueError("product workspace must be an existing absolute directory")
@@ -88,7 +90,7 @@ class ProductRootProvider:
         )
 
 
-class GatewayMcpSampler:
+class GatewayMcpSampler(McpSampler):
     """Sampling callback hard-wired to a root-owned ModelGateway route.
 
     MCP model preferences are hints only. The server cannot select a provider,
@@ -96,7 +98,9 @@ class GatewayMcpSampler:
     administrator-declared ``route_id``.
     """
 
-    def __init__(self, gateway: ModelGateway, *, route_id: str, max_tokens: int = 32_768) -> None:
+    def __init__(
+        self, gateway: ModelGateway, *, route_id: str, max_tokens: int = 32_768
+    ) -> None:
         if not route_id.strip():
             raise ValueError("sampling route_id must not be blank")
         if max_tokens < 1:
@@ -173,7 +177,9 @@ class GatewayMcpSampler:
 
 def _sampling_message(message: SamplingMessage) -> ModelMessage:
     role = ModelRole.USER if message.role == "user" else ModelRole.ASSISTANT
-    parts = message.content if isinstance(message.content, tuple) else (message.content,)
+    parts = (
+        message.content if isinstance(message.content, tuple) else (message.content,)
+    )
     text_parts: list[ModelTextContent] = []
     tool_calls = []
     tool_call_id: str | None = None
@@ -258,12 +264,16 @@ class McpClientRequestDispatcher:
         except McpProtocolError as exc:
             return JsonRpcResponse(
                 id=request.id,
-                error=JsonRpcErrorObject(code=exc.code, message=str(exc), data=exc.data),
+                error=JsonRpcErrorObject(
+                    code=exc.code, message=str(exc), data=exc.data
+                ),
             )
         except ValidationError:
             return JsonRpcResponse(
                 id=request.id,
-                error=JsonRpcErrorObject(code=-32602, message="invalid callback parameters"),
+                error=JsonRpcErrorObject(
+                    code=-32602, message="invalid callback parameters"
+                ),
             )
 
     async def _dispatch_request(
@@ -283,12 +293,18 @@ class McpClientRequestDispatcher:
             return self._roots.list_roots().model_dump(mode="json", by_alias=True)
         if method == "sampling/createMessage":
             if self._capabilities.sampling is None or self._sampler is None:
-                raise McpProtocolError("sampling capability is unavailable", code=-32601)
+                raise McpProtocolError(
+                    "sampling capability is unavailable", code=-32601
+                )
             parsed = CreateMessageParams.model_validate(params or {})
             if parsed.tools and self._capabilities.sampling.tools is None:
-                raise McpProtocolError("sampling tools were not negotiated", code=-32602)
+                raise McpProtocolError(
+                    "sampling tools were not negotiated", code=-32602
+                )
             if parsed.task is not None and not self._supports_task_request("sampling"):
-                raise McpProtocolError("task-augmented sampling is disabled", code=-32602)
+                raise McpProtocolError(
+                    "task-augmented sampling is disabled", code=-32602
+                )
             result = await self._sampler.create_message(context, parsed)
             if (parsed.task is not None) != isinstance(result, CreateTaskResult):
                 raise McpProtocolError(
@@ -298,15 +314,21 @@ class McpClientRequestDispatcher:
             return result.model_dump(mode="json", by_alias=True, exclude_none=True)
         if method == "elicitation/create":
             if self._capabilities.elicitation is None or self._elicitation is None:
-                raise McpProtocolError("elicitation capability is unavailable", code=-32601)
+                raise McpProtocolError(
+                    "elicitation capability is unavailable", code=-32601
+                )
             parsed = ElicitationParams.model_validate(params or {})
             if parsed.mode is ElicitationMode.URL and (
                 not self._features.url_elicitation
                 or self._capabilities.elicitation.url is None
             ):
                 raise McpProtocolError("URL elicitation is disabled", code=-32602)
-            if parsed.task is not None and not self._supports_task_request("elicitation"):
-                raise McpProtocolError("task-augmented elicitation is disabled", code=-32602)
+            if parsed.task is not None and not self._supports_task_request(
+                "elicitation"
+            ):
+                raise McpProtocolError(
+                    "task-augmented elicitation is disabled", code=-32602
+                )
             result = await self._elicitation.elicit(context, parsed)
             if (parsed.task is not None) != isinstance(result, CreateTaskResult):
                 raise McpProtocolError(
@@ -322,7 +344,9 @@ class McpClientRequestDispatcher:
                     "URL elicitation must not return form content",
                     code=McpErrorCode.INVALID_PARAMS,
                 )
-            if parsed.mode is ElicitationMode.FORM and not isinstance(result, CreateTaskResult):
+            if parsed.mode is ElicitationMode.FORM and not isinstance(
+                result, CreateTaskResult
+            ):
                 if result.action == "accept":
                     if result.content is None:
                         raise McpProtocolError(
@@ -344,7 +368,9 @@ class McpClientRequestDispatcher:
             return result.model_dump(mode="json", by_alias=True, exclude_none=True)
         if method in {"tasks/get", "tasks/result", "tasks/list", "tasks/cancel"}:
             if not self._features.experimental_tasks or self._tasks is None:
-                raise McpProtocolError("client task service is unavailable", code=-32601)
+                raise McpProtocolError(
+                    "client task service is unavailable", code=-32601
+                )
             task_capability = self._capabilities.tasks
             if task_capability is None:
                 raise McpProtocolError("client tasks were not negotiated", code=-32601)
@@ -418,7 +444,9 @@ class McpClientRequestDispatcher:
                 requests.sampling is not None
                 and requests.sampling.create_message is not None
             )
-        return requests.elicitation is not None and requests.elicitation.create is not None
+        return (
+            requests.elicitation is not None and requests.elicitation.create is not None
+        )
 
 
 __all__ = [

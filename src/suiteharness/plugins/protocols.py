@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 from suiteharness.plugins.discovery import VerifiedPluginSource
 from suiteharness.plugins.models import (
@@ -55,21 +57,21 @@ class ContributionRegistration:
         return self.kind, self.declaration.contribution_id
 
 
-@runtime_checkable
-class ContributionHandle(Protocol):
+class ContributionHandle(ABC):
     """Identity-specific revocation; implementations must be idempotent."""
 
+    @abstractmethod
     async def revoke(self) -> None: ...
 
 
-@runtime_checkable
-class ContributionRegistry(Protocol):
+class ContributionRegistry(ABC):
     """Only host capability exposed for publishing plugin contributions.
 
     Implementations must publish the complete batch atomically.  They must not
     expose the tool Runner, grant issuer, approval authority or root registry.
     """
 
+    @abstractmethod
     async def publish(
         self,
         registrations: tuple[ContributionRegistration, ...],
@@ -77,19 +79,25 @@ class ContributionRegistry(Protocol):
         replaces: frozenset[str],
     ) -> tuple[ContributionHandle, ...]: ...
 
+    async def snapshot(self) -> tuple:
+        """Host composition requires a consistent visible contribution snapshot."""
+        raise NotImplementedError("registry must support snapshot for server composition")
 
-class PluginPrepareContextProtocol(Protocol):
+
+class PluginPrepareContextProtocol(ABC):
     manifest: PluginManifest
     config: Mapping[str, Any]
     permissions: PermissionSet
 
+    @abstractmethod
     def inject(self, service: str) -> object | None: ...
 
 
-class PluginActivationContextProtocol(Protocol):
+class PluginActivationContextProtocol(ABC):
     manifest: PluginManifest
     permissions: PermissionSet
 
+    @abstractmethod
     def contribute(
         self,
         kind: ContributionKind,
@@ -98,35 +106,39 @@ class PluginActivationContextProtocol(Protocol):
     ) -> ContributionHandle: ...
 
 
-@runtime_checkable
-class PreparedPlugin(Protocol):
+class PreparedPlugin(ABC):
     @property
+    @abstractmethod
     def exports(self) -> Mapping[str, object]: ...
 
+    @abstractmethod
     async def activate(self, context: PluginActivationContextProtocol) -> None: ...
 
+    @abstractmethod
     async def close(self) -> None: ...
 
 
-@runtime_checkable
-class PluginRuntime(Protocol):
+class PluginRuntime(ABC):
+    @abstractmethod
     async def prepare(self, context: PluginPrepareContextProtocol) -> PreparedPlugin: ...
 
+    @abstractmethod
     async def close(self) -> None: ...
 
 
-@runtime_checkable
-class TrustedPluginLoader(Protocol):
+class TrustedPluginLoader(ABC):
+    @abstractmethod
     async def load(self, source: VerifiedPluginSource) -> PluginRuntime: ...
 
 
-@runtime_checkable
-class PluginLauncher(Protocol):
+class PluginLauncher(ABC):
     """Trusted host adapter that returns a proxy to an isolated process/MCP peer."""
 
     @property
+    @abstractmethod
     def trust_mode(self) -> TrustMode: ...
 
+    @abstractmethod
     async def launch(
         self,
         descriptor: PluginLaunchDescriptor,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.models.protocols import ModelProvider
+
 import asyncio
 import base64
 import json
@@ -140,7 +142,7 @@ class Boto3BedrockRuntimeClient:
         return self._stream(model_id=model_id, request=request)
 
 
-class BedrockConverseAdapter:
+class BedrockConverseAdapter(ModelProvider):
     def __init__(
         self,
         descriptor: ProviderDescriptor,

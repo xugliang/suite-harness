@@ -40,6 +40,7 @@ from .starlette import (
     create_starlette_websocket_endpoint,
     create_starlette_websocket_route,
 )
+from .tasks import ConnectionTaskGroup
 
 __all__ = [
     "AckFrame",
@@ -48,6 +49,7 @@ __all__ = [
     "ApprovalRequiredFrame",
     "ClientFrame",
     "CompanySessionClaims",
+    "ConnectionTaskGroup",
     "EnterpriseWebSocketServer",
     "ErrorFrame",
     "EventFrame",

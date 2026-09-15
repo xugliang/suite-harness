@@ -28,7 +28,7 @@ from suiteharness.models.types import (
 )
 
 
-class GoogleAuthTokenProvider:
+class GoogleAuthTokenProvider(AccessTokenProvider):
     """Optional google-auth bridge for workload/service-account credentials."""
 
     def __init__(
@@ -171,6 +171,7 @@ class VertexGeminiAdapter(GeminiAdapter):
         identifier: str | None = None
         reason = FinishReason.UNKNOWN
         usage = ModelUsage()
+        has_calls = False
         async for payload in iter_sse_json(self._transport.stream(wire_request)):
             if identifier is None:
                 identifier = response_id(payload.get("responseId"))
@@ -179,6 +180,7 @@ class VertexGeminiAdapter(GeminiAdapter):
                     response_id=identifier,
                 )
             values, calls, current_reason = self._candidate(payload)
+            has_calls |= bool(calls)
             if current_reason is not FinishReason.UNKNOWN:
                 reason = current_reason
             for value in values:
@@ -205,7 +207,7 @@ class VertexGeminiAdapter(GeminiAdapter):
         yield ModelStreamEvent(
             type=ModelStreamEventType.MESSAGE_END,
             response_id=identifier,
-            finish_reason=reason,
+            finish_reason=FinishReason.TOOL_CALLS if has_calls and reason is FinishReason.STOP else reason,
             usage=usage,
         )
 

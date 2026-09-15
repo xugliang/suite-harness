@@ -15,6 +15,7 @@ from suiteharness.execution.models import (
     ToolIdentity,
     ToolSpec,
 )
+from suiteharness.execution.protocols import ToolAuthorizationPolicy
 
 _DRIVE = re.compile(r"^[A-Za-z]:")
 _FEISHU_WRITABLE_TOOLS = frozenset({"suiteharness.fs.write", "suiteharness.fs.edit"})
@@ -60,7 +61,7 @@ class WorkspaceWriteRule:
         return not configured or requested[: len(configured)] == configured
 
 
-class CompanyChannelAuthorizationPolicy:
+class CompanyChannelAuthorizationPolicy(ToolAuthorizationPolicy):
     """Keep channel UX decisions inside the non-replaceable execution path.
 
     Web reads run directly and writes require an exact single-use approval.
@@ -70,7 +71,9 @@ class CompanyChannelAuthorizationPolicy:
     The workspace handler performs the canonical/symlink check again.
     """
 
-    def __init__(self, *, feishu_writable_roots: tuple[WorkspaceWriteRule, ...] = ()) -> None:
+    def __init__(
+        self, *, feishu_writable_roots: tuple[WorkspaceWriteRule, ...] = ()
+    ) -> None:
         self._feishu_writable_roots = tuple(feishu_writable_roots)
 
     def evaluate(
@@ -82,7 +85,10 @@ class CompanyChannelAuthorizationPolicy:
     ) -> ToolAuthorization:
         channel = request.scope.channel_id
         if channel == "web":
-            if ToolEffect.WRITE in spec.effects or ToolEffect.DESTRUCTIVE in spec.effects:
+            if (
+                ToolEffect.WRITE in spec.effects
+                or ToolEffect.DESTRUCTIVE in spec.effects
+            ):
                 return ToolAuthorization.REQUIRE_APPROVAL
             return ToolAuthorization.ALLOW
         if channel != "feishu":

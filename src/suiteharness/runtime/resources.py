@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 import asyncio
 import math
 from dataclasses import dataclass
-from typing import Protocol
 
 from .scopes import RequestScope
 
@@ -28,7 +29,8 @@ class ResourceRef:
                 raise ValueError("resource identifiers must be bounded non-blank strings")
 
 
-class ResourceAuthorizer(Protocol):
+class ResourceAuthorizer(ABC):
+    @abstractmethod
     async def authorize(self, scope: RequestScope, resource: ResourceRef, *, action: str) -> bool:
         """Check current object ownership from trusted server storage, not request fields."""
         ...

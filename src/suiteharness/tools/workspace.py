@@ -9,11 +9,11 @@ import os
 import re
 import tempfile
 import time
+from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path, PurePosixPath
 from threading import RLock
-from typing import Protocol
 
 import regex as safe_regex
 from pydantic import JsonValue
@@ -37,18 +37,17 @@ class WorkspaceToolBinding:
     access_policy: WorkspaceAccessPolicy
 
 
-class WorkspaceBindingResolver(Protocol):
+class WorkspaceBindingResolver(ABC):
+    @abstractmethod
     def resolve(self, context: ToolCallContext) -> WorkspaceToolBinding: ...
 
 
-class MappingWorkspaceBindingResolver:
+class MappingWorkspaceBindingResolver(WorkspaceBindingResolver):
     """Process-local reference resolver keyed by authenticated tenant/product."""
 
     def __init__(
         self,
-        bindings: Mapping[
-            tuple[str, str] | tuple[str, str, str], WorkspaceToolBinding
-        ]
+        bindings: Mapping[tuple[str, str] | tuple[str, str, str], WorkspaceToolBinding]
         | None = None,
     ) -> None:
         self._items = dict(bindings or {})
@@ -83,7 +82,9 @@ class MappingWorkspaceBindingResolver:
             try:
                 return self._items.get(channel_key) or self._items[fallback_key]
             except KeyError as exc:
-                raise WorkspacePathError("no workspace is configured for this product") from exc
+                raise WorkspacePathError(
+                    "no workspace is configured for this product"
+                ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +119,11 @@ def _space(value: object) -> WorkspaceSpace:
 
 
 def _root(binding: WorkspaceToolBinding, space: WorkspaceSpace) -> Path:
-    return binding.paths.product_root if space is WorkspaceSpace.PRODUCT else binding.paths.shared_root
+    return (
+        binding.paths.product_root
+        if space is WorkspaceSpace.PRODUCT
+        else binding.paths.shared_root
+    )
 
 
 def _relative(value: object, *, allow_root: bool = True) -> str:
@@ -172,13 +177,38 @@ def _decode_text(content: bytes, encoding: str) -> str:
         raise ValueError(f"file is not valid {normalized} text") from exc
 
 
+def _text_page(content: bytes, encoding: str, limit: int, max_chars: int, offset: int) -> dict:
+    import codecs
+    normalized = encoding.lower().replace("_", "-")
+    if normalized not in {"utf-8", "utf8", "gbk", "gb18030"}:
+        raise ValueError("encoding must be UTF-8, GBK, or GB18030")
+    more = len(content) > limit
+    decoder = codecs.getincrementaldecoder(normalized)(errors="strict")
+    try:
+        text = decoder.decode(content[:limit], final=not more)
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"file or offset is not valid {normalized} text") from exc
+    pending, _state = decoder.getstate()
+    consumed = min(len(content), limit) - len(pending)
+    if len(text) > max_chars:
+        text = text[:max_chars]
+        consumed = len(text.encode(normalized))
+    if content and consumed == 0:
+        raise ValueError("max_bytes must fit at least one complete character (use 4 or more)")
+    more = more or consumed < len(content)
+    return {"content": text, "bytes": consumed, "offset": offset,
+            "next_offset": offset + consumed if more else None, "truncated": more}
+
+
 def _atomic_write(target: Path, content: bytes, *, overwrite: bool) -> None:
     if target.exists() and not target.is_file():
         raise ValueError("write target must be a regular file")
     if target.exists() and not overwrite:
         raise FileExistsError("target exists; set overwrite=true to replace it")
     parent = target.parent.resolve(strict=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".suiteharness-write-", dir=parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".suiteharness-write-", dir=parent
+    )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
@@ -210,10 +240,14 @@ class WorkspaceFileTools:
 
         return self._secure_filesystem is not None
 
-    async def list(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    async def list(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         return await asyncio.to_thread(self._list, context, arguments)
 
-    def _list(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    def _list(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         binding = self._resolver.resolve(context)
         space = _space(arguments.get("space", "product"))
         relative = _relative(arguments.get("path", "."))
@@ -285,33 +319,32 @@ class WorkspaceFileTools:
             "truncated": len(children) > limit,
         }
 
-    async def read(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    async def read(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         return await asyncio.to_thread(self._read, context, arguments)
 
-    def _read(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    def _read(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         binding = self._resolver.resolve(context)
         space = _space(arguments.get("space", "product"))
         relative = _relative(arguments.get("path"), allow_root=False)
         requested_limit = int(arguments.get("max_bytes", self._limits.max_read_bytes))
         limit = min(max(1, requested_limit), self._limits.max_read_bytes)
+        offset = arguments.get("offset", 0)
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative byte offset")
         if self._secure_filesystem is not None:
             root = _root(binding, space)
             binding.access_policy.authorize_relative(
                 root, relative, WorkspaceOperation.READ
             )
-            content = self._secure_filesystem.read_file(root, relative, limit)
-            truncated = len(content) > limit
-            content = content[:limit]
-            text = _decode_text(content, str(arguments.get("encoding", "utf-8")))
-            if len(text) > self._limits.max_result_characters:
-                text = text[: self._limits.max_result_characters]
-                truncated = True
+            content = self._secure_filesystem.read_file(root, relative, limit, offset=offset)
             return {
                 "space": space.value,
                 "path": relative,
-                "content": text,
-                "bytes": len(content),
-                "truncated": truncated,
+                **_text_page(content, str(arguments.get("encoding", "utf-8")), limit, self._limits.max_result_characters, offset),
             }
         path = _resolve(
             binding,
@@ -323,25 +356,22 @@ class WorkspaceFileTools:
         if not path.is_file():
             raise ValueError("read path must be a regular file")
         with path.open("rb") as stream:
+            stream.seek(offset)
             content = stream.read(limit + 1)
-        truncated = len(content) > limit
-        content = content[:limit]
-        text = _decode_text(content, str(arguments.get("encoding", "utf-8")))
-        if len(text) > self._limits.max_result_characters:
-            text = text[: self._limits.max_result_characters]
-            truncated = True
         return {
             "space": space.value,
             "path": _portable_path(path, _root(binding, space)),
-            "content": text,
-            "bytes": len(content),
-            "truncated": truncated,
+            **_text_page(content, str(arguments.get("encoding", "utf-8")), limit, self._limits.max_result_characters, offset),
         }
 
-    async def write(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    async def write(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         return await asyncio.to_thread(self._write, context, arguments)
 
-    def _write(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    def _write(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         binding = self._resolver.resolve(context)
         space = _space(arguments.get("space", "product"))
         relative = _relative(arguments.get("path"), allow_root=False)
@@ -375,14 +405,20 @@ class WorkspaceFileTools:
             WorkspaceOperation.WRITE,
             require_exists=False,
         )
-        binding.access_policy.authorize(target.parent.resolve(strict=True), WorkspaceOperation.WRITE)
+        binding.access_policy.authorize(
+            target.parent.resolve(strict=True), WorkspaceOperation.WRITE
+        )
         _atomic_write(target, content, overwrite=arguments.get("overwrite") is True)
         return {"space": space.value, "path": relative, "bytes": len(content)}
 
-    async def edit(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    async def edit(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         return await asyncio.to_thread(self._edit, context, arguments)
 
-    def _edit(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    def _edit(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         binding = self._resolver.resolve(context)
         space = _space(arguments.get("space", "product"))
         relative = _relative(arguments.get("path"), allow_root=False)
@@ -446,10 +482,14 @@ class WorkspaceFileTools:
         _atomic_write(writable, encoded, overwrite=True)
         return {"space": space.value, "path": relative, "replacements": actual}
 
-    async def glob(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    async def glob(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         return await asyncio.to_thread(self._glob, context, arguments)
 
-    def _glob(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    def _glob(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         binding = self._resolver.resolve(context)
         space = _space(arguments.get("space", "product"))
         pattern = _relative(arguments.get("pattern"), allow_root=False)
@@ -476,7 +516,10 @@ class WorkspaceFileTools:
                 if len(matches) >= limit:
                     truncated = True
                     break
-                if result_characters + len(portable) > self._limits.max_result_characters:
+                if (
+                    result_characters + len(portable)
+                    > self._limits.max_result_characters
+                ):
                     truncated = True
                     break
                 matches.append(portable)
@@ -487,7 +530,9 @@ class WorkspaceFileTools:
         truncated = False
         result_characters = 0
         for candidate in root.glob(pattern):
-            safe = resolve_beneath(root, candidate.relative_to(root), require_exists=True)
+            safe = resolve_beneath(
+                root, candidate.relative_to(root), require_exists=True
+            )
             binding.access_policy.authorize(safe, WorkspaceOperation.READ)
             portable = _portable_path(safe, root)
             if result_characters + len(portable) > self._limits.max_result_characters:
@@ -499,12 +544,20 @@ class WorkspaceFileTools:
                 truncated = True
                 matches.pop()
                 break
-        return {"space": space.value, "matches": sorted(matches), "truncated": truncated}
+        return {
+            "space": space.value,
+            "matches": sorted(matches),
+            "truncated": truncated,
+        }
 
-    async def grep(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    async def grep(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         return await asyncio.to_thread(self._grep, context, arguments)
 
-    def _grep(self, context: ToolCallContext, arguments: dict[str, JsonValue]) -> JsonValue:
+    def _grep(
+        self, context: ToolCallContext, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         binding = self._resolver.resolve(context)
         space = _space(arguments.get("space", "product"))
         relative_base = _relative(arguments.get("path", "."))
@@ -522,7 +575,9 @@ class WorkspaceFileTools:
             # second bound. Deployments needing richer expressions can expose
             # sandboxed ripgrep as a separate plugin tool.
             if "(?" in query or re.search(r"\\[1-9]", query):
-                raise ValueError("grep regex lookarounds and backreferences are forbidden")
+                raise ValueError(
+                    "grep regex lookarounds and backreferences are forbidden"
+                )
             if re.search(r"\([^)]*[*+{][^)]*\)[*+{]", query):
                 raise ValueError("grep regex contains a nested repetition")
             compiled = safe_regex.compile(query, flags)
@@ -557,11 +612,16 @@ class WorkspaceFileTools:
                 try:
                     matched = compiled.search(line, timeout=min(0.02, remaining))
                 except TimeoutError as exc:
-                    raise ValueError("grep regex exceeded the safe execution time") from exc
+                    raise ValueError(
+                        "grep regex exceeded the safe execution time"
+                    ) from exc
                 if not matched:
                     continue
                 rendered = line[:2_000]
-                if result_characters + len(rendered) > self._limits.max_result_characters:
+                if (
+                    result_characters + len(rendered)
+                    > self._limits.max_result_characters
+                ):
                     truncated = True
                     return True
                 matches.append(
@@ -626,10 +686,16 @@ class WorkspaceFileTools:
                 break
             if not candidate.is_file():
                 continue
-            relative_from_base = candidate.name if base.is_file() else candidate.relative_to(base).as_posix()
+            relative_from_base = (
+                candidate.name
+                if base.is_file()
+                else candidate.relative_to(base).as_posix()
+            )
             if not fnmatch.fnmatch(relative_from_base, file_pattern):
                 continue
-            safe = resolve_beneath(root, candidate.relative_to(root), require_exists=True)
+            safe = resolve_beneath(
+                root, candidate.relative_to(root), require_exists=True
+            )
             binding.access_policy.authorize(safe, WorkspaceOperation.READ)
             files_examined += 1
             if files_examined > self._limits.max_grep_files:

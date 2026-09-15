@@ -359,9 +359,11 @@ tenants/{tenant}/products/{product}
 
 - `BaiduQianfanSearchProvider`：调用百度千帆结构化 Web Search API；
 - `MicrosoftFoundryGroundingProvider`：通过注入客户端调用 Bing grounding（搜索依据服务）；
-- `SearchProviderRegistry/Service`：按配置选择 provider 并限制结果。
+- `HtmlSearchProvider`：只读解析 Bing 或百度普通搜索网页的标题、链接与摘要；
+- `HtmlSearchClient`：复用服务器出口、公开地址校验、连接 IP 证明、超时与响应上限；
+- `SearchProviderRegistry/Service`：按配置选择 provider；默认调用可在可恢复故障或空结果时按管理员配置回退，显式选择和策略拒绝不回退。
 
-框架不通过解析搜索结果 HTML 伪造搜索 API。A/B 可以路由同一个搜索提供器，但仍各自经过工具授权。
+模型不会看到 `web_search_results` 之类的提示词变量，也不感知底层网页解析。它只决定是否调用标准 `suiteharness.web.search`；Harness 再执行产品权限、出口和网络检查，把工具结果作为 tool message 返回。A/B 可以路由同一个搜索提供器，但仍各自经过工具授权。
 
 ### `web/fetch.py`
 
@@ -651,7 +653,7 @@ SQLite 实现用事务、修订号 CAS、幂等键和持久运行 claim 防并�
 - Docker/本地开发沙箱；
 - 顶层服务器监听/并发/启停超时，Web/飞书路径及产品路由；
 - 模型 profile/route；
-- 百度/Foundry 搜索和三类抓取；
+- Bing/百度网页搜索、百度千帆/Foundry 结构化搜索和三类抓取；
 - 产品级 MCP；
 - 插件路径、摘要和信任；
 - 单独密钥结构。

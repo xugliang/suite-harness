@@ -1,0 +1,23 @@
+name: source-checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ matrix.python }}'
+      - run: python -m pip install -r requirements/test.txt
+      - run: python -m pytest
+        env:
+          PYTHONPATH: src
+      - run: python tools/build_release.py --output ../source-candidate
+      - run: python -m suiteharness.doctor --source ../source-candidate --json
+        env:
+          PYTHONPATH: src

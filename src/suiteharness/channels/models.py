@@ -19,6 +19,7 @@ class ChannelKind(str, Enum):
 class OutboundEventKind(str, Enum):
     STARTED = "started"
     DELTA = "delta"
+    STATUS = "status"
     APPROVAL_REQUIRED = "approval_required"
     COMPLETED = "completed"
     FAILED = "failed"

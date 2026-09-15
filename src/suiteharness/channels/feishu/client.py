@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 
 from pydantic import SecretStr
@@ -27,11 +28,13 @@ class FeishuHttpRequest:
     timeout_seconds: float = 15.0
 
 
-class FeishuHttpTransport(Protocol):
+class FeishuHttpTransport(ABC):
+    @abstractmethod
     async def send(self, request: FeishuHttpRequest) -> FeishuHttpResponse: ...
 
 
-class TenantAccessTokenProvider(Protocol):
+class TenantAccessTokenProvider(ABC):
+    @abstractmethod
     async def get_token(self) -> str: ...
 
 
@@ -56,7 +59,8 @@ def _api_payload(response: FeishuHttpResponse, operation: str) -> dict[str, Any]
     if response.status_code < 200 or response.status_code >= 300:
         retryable = response.status_code == 429 or response.status_code >= 500
         raise FeishuApiError(
-            f"Feishu {operation} failed with HTTP {response.status_code}", retryable=retryable
+            f"Feishu {operation} failed with HTTP {response.status_code}",
+            retryable=retryable,
         )
     try:
         payload = decode_json_object(response.body)
@@ -89,7 +93,7 @@ def _idempotency_key(value: str | None) -> str | None:
     return value
 
 
-class CachedTenantAccessTokenProvider:
+class CachedTenantAccessTokenProvider(TenantAccessTokenProvider):
     """Fetch and cache a tenant token with single-flight refresh semantics."""
 
     def __init__(
@@ -153,7 +157,9 @@ class CachedTenantAccessTokenProvider:
                 or not isinstance(expires_in, int)
                 or expires_in <= 0
             ):
-                raise FeishuApiError("Feishu tenant token response has an invalid expiry")
+                raise FeishuApiError(
+                    "Feishu tenant token response has an invalid expiry"
+                )
             margin = min(self._refresh_skew, max(0.0, expires_in / 2))
             self._token = SecretStr(token)
             self._usable_until = self._clock() + expires_in - margin
@@ -180,7 +186,9 @@ def hmac_compare(left: str, right: str) -> bool:
 class FeishuMessageClient:
     """Send normalized text messages through a company-owned Feishu app."""
 
-    _RECEIVE_ID_TYPES = frozenset({"chat_id", "open_id", "user_id", "union_id", "email"})
+    _RECEIVE_ID_TYPES = frozenset(
+        {"chat_id", "open_id", "user_id", "union_id", "email"}
+    )
 
     def __init__(
         self,
@@ -310,7 +318,7 @@ class FeishuMessageClient:
             ) from exc
 
 
-class HttpxFeishuTransport:
+class HttpxFeishuTransport(FeishuHttpTransport):
     """Optional production HTTP transport; ``httpx`` is loaded only when used."""
 
     def __init__(
@@ -345,7 +353,9 @@ class HttpxFeishuTransport:
                 timeout=request.timeout_seconds,
             )
         except self._httpx.TimeoutException as exc:
-            raise FeishuApiError("Feishu API request timed out", retryable=True) from exc
+            raise FeishuApiError(
+                "Feishu API request timed out", retryable=True
+            ) from exc
         except self._httpx.HTTPError as exc:
             raise FeishuApiError(
                 f"Feishu API transport failed: {type(exc).__name__}", retryable=True

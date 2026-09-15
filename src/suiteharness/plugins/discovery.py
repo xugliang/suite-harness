@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 import hashlib
 import json
 import os
@@ -9,7 +11,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any
 
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
 from pydantic import ValidationError as PydanticValidationError
@@ -29,15 +31,17 @@ from suiteharness.security import UnsafeJsonSchemaError, harden_untrusted_json_s
 DEFAULT_MANIFEST_NAME = "suiteharness-plugin.json"
 
 
-class SignatureVerifier(Protocol):
+class SignatureVerifier(ABC):
     """Cryptographic verification seam backed by deployment key management."""
 
+    @abstractmethod
     def verify(self, payload: bytes, signature: SignatureMetadata) -> bool: ...
 
 
-class TrustPolicy(Protocol):
+class TrustPolicy(ABC):
     """Deployment policy evaluated after digest and signature checks."""
 
+    @abstractmethod
     def allows(
         self,
         *,
@@ -49,7 +53,7 @@ class TrustPolicy(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class AllowlistedTrustPolicy:
+class AllowlistedTrustPolicy(TrustPolicy):
     """Static server policy: exact artifact digests and explicit in-process IDs."""
 
     allowed_digests: Mapping[str, frozenset[str]]

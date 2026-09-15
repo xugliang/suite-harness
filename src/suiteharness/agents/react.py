@@ -7,8 +7,13 @@ handler.  Every returned :class:`ToolIntent` therefore still crosses the trusted
 
 from __future__ import annotations
 
+from suiteharness.execution.protocols import Workflow
+
 from dataclasses import dataclass
+from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Literal, cast
+from suiteharness.execution.events import WorkflowEvent, collect_decision
 
 from pydantic import JsonValue
 
@@ -28,6 +33,7 @@ from suiteharness.models import (
     ModelRole,
     ModelTool,
     ModelToolCall,
+    ModelStreamEventType,
     TextContent,
 )
 from suiteharness.sessions.models import canonical_json
@@ -40,7 +46,7 @@ class ReActStateError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class ReActWorkflow:
+class ReActWorkflow(Workflow):
     gateway: ModelGatewayLike
     route_id: str
     model: str | None = None
@@ -60,6 +66,11 @@ class ReActWorkflow:
         frame: WorkflowFrame,
         prompt: PromptEnvelope | None,
     ) -> WorkflowDecision:
+        return await collect_decision(self.stream(request, frame, prompt))
+
+    async def stream(
+        self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
+    ) -> AsyncIterator[WorkflowEvent | WorkflowDecision]:
         messages, consumed, seen_call_ids = self._restore_state(request, frame, prompt)
         new_observations = frame.observations[consumed:]
         for observation in new_observations:
@@ -89,7 +100,7 @@ class ReActWorkflow:
                 "product_id": request.scope.product_id,
             }
         )
-        response = await self.gateway.complete(
+        source = self.gateway.stream(
             self.route_id,
             ModelRequest(
                 messages=tuple(messages),
@@ -102,20 +113,61 @@ class ReActWorkflow:
             ),
         )
 
-        if response.finish_reason is FinishReason.TOOL_CALLS and not response.tool_calls:
+        text_parts: list[str] = []
+        tool_calls: list[ModelToolCall] = []
+        finish_reason = None
+        size = 0
+        async with aclosing(source):
+            async for event in source:
+                if finish_reason is not None:
+                    raise ReActStateError('model emitted after message_end')
+                if event.type is ModelStreamEventType.TEXT_DELTA:
+                    text = event.text_delta or ''
+                    size += len(text.encode('utf-8'))
+                    if size > 1024 * 1024:
+                        raise ReActStateError('model text exceeds byte limit')
+                    text_parts.append(text)
+                    yield WorkflowEvent(kind='delta', text=text)
+                elif event.type is ModelStreamEventType.TOOL_CALL_DELTA:
+                    call = event.tool_call
+                    assert call is not None
+                    if any(item.call_id == call.call_id for item in tool_calls):
+                        raise ReActStateError('model repeated a tool call id')
+                    if len(tool_calls) >= 32 or len(canonical_json(call.arguments)) > 256 * 1024:
+                        raise ReActStateError('model tool calls exceed bounded output')
+                    tool_calls.append(call)
+                elif event.type is ModelStreamEventType.MESSAGE_END:
+                    finish_reason = event.finish_reason
+                elif event.type is ModelStreamEventType.CONTEXT_COMPACTED:
+                    if event.prepared_messages is None:
+                        raise ReActStateError('gateway context event has no prepared messages')
+                    messages = [message.model_copy(deep=True) for message in event.prepared_messages]
+                    public = {key: value for key, value in (event.context_info or {}).items()
+                              if key in {'estimated_input_tokens', 'removed_rounds', 'truncated_tools'}
+                              and isinstance(value, int) and not isinstance(value, bool)}
+                    yield WorkflowEvent(kind='compact_completed', data=public)
+                if event.usage is not None:
+                    yield WorkflowEvent(kind='usage', data=event.usage.model_dump(mode='json'))
+        if finish_reason is None:
+            raise ReActStateError('model stream ended without message_end')
+        if finish_reason not in {FinishReason.STOP, FinishReason.TOOL_CALLS}:
+            raise ReActStateError(f'model did not finish successfully: {finish_reason.value}')
+        if tool_calls and finish_reason is not FinishReason.TOOL_CALLS:
+            raise ReActStateError('model returned tools without a tool_calls finish reason')
+        if finish_reason is FinishReason.TOOL_CALLS and not tool_calls:
             raise ReActStateError("model declared tool_calls but returned none")
 
         assistant = ModelMessage(
             role=ModelRole.ASSISTANT,
-            content=response.content,
-            tool_calls=response.tool_calls,
+            content=(TextContent(text=''.join(text_parts)),) if text_parts else (),
+            tool_calls=tuple(tool_calls),
         )
         messages.append(assistant)
         state = self._dump_state(request, messages, len(frame.observations), seen_call_ids)
 
-        if response.tool_calls:
+        if tool_calls:
             intents = self._tool_intents(
-                response.tool_calls,
+                tuple(tool_calls),
                 available_names=available_names,
                 seen_call_ids=seen_call_ids,
             )
@@ -125,19 +177,12 @@ class ReActWorkflow:
                 len(frame.observations),
                 seen_call_ids | {intent.call_id for intent in intents},
             )
-            return WorkflowDecision.tools(*intents, state=state)
+            yield WorkflowDecision.tools(*intents, state=state)
+            return
 
-        if not response.content:
+        if not ''.join(text_parts).strip():
             raise ReActStateError("model returned neither content nor tool calls")
-        text_parts = [part.text for part in response.content if isinstance(part, TextContent)]
-        if len(text_parts) == len(response.content):
-            output: JsonValue = "".join(text_parts)
-        else:
-            output = cast(
-                JsonValue,
-                [part.model_dump(mode="json") for part in response.content],
-            )
-        return WorkflowDecision.final(output, state=state)
+        yield WorkflowDecision.final(''.join(text_parts), state=state)
 
     def _restore_state(
         self,
@@ -274,7 +319,7 @@ class ReActWorkflow:
 
 
 @dataclass(frozen=True, slots=True)
-class ProductRoutedReActWorkflow:
+class ProductRoutedReActWorkflow(Workflow):
     """Default ReAct workflow whose model route is selected per product.
 
     The resolver is owned by the server configuration.  Product extensions may
@@ -295,6 +340,11 @@ class ProductRoutedReActWorkflow:
         frame: WorkflowFrame,
         prompt: PromptEnvelope | None,
     ) -> WorkflowDecision:
+        return await collect_decision(self.stream(request, frame, prompt))
+
+    async def stream(
+        self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
+    ) -> AsyncIterator[WorkflowEvent | WorkflowDecision]:
         route_id = self.routes.route_for(request.scope.product_id)
         if not isinstance(route_id, str) or not route_id.strip():
             raise ReActStateError(
@@ -309,4 +359,6 @@ class ProductRoutedReActWorkflow:
             max_output_tokens=self.max_output_tokens,
             tool_choice=self.tool_choice,
         )
-        return await workflow.next(request, frame, prompt)
+        async with aclosing(workflow.stream(request, frame, prompt)) as source:
+            async for event in source:
+                yield event

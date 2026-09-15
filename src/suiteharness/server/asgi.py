@@ -11,12 +11,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from starlette.applications import Starlette
@@ -50,53 +51,9 @@ from .host import CompanyChannelRuntime, FeishuHostAdapters, WebApprovalRuntime
 
 _LOGGER = logging.getLogger(__name__)
 _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
-_WEB_SEARCH_TOOL_ALIAS = "suiteharness.web.search"
 _SECURITY_SINGLETON_HEADERS = frozenset(
     {"authorization", "content-length", "cookie", "origin", "transfer-encoding"}
 )
-
-
-def _reachable_search_provider_ids(
-    loaded: LoadedSuiteHarnessConfig,
-    grant_templates: tuple[ToolAccessTemplate, ...],
-    product_ids: frozenset[str],
-) -> frozenset[str]:
-    """Return the provider union reachable through current product/channel grants."""
-
-    enabled_channels: set[str] = set()
-    if loaded.config.channels.web.enabled:
-        enabled_channels.add("web")
-    if loaded.config.channels.feishu.enabled:
-        enabled_channels.add("feishu")
-
-    required: set[str] = set()
-    for template in grant_templates:
-        if template.channel_id not in enabled_channels:
-            continue
-        if _WEB_SEARCH_TOOL_ALIAS in (
-            *template.write_aliases,
-            *template.destructive_aliases,
-        ):
-            raise CompanyServerStartupError(
-                "suiteharness.web.search must appear only in read_aliases"
-            )
-        if (
-            template.product_id not in product_ids
-            or _WEB_SEARCH_TOOL_ALIAS not in template.read_aliases
-        ):
-            continue
-        providers = loaded.config.web_tools.search_providers_by_product.get(
-            template.product_id
-        )
-        if providers is None:
-            providers = frozenset({loaded.config.web_tools.search.default_provider})
-        if not providers:
-            raise CompanyServerStartupError(
-                f"Web search is granted for product {template.product_id!r} "
-                "but no search provider is authorized"
-            )
-        required.update(providers)
-    return frozenset(required)
 
 
 def _require_starlette() -> tuple[type[Any], type[Any], type[Any], type[Any]]:
@@ -137,7 +94,11 @@ class CompanyHttpAuthenticationRequest:
     def __post_init__(self) -> None:
         if self.method != "POST":
             raise ValueError("company authentication exchange must use POST")
-        if not self.path.startswith("/") or len(self.path) > 2048 or "\x00" in self.path:
+        if (
+            not self.path.startswith("/")
+            or len(self.path) > 2048
+            or "\x00" in self.path
+        ):
             raise ValueError("invalid company authentication request path")
         if not self.origin or len(self.origin) > 2048 or "\x00" in self.origin:
             raise ValueError("invalid company authentication request origin")
@@ -171,9 +132,10 @@ class CompanyHttpAuthenticationRequest:
         return None if not values else values[0]
 
 
-class CompanyHttpAuthenticator(Protocol):
+class CompanyHttpAuthenticator(ABC):
     """Verify an existing company SSO credential at the HTTP trust boundary."""
 
+    @abstractmethod
     async def authenticate(
         self,
         request: CompanyHttpAuthenticationRequest,
@@ -283,7 +245,9 @@ class CompanyServerRuntime:
             except BaseException as exc:
                 failures.append(exc)
             if failures:
-                raise BaseExceptionGroup("company server shutdown reported failures", failures)
+                raise BaseExceptionGroup(
+                    "company server shutdown reported failures", failures
+                )
 
     def _log_background_exit(self, task: asyncio.Task[None]) -> None:
         if self._closed or task.cancelled():
@@ -327,10 +291,15 @@ class CompanyServerBootstrap:
         if approval_timeout_seconds <= 0 or approval_timeout_seconds > 3600:
             raise ValueError("approval timeout must be in (0, 3600]")
         if loaded.config.channels.web.enabled and web_authenticator is None:
-            raise ValueError("enabled Web channel requires a company HTTP authenticator")
+            raise ValueError(
+                "enabled Web channel requires a company HTTP authenticator"
+            )
         if not loaded.config.channels.web.enabled and web_authenticator is not None:
             raise ValueError("company HTTP authenticator requires the Web channel")
-        if not loaded.config.channels.web.enabled and web_session_revalidator is not None:
+        if (
+            not loaded.config.channels.web.enabled
+            and web_session_revalidator is not None
+        ):
             raise ValueError("Web session revalidator requires the Web channel")
         if web_session_revalidator is not None and not callable(
             getattr(web_session_revalidator, "revalidate", None)
@@ -376,12 +345,6 @@ class CompanyServerBootstrap:
     async def build(self) -> CompanyServerRuntime:
         """Activate products, extensions and channels as one rollback-safe unit."""
 
-        plan = self.resolve_plan()
-        search_provider_ids = _reachable_search_provider_ids(
-            self.loaded,
-            self.grant_templates,
-            frozenset(product.product_id for product in plan.products),
-        )
         approvals = (
             WebApprovalRuntime(timeout_seconds=self.approval_timeout_seconds)
             if self.loaded.config.channels.web.enabled
@@ -397,19 +360,30 @@ class CompanyServerBootstrap:
                 sandbox_transport=self.sandbox_transport,
                 browser_workers=self.browser_workers,
                 foundry_clients=self.foundry_clients,
-                search_provider_ids=search_provider_ids,
                 interactive_approvals=(
                     approvals.coordinator if approvals is not None else None
                 ),
                 plugin_adapters=self.plugin_adapters,
                 mcp_adapters=self.mcp_adapters,
             )
+            # Product contributions must exist before resolving the selected bundle.
+            await foundation.extensions.start_plugins()
+            from suiteharness.plugins.composition import compose_plugin_products
+            registry = foundation.extensions.plugin_contributions
+            contributions = await registry.snapshot() if registry is not None else ()
+            catalog, activators = compose_plugin_products(
+                self.product_catalog, self.product_activators, contributions,
+                self.loaded.config.plugins.bindings_by_product,
+            )
+            plan = resolve_customer_bundle(
+                self.loaded.config.customer_bundle, catalog, harness_version=__version__,
+            )
             for product in plan.products:
                 foundation.prepare_product_workspace(product.product_id)
             activation = await foundation.kernel.activate_customer_bundle(
                 self.loaded.config.deployment.tenant_id,
                 plan,
-                self.product_activators,
+                activators,
             )
             extensions = await foundation.start_extensions(activation)
             channels = await CompanyChannelRuntime.create(
@@ -554,7 +528,9 @@ class CompanyServerApplication:
             return self._json({"status": "not_ready", "checks": {}}, status_code=503)
         status = await runtime.readiness()
         code = 200 if status.ready else 503
-        public = {name: ("ok" if ready else "failed") for name, ready in status.checks.items()}
+        public = {
+            name: ("ok" if ready else "failed") for name, ready in status.checks.items()
+        }
         return self._json(
             {"status": "ready" if status.ready else "not_ready", "checks": public},
             status_code=code,
@@ -575,33 +551,45 @@ class CompanyServerApplication:
                 )
             _app_type, _route_type, _json_type, response_type = _require_starlette()
             return response_type(status_code=204, headers=cors)
-        if not self._empty_body_headers(request) or not await self._body_is_empty(request):
+        if not self._empty_body_headers(request) or not await self._body_is_empty(
+            request
+        ):
             return self._json(
                 {"error": "request_body_not_supported"}, status_code=413, headers=cors
             )
         runtime = self._runtime
         authenticator = self.bootstrap.web_authenticator
         if runtime is None or not self._accepting or authenticator is None:
-            return self._json({"error": "service_unavailable"}, status_code=503, headers=cors)
+            return self._json(
+                {"error": "service_unavailable"}, status_code=503, headers=cors
+            )
         try:
             auth_request = self._authentication_request(request, origin)
         except ValueError:
-            return self._json({"error": "invalid_request"}, status_code=400, headers=cors)
+            return self._json(
+                {"error": "invalid_request"}, status_code=400, headers=cors
+            )
         try:
             async with asyncio.timeout(config.authentication_timeout_seconds):
                 principal = await authenticator.authenticate(auth_request)
         except (TimeoutError, CompanyAuthenticationUnavailable):
-            return self._json({"error": "service_unavailable"}, status_code=503, headers=cors)
+            return self._json(
+                {"error": "service_unavailable"}, status_code=503, headers=cors
+            )
         except Exception:
             _LOGGER.error("company HTTP authenticator failed")
-            return self._json({"error": "service_unavailable"}, status_code=503, headers=cors)
+            return self._json(
+                {"error": "service_unavailable"}, status_code=503, headers=cors
+            )
         if not isinstance(principal, AuthenticatedPrincipal) or (
             principal.tenant_id != self.bootstrap.loaded.config.deployment.tenant_id
         ):
             return self._json({"error": "unauthorized"}, status_code=401, headers=cors)
         codec = runtime.channels.web_session_tokens
         if codec is None:
-            return self._json({"error": "service_unavailable"}, status_code=503, headers=cors)
+            return self._json(
+                {"error": "service_unavailable"}, status_code=503, headers=cors
+            )
         token = codec.issue(principal, lifetime_seconds=config.session_lifetime_seconds)
         response = self._json(
             {
@@ -676,7 +664,11 @@ class CompanyServerApplication:
         if message.get("type") != "http.request":
             return False
         body = message.get("body", b"")
-        return isinstance(body, bytes) and not body and message.get("more_body") is not True
+        return (
+            isinstance(body, bytes)
+            and not body
+            and message.get("more_body") is not True
+        )
 
     @staticmethod
     def _authentication_request(
@@ -762,7 +754,9 @@ class CompanyServerApplication:
         )
 
 
-def create_company_asgi_app(bootstrap: CompanyServerBootstrap) -> CompanyServerApplication:
+def create_company_asgi_app(
+    bootstrap: CompanyServerBootstrap,
+) -> CompanyServerApplication:
     """Create the canonical company-only ASGI application."""
 
     return CompanyServerApplication(bootstrap)

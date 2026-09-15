@@ -36,6 +36,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+feishu = [
+    "lark-oapi>=1.4,<2",
+]
 aws = [
     "boto3>=1.34",
 ]

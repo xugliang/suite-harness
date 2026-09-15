@@ -1,0 +1,4 @@
+# The product supplies this trusted factory; this is not a built-in demo product.
+factory: company_product.server:create_app
+host: 0.0.0.0
+port: 8080

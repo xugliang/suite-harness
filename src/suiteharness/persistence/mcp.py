@@ -7,7 +7,7 @@ import re
 from urllib.parse import urlsplit
 
 from suiteharness.mcp.models import HttpResumeState
-from suiteharness.mcp.protocols import McpHttpResumeCheckpoint
+from suiteharness.mcp.protocols import McpHttpResumeCheckpoint, McpHttpResumeStore
 
 from .models import ProductStateKey
 from .state import SQLiteProductStateStore
@@ -15,7 +15,7 @@ from .state import SQLiteProductStateStore
 _SERVER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
-class SQLiteMcpHttpResumeStore:
+class SQLiteMcpHttpResumeStore(McpHttpResumeStore):
     """Persist only MCP session/event cursors, never credentials or auth headers.
 
     The endpoint is represented by a SHA-256 fingerprint in the state key. A

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.sandbox.protocols import SandboxQuarantineStore
+
 import re
 from collections.abc import Mapping
 
@@ -39,7 +41,7 @@ _OWNER_SCHEMA = (
 )
 
 
-class SQLiteSandboxQuarantineStore:
+class SQLiteSandboxQuarantineStore(SandboxQuarantineStore):
     """Persist only deterministic container names and sanitized failure reasons."""
 
     def __init__(

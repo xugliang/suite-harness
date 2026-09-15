@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.models.protocols import ModelProvider
+
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -33,7 +35,7 @@ from suiteharness.models.types import (
 )
 
 
-class OpenAIResponsesAdapter:
+class OpenAIResponsesAdapter(ModelProvider):
     def __init__(
         self,
         descriptor: ProviderDescriptor,

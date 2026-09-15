@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import logging
 import re
 import secrets
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, aclosing
+from suiteharness.execution.events import RunEvent
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -19,6 +21,7 @@ from suiteharness.channels import (
     OutboundEvent,
     OutboundEventKind,
 )
+from suiteharness.channels.gateway import ChannelApplication as ChannelApplicationPort
 from suiteharness.execution import (
     ConversationContext,
     ConversationMessage,
@@ -36,7 +39,10 @@ from suiteharness.sessions import (
     TranscriptEvent,
     TranscriptEventType,
 )
-from suiteharness.sessions.models import canonical_json
+from suiteharness.sessions.models import canonical_json, memory_invalidation_source
+from suiteharness.memory.resolver import DefaultSessionMemoryResolver
+from suiteharness.memory.session_memory import MemoryState, SessionConversationMemory
+from suiteharness.memory.markdown_archive import MarkdownArchive
 
 from .access import ChannelGrantIssuer
 
@@ -46,6 +52,8 @@ _CHECKPOINT_SCHEMA = "suiteharness.channel-application.v1"
 _USER_EVENT_SCHEMA = "suiteharness.channel-user-message.v1"
 _RUN_LEASE_GRACE_SECONDS = 30.0
 _RUN_FINALIZATION_SECONDS = 30.0
+_ARCHIVE_HEADER = re.compile(r'<!-- suiteharness-memory-v1 revision=([0-9]+) -->\n')
+_LOGGER = logging.getLogger(__name__)
 
 
 class ChannelApplicationError(RuntimeError):
@@ -64,11 +72,19 @@ class CustomerBundleRunner(Protocol):
 
     async def run(self, request: RunRequest) -> RunResult: ...
 
+    def stream(self, request: RunRequest) -> AsyncIterator[RunEvent]: ...
+
 
 class RunInputBuilder(Protocol):
     """Product-neutral seam for mapping a channel envelope to workflow input."""
 
     def __call__(self, message: InboundMessage, scope: RequestScope) -> JsonValue: ...
+
+
+class SessionMemoryResolver(Protocol):
+    """Resolve the conversation-memory policy for one trusted request scope."""
+
+    def resolve(self, scope: RequestScope) -> SessionConversationMemory: ...
 
 
 def default_run_input(message: InboundMessage, scope: RequestScope) -> JsonValue:
@@ -124,7 +140,7 @@ class _SessionLocks:
                 self._entries.pop(identity, None)
 
 
-class ChannelApplication:
+class ChannelApplication(ChannelApplicationPort):
     """Persist, authorize, execute, checkpoint, and emit one channel message.
 
     A per-session lock gives deterministic ordering inside one process.  Every
@@ -147,6 +163,8 @@ class ChannelApplication:
         conversation_history_limit: int = 32,
         conversation_history_bytes: int = 128 * 1024,
         conversation_scan_limit: int = 256,
+        memory_resolver: SessionMemoryResolver | None = None,
+        archive: MarkdownArchive | None = None,
     ) -> None:
         if not callable(input_builder):
             raise TypeError("input_builder must be callable")
@@ -168,9 +186,17 @@ class ChannelApplication:
             )
         if conversation_history_limit < 2 or conversation_history_limit > 256:
             raise ValueError("conversation_history_limit must be between 2 and 256")
-        if conversation_history_bytes < 1024 or conversation_history_bytes > 4 * 1024 * 1024:
-            raise ValueError("conversation_history_bytes must be between 1024 and 4194304")
-        if conversation_scan_limit < conversation_history_limit or conversation_scan_limit > 1000:
+        if (
+            conversation_history_bytes < 1024
+            or conversation_history_bytes > 4 * 1024 * 1024
+        ):
+            raise ValueError(
+                "conversation_history_bytes must be between 1024 and 4194304"
+            )
+        if (
+            conversation_scan_limit < conversation_history_limit
+            or conversation_scan_limit > 1000
+        ):
             raise ValueError(
                 "conversation_scan_limit must cover history_limit and be at most 1000"
             )
@@ -184,14 +210,120 @@ class ChannelApplication:
         self._conversation_history_limit = conversation_history_limit
         self._conversation_history_bytes = conversation_history_bytes
         self._conversation_scan_limit = conversation_scan_limit
+        self._memory_resolver = memory_resolver or DefaultSessionMemoryResolver()
+        self._archive = archive
         self._locks = _SessionLocks()
+
+    def _validate_memory_scope(self, scope: RequestScope) -> SessionIdentity:
+        if not isinstance(scope, RequestScope) or scope.path.kind is not ScopeKind.AGENT:
+            raise ChannelApplicationError('conversation operations require an authenticated agent scope')
+        if scope.tenant_id != self._activation.tenant_id:
+            raise ChannelApplicationError('memory tenant does not match active customer bundle')
+        products = getattr(self._activation, 'products', None)
+        if products is not None and scope.product_id not in products:
+            raise ChannelApplicationError('memory product is not active')
+        return self._session_identity(scope)
+
+    async def history(self, scope: RequestScope, *, limit: int = 100,
+                      include_invalidated: bool = False) -> tuple[TranscriptEvent, ...]:
+        """Visible messages, optionally including explicitly marked inactive audit copies.
+
+        The caller must authenticate and authorize the exact business session.
+        This is a display API, never an alternative source of model context.
+        Raw audit events remain unchanged on the host-owned SessionStore.
+        """
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError('history limit must be between 1 and 1000')
+        if type(include_invalidated) is not bool:
+            raise ValueError('include_invalidated must be a boolean')
+        identity = self._validate_memory_scope(scope)
+        record = await self._sessions.get(identity)
+        if record is None:
+            return ()
+        events = await self._sessions.recent_transcript(identity, limit=1000)
+        # Re-read the watermark so a concurrent invalidation cannot expose a
+        # suffix selected before its commit.
+        record = await self._sessions.get(identity)
+        assert record is not None
+        selected = tuple(event for event in events
+                     if (include_invalidated or event.revision > record.memory_invalidated_revision) and event.type in {
+                         TranscriptEventType.USER_MESSAGE, TranscriptEventType.ASSISTANT_MESSAGE,
+                     })[-limit:]
+        if include_invalidated:
+            return tuple(event.model_copy(update={'payload': {
+                **event.payload, 'memory_eligible': event.revision > record.memory_invalidated_revision,
+            }}) for event in selected)
+        return selected
+
+    async def invalidate_memory(self, scope: RequestScope, *, reason: str = 'source_changed',
+                                idempotency_key: str | None = None,
+                                source_namespace: str | None = None,
+                                source_version: int | None = None) -> None:
+        """Atomically advance a durable cutoff without deleting audit or changing identity.
+
+        This deliberately does not acquire the long-running conversation lock:
+        an in-flight run must be fenced immediately, including in other hosts.
+        """
+        identity = self._validate_memory_scope(scope)
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 200:
+            raise ValueError('memory invalidation requires a bounded reason')
+        if idempotency_key is not None and (not isinstance(idempotency_key, str)
+                or not idempotency_key.strip() or len(idempotency_key) > 512):
+            raise ValueError('memory invalidation idempotency key must be a bounded string')
+        payload = {'schema': 'suiteharness.memory-invalidation.v1', 'reason': reason}
+        if source_namespace is not None or source_version is not None:
+            payload.update(source_namespace=source_namespace, source_version=source_version)
+            memory_invalidation_source(payload)
+        await self._sessions.create(identity)
+        durable_key = (None if idempotency_key is None else
+                       'memory-invalidation-' + hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest())
+        await self._sessions.append(identity, event_id=f'memory-invalidated-{secrets.token_hex(16)}',
+            event_type=TranscriptEventType.MEMORY_INVALIDATED,
+            payload=payload,
+            idempotency_key=durable_key)
+        # Do not race a newer completion with an asynchronous file deletion.
+        # The durable cutoff rejects old derived archives, even after restart;
+        # the next authorized completion replaces their contents.
+
+    async def _archive_text(self, identity: SessionIdentity, cutoff: int, revision: int) -> str:
+        if self._archive is None:
+            return ''
+        document = await asyncio.to_thread(self._archive.retrieve, identity, '', self._archive.max_file_bytes)
+        header = _ARCHIVE_HEADER.match(document)
+        if header is None or not cutoff < int(header[1]) <= revision:
+            return ''
+        return document[header.end():]
+
+    async def _archive_completed(self, identity: SessionIdentity, cutoff: int, revision: int,
+                                 question: str, output: JsonValue) -> None:
+        if self._archive is None:
+            return
+        try:
+            record = await self._sessions.get(identity)
+            if record is None or record.memory_invalidated_revision != cutoff:
+                return
+            previous = await self._archive_text(identity, cutoff, revision)
+            answer = output if isinstance(output, str) else canonical_json(output)
+            header = f'<!-- suiteharness-memory-v1 revision={revision} -->\n'
+            document = previous + f'\n\n## User\n\n{question}\n\n## Assistant\n\n{answer}\n'
+            budget = self._archive.max_file_bytes - len(header.encode('utf-8'))
+            bounded = document.encode('utf-8')[-budget:].decode('utf-8', errors='ignore')
+            await asyncio.to_thread(self._archive.store, identity, header + bounded)
+        except (OSError, ValueError):
+            # Chat facts already committed; a derived archive cannot turn a
+            # successful answer into a failed run or authorize model reexecution.
+            _LOGGER.warning('memory_archive_write_failed')
 
     async def handle(
         self,
         message: InboundMessage,
         scope: RequestScope,
+        *,
+        before_commit: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncIterator[OutboundEvent]:
         self._validate_boundary(message, scope)
+        if before_commit is not None and not callable(before_commit):
+            raise TypeError('before_commit must be callable')
         identity = self._session_identity(scope)
         run_id = self._stable_id(
             "run",
@@ -207,14 +339,16 @@ class ChannelApplication:
         message_digest = self._message_digest(message, scope)
 
         async with self._locks.acquire(identity):
-            async for event in self._handle_locked(
+            async with aclosing(self._handle_locked(
                 message,
                 scope,
                 identity,
                 run_id,
                 message_digest,
-            ):
-                yield event
+                before_commit,
+            )) as source:
+                async for event in source:
+                    yield event
 
     async def _handle_locked(
         self,
@@ -223,6 +357,7 @@ class ChannelApplication:
         identity: SessionIdentity,
         run_id: str,
         message_digest: str,
+        before_commit: Callable[[], Awaitable[None]] | None,
     ) -> AsyncIterator[OutboundEvent]:
         await self._sessions.create(identity)
         owner_token = secrets.token_urlsafe(32)
@@ -230,7 +365,17 @@ class ChannelApplication:
         snapshot = await self._sessions.resume(identity)
         if snapshot is None:
             raise ChannelApplicationError("session disappeared after creation")
-        history = self._load_history(snapshot.checkpoint.workflow_state if snapshot.checkpoint else None)
+        history = self._load_history(
+            snapshot.checkpoint.workflow_state if snapshot.checkpoint else None
+        )
+        memory_state = self._load_memory_state(
+            snapshot.checkpoint.workflow_state if snapshot.checkpoint else None
+        )
+        memory_cutoff = snapshot.session.memory_invalidated_revision
+        if memory_state.covered_revision < memory_cutoff:
+            memory_state = MemoryState(covered_revision=memory_cutoff)
+        if snapshot.checkpoint is not None and snapshot.checkpoint.revision <= memory_cutoff:
+            history = []
         cached_index = self._find_run(history, run_id)
         if cached_index is not None:
             cached = history[cached_index]
@@ -268,6 +413,7 @@ class ChannelApplication:
                     identity,
                     history,
                     cached_index,
+                    memory_state,
                     snapshot.session.revision,
                     payload,
                     update_status=cached_index == len(history) - 1,
@@ -282,6 +428,15 @@ class ChannelApplication:
                         expected_status,
                         expected_revision=snapshot.session.revision,
                     )
+            if cached['state'] == OutboundEventKind.COMPLETED.value and before_commit is not None:
+                await before_commit()
+            current = await self._sessions.get(identity)
+            if current is None or current.memory_invalidated_revision != memory_cutoff:
+                payload = self._application_failure_payload(identity, run_id)
+                payload['failure'] = {'code': 'memory_invalidated',
+                    'message': 'conversation sources changed before replay', 'retryable': False}
+                yield self._outbound(scope, OutboundEventKind.FAILED, payload)
+                return
             yield self._cached_terminal(scope, cached)
             return
 
@@ -289,7 +444,21 @@ class ChannelApplication:
             identity,
             limit=self._conversation_scan_limit,
         )
-        conversation = self._conversation_context(recent)
+        recent = tuple(event for event in recent if event.revision > memory_cutoff)
+        memory_preparation = await self._memory_resolver.resolve(scope).prepare(
+            identity,
+            recent,
+            memory_state,
+        )
+        conversation = memory_preparation.context
+        memory_state = memory_preparation.state
+        if self._archive is not None:
+            try:
+                archive_text = await self._archive_text(identity, memory_cutoff, snapshot.session.revision)
+                conversation = conversation.model_copy(update={'long_term_context': archive_text[:4000]})
+            except (OSError, ValueError):
+                _LOGGER.warning('memory_archive_read_failed')
+                conversation = conversation.model_copy(update={'memory_degraded': True})
 
         prior_revision = snapshot.session.revision
         user_event = await self._sessions.append(
@@ -297,7 +466,9 @@ class ChannelApplication:
             event_id=self._stable_id("event", run_id, "user"),
             event_type=TranscriptEventType.USER_MESSAGE,
             payload=self._message_payload(message, scope),
-            idempotency_key=self._stable_id("idem", identity.principal_id, run_id, "user"),
+            idempotency_key=self._stable_id(
+                "idem", identity.principal_id, run_id, "user"
+            ),
             expected_revision=prior_revision,
             occurred_at=message.received_at,
         )
@@ -342,13 +513,20 @@ class ChannelApplication:
         started_checkpoint = await self._sessions.save_checkpoint(
             identity,
             checkpoint_id=self._stable_id("checkpoint", run_id, "started"),
-            workflow_state=self._history_state(history),
+            workflow_state=self._history_state(history, memory_state),
             expected_revision=revision,
-            idempotency_key=self._stable_id("idem", identity.principal_id, run_id, "started"),
+            idempotency_key=self._stable_id(
+                "idem", identity.principal_id, run_id, "started"
+            ),
         )
-        yield self._started(scope, identity, run_id, replayed=False)
-
+        interrupted: BaseException | None = None
+        partial_parts: list[str] = []
+        partial_bytes = 0
+        partial_truncated = False
+        # Keep incomplete output bounded independently of product/model behavior.
+        partial_limit = min(128 * 1024, self._history_bytes // 8)
         try:
+            yield self._started(scope, identity, run_id, replayed=False)
             run_input = self._input_builder(message, scope)
             canonical_json(run_input)
             async with self._grants.lease(scope) as issued:
@@ -361,9 +539,44 @@ class ChannelApplication:
                     read_only=issued.read_only,
                     budget=self._budget,
                 )
-                result = await self._activation.run(request)
+                result = None
+                async with aclosing(self._activation.stream(request)) as source:
+                    async for event in source:
+                        record = await self._sessions.get(identity)
+                        if record is None or record.memory_invalidated_revision != memory_cutoff:
+                            raise ChannelApplicationError('conversation memory was invalidated during execution')
+                        if event.run_id != run_id:
+                            raise ValueError('execution stream belongs to another run')
+                        if event.result is not None:
+                            if result is not None:
+                                raise ValueError('execution stream repeated a terminal result')
+                            result = event.result
+                        elif event.kind != 'started':
+                            if event.kind == 'delta':
+                                encoded = event.text.encode('utf-8')
+                                retained = encoded[:max(0, partial_limit - partial_bytes)].decode('utf-8', errors='ignore')
+                                if retained:
+                                    partial_parts.append(retained)
+                                partial_bytes += len(retained.encode('utf-8'))
+                                partial_truncated |= retained != event.text
+                            yield self._outbound(
+                                scope,
+                                OutboundEventKind.DELTA if event.kind == 'delta' else OutboundEventKind.STATUS,
+                                {'run_id': run_id, 'session_id': identity.session_id,
+                                 'product_id': identity.product_id, 'sequence': event.sequence,
+                                 'type': event.kind, 'text': event.text, 'data': event.data},
+                            )
                 if not isinstance(result, RunResult):
                     raise TypeError("customer bundle returned an invalid run result")
+        except (asyncio.CancelledError, GeneratorExit) as exc:
+            interrupted = exc
+            kind = OutboundEventKind.FAILED
+            payload = self._application_failure_payload(identity, run_id)
+            payload.update(run_status=RunStatus.CANCELLED.value, failure={
+                'code': 'cancelled', 'message': 'channel stream was closed', 'retryable': False,
+            })
+            transcript_type = TranscriptEventType.CANCEL
+            session_status = SessionStatus.CANCELLED
         except Exception:
             kind = OutboundEventKind.FAILED
             payload = self._application_failure_payload(identity, run_id)
@@ -373,6 +586,22 @@ class ChannelApplication:
             kind, payload, transcript_type, session_status = self._terminal_from_result(
                 identity, result
             )
+
+        if kind is OutboundEventKind.FAILED and partial_parts:
+            payload.update(partial_output=''.join(partial_parts), incomplete=True,
+                            partial_truncated=partial_truncated)
+
+        record = await self._sessions.get(identity)
+        if record is None or record.memory_invalidated_revision != memory_cutoff:
+            # A source mutation committed while the old run was executing. Never
+            # publish or persist its answer/summary over the newer watermark.
+            if interrupted is not None:
+                raise interrupted
+            invalidated = self._application_failure_payload(identity, run_id)
+            invalidated['failure'] = {'code': 'memory_invalidated',
+                'message': 'conversation sources changed during execution', 'retryable': False}
+            yield self._outbound(scope, OutboundEventKind.FAILED, invalidated)
+            return
 
         finalized = await self._sessions.finalize_run(
             identity,
@@ -384,15 +613,39 @@ class ChannelApplication:
             # Another process observed an expired execution lease and fenced
             # this owner. Never let the old generation publish terminal state.
             payload = self._uncertain_payload(identity, run_id, replayed=False)
+            if interrupted is not None:
+                raise interrupted
             yield self._outbound(scope, OutboundEventKind.FAILED, payload)
             return
+
+        if kind is OutboundEventKind.COMPLETED and before_commit is not None:
+            try:
+                await before_commit()
+            except BaseException as exc:
+                # Keep the submitted user input and a safe failed outcome for
+                # audit, but never save the denied assistant output or archive.
+                interrupted = exc
+                kind = OutboundEventKind.FAILED
+                payload = self._application_failure_payload(identity, run_id)
+                payload['failure'] = {'code': 'commit_rejected',
+                    'message': 'request authorization changed before completion', 'retryable': False}
+                transcript_type = TranscriptEventType.ERROR
+                session_status = SessionStatus.FAILED
+                if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                    payload.update(run_status=RunStatus.CANCELLED.value, failure={
+                        'code': 'cancelled', 'message': 'channel stream was closed', 'retryable': False,
+                    })
+                    transcript_type = TranscriptEventType.CANCEL
+                    session_status = SessionStatus.CANCELLED
 
         terminal_event = await self._sessions.append(
             identity,
             event_id=self._stable_id("event", run_id, "terminal"),
             event_type=transcript_type,
             payload=payload,
-            idempotency_key=self._stable_id("idem", identity.principal_id, run_id, "terminal"),
+            idempotency_key=self._stable_id(
+                "idem", identity.principal_id, run_id, "terminal"
+            ),
             expected_revision=started_checkpoint.revision,
         )
         run_index = self._find_run(history, run_id)
@@ -406,15 +659,28 @@ class ChannelApplication:
         checkpoint = await self._sessions.save_checkpoint(
             identity,
             checkpoint_id=self._stable_id("checkpoint", run_id, "terminal"),
-            workflow_state=self._history_state(history),
+            workflow_state=self._history_state(history, memory_state),
             expected_revision=terminal_event.revision,
-            idempotency_key=self._stable_id("idem", identity.principal_id, run_id, "terminal-state"),
+            idempotency_key=self._stable_id(
+                "idem", identity.principal_id, run_id, "terminal-state"
+            ),
         )
         await self._sessions.set_status(
             identity,
             session_status,
             expected_revision=checkpoint.revision,
         )
+        if kind is OutboundEventKind.COMPLETED:
+            await self._archive_completed(identity, memory_cutoff, terminal_event.revision,
+                                          message.text, payload.get('output'))
+        if interrupted is not None:
+            raise interrupted
+        record = await self._sessions.get(identity)
+        if record is None or record.memory_invalidated_revision != memory_cutoff:
+            kind = OutboundEventKind.FAILED
+            payload = self._application_failure_payload(identity, run_id)
+            payload['failure'] = {'code': 'memory_invalidated',
+                'message': 'conversation sources changed during execution', 'retryable': False}
         yield self._outbound(scope, kind, payload)
 
     async def _recover_uncertain(
@@ -422,6 +688,7 @@ class ChannelApplication:
         identity: SessionIdentity,
         history: list[dict[str, JsonValue]],
         index: int,
+        memory_state: MemoryState,
         expected_revision: int,
         payload: dict[str, JsonValue],
         *,
@@ -433,12 +700,16 @@ class ChannelApplication:
             event_id=self._stable_id("event", run_id, "uncertain"),
             event_type=TranscriptEventType.ERROR,
             payload=payload,
-            idempotency_key=self._stable_id("idem", identity.principal_id, run_id, "uncertain"),
+            idempotency_key=self._stable_id(
+                "idem", identity.principal_id, run_id, "uncertain"
+            ),
             expected_revision=expected_revision,
         )
         current = await self._sessions.get(identity)
         if current is None:
-            raise ChannelApplicationError("session disappeared during uncertain-run recovery")
+            raise ChannelApplicationError(
+                "session disappeared during uncertain-run recovery"
+            )
         history[index] = {
             **history[index],
             "state": OutboundEventKind.FAILED.value,
@@ -447,7 +718,7 @@ class ChannelApplication:
         checkpoint = await self._sessions.save_checkpoint(
             identity,
             checkpoint_id=self._stable_id("checkpoint", run_id, "uncertain"),
-            workflow_state=self._history_state(history),
+            workflow_state=self._history_state(history, memory_state),
             # An idempotent retry may return an older event after a newer run
             # changed the session.  Re-read the CAS revision rather than using
             # that historical event's revision.
@@ -471,11 +742,17 @@ class ChannelApplication:
     ) -> None:
         if len(history) >= self._history_limit:
             removable = next(
-                (index for index, item in enumerate(history) if item["state"] != "started"),
+                (
+                    index
+                    for index, item in enumerate(history)
+                    if item["state"] != "started"
+                ),
                 None,
             )
             if removable is None:
-                raise ChannelApplicationError("checkpoint contains too many unfinished runs")
+                raise ChannelApplicationError(
+                    "checkpoint contains too many unfinished runs"
+                )
             history.pop(removable)
         history.append(
             {
@@ -496,6 +773,7 @@ class ChannelApplication:
     def _history_state(
         self,
         history: list[dict[str, JsonValue]],
+        memory_state: MemoryState,
     ) -> dict[str, JsonValue]:
         """Bound replay history by entries and serialized bytes.
 
@@ -508,11 +786,19 @@ class ChannelApplication:
             state: dict[str, JsonValue] = {
                 "schema": _CHECKPOINT_SCHEMA,
                 "runs": history,
+                "memory": cast(
+                    dict[str, JsonValue],
+                    memory_state.model_dump(mode="json"),
+                ),
             }
             if len(canonical_json(state).encode("utf-8")) <= self._history_bytes:
                 return cast(dict[str, JsonValue], copy.deepcopy(state))
             removable = next(
-                (index for index, item in enumerate(history) if item["state"] != "started"),
+                (
+                    index
+                    for index, item in enumerate(history)
+                    if item["state"] != "started"
+                ),
                 None,
             )
             if removable is None:
@@ -527,15 +813,21 @@ class ChannelApplication:
         if len(canonical_json(state).encode("utf-8")) > self._history_bytes:
             raise ChannelApplicationError("session checkpoint exceeds its byte limit")
         if not isinstance(state, dict) or state.get("schema") != _CHECKPOINT_SCHEMA:
-            raise ChannelApplicationError("session checkpoint belongs to an incompatible owner")
+            raise ChannelApplicationError(
+                "session checkpoint belongs to an incompatible owner"
+            )
         raw_runs = state.get("runs")
         if not isinstance(raw_runs, list):
-            raise ChannelApplicationError("session checkpoint has an invalid run history")
+            raise ChannelApplicationError(
+                "session checkpoint has an invalid run history"
+            )
         history: list[dict[str, JsonValue]] = []
         seen: set[str] = set()
         for item in raw_runs:
             if not isinstance(item, dict):
-                raise ChannelApplicationError("session checkpoint has an invalid run entry")
+                raise ChannelApplicationError(
+                    "session checkpoint has an invalid run entry"
+                )
             run_id = item.get("run_id")
             digest = item.get("message_digest")
             run_state = item.get("state")
@@ -547,10 +839,16 @@ class ChannelApplication:
                 or not isinstance(digest, str)
                 or not _DIGEST.fullmatch(digest)
                 or run_state
-                not in {"started", OutboundEventKind.COMPLETED.value, OutboundEventKind.FAILED.value}
+                not in {
+                    "started",
+                    OutboundEventKind.COMPLETED.value,
+                    OutboundEventKind.FAILED.value,
+                }
                 or (run_state != "started" and not isinstance(payload, dict))
             ):
-                raise ChannelApplicationError("session checkpoint has an invalid run entry")
+                raise ChannelApplicationError(
+                    "session checkpoint has an invalid run entry"
+                )
             seen.add(run_id)
             history.append(
                 {
@@ -561,6 +859,27 @@ class ChannelApplication:
                 }
             )
         return history
+
+    def _load_memory_state(self, state: JsonValue) -> MemoryState:
+        if state is None:
+            return MemoryState()
+        if len(canonical_json(state).encode("utf-8")) > self._history_bytes:
+            raise ChannelApplicationError("session checkpoint exceeds its byte limit")
+        if not isinstance(state, dict) or state.get("schema") != _CHECKPOINT_SCHEMA:
+            raise ChannelApplicationError(
+                "session checkpoint belongs to an incompatible owner"
+            )
+        raw_memory = state.get("memory")
+        if raw_memory is None:
+            return MemoryState()
+        if not isinstance(raw_memory, dict):
+            raise ChannelApplicationError("session checkpoint has invalid memory state")
+        try:
+            return MemoryState.model_validate(raw_memory)
+        except ValueError as exc:
+            raise ChannelApplicationError(
+                "session checkpoint has invalid memory state"
+            ) from exc
 
     def _cached_terminal(
         self,
@@ -839,18 +1158,30 @@ class ChannelApplication:
         )
 
     def _validate_boundary(self, message: InboundMessage, scope: RequestScope) -> None:
-        if not isinstance(message, InboundMessage) or not isinstance(scope, RequestScope):
+        if not isinstance(message, InboundMessage) or not isinstance(
+            scope, RequestScope
+        ):
             raise TypeError("message and scope must be validated boundary models")
         if scope.path.kind is not ScopeKind.AGENT:
-            raise ChannelApplicationError("company-channel requests require an agent scope")
+            raise ChannelApplicationError(
+                "company-channel requests require an agent scope"
+            )
         if not scope.request_id or not scope.correlation_id:
-            raise ChannelApplicationError("company-channel scope requires request correlation ids")
+            raise ChannelApplicationError(
+                "company-channel scope requires request correlation ids"
+            )
         if message.channel.value != scope.channel_id:
-            raise ChannelApplicationError("message channel does not match authenticated scope")
+            raise ChannelApplicationError(
+                "message channel does not match authenticated scope"
+            )
         if message.product_id is not None and message.product_id != scope.product_id:
-            raise ChannelApplicationError("message product does not match authenticated scope")
+            raise ChannelApplicationError(
+                "message product does not match authenticated scope"
+            )
         if self._activation.tenant_id != scope.tenant_id:
-            raise ChannelApplicationError("request tenant does not match active customer bundle")
+            raise ChannelApplicationError(
+                "request tenant does not match active customer bundle"
+            )
 
     @staticmethod
     def _started(

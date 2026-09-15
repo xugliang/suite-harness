@@ -97,16 +97,22 @@ models:
 web_tools:
   # 未显式列出时只能使用下面的公司默认 provider/route；非默认出口需逐产品放行。
   search_providers_by_product:
-    product-a: [baidu-qianfan]
+    product-a: [bing-html]
   fetch_routes_by_product:
     product-a: [direct]
   search:
-    default_provider: baidu-qianfan
+    default_provider: bing-html
+    # 仅在模型未显式选择 provider，且前一来源失败或无结果时依次回退。
+    fallback_providers: [baidu-html]
     providers:
-      - kind: baidu_qianfan
-        provider_id: baidu-qianfan
-        credentials_ref: search/baidu-qianfan
-        endpoint: https://qianfan.baidubce.com/v2/ai_search/web_search
+      - kind: html
+        provider_id: bing-html
+        engine: bing
+        endpoint: https://www.bing.com/search
+      - kind: html
+        provider_id: baidu-html
+        engine: baidu
+        endpoint: https://www.baidu.com/s
   fetch:
     # direct 带 DNS 固定和 SSRF 防护；境内网络不稳定时可换 managed_proxy/browser_worker。
     default_route: direct

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -67,10 +68,10 @@ class McpHttpExchange(Protocol):
     def open_events(self, request: HttpRequest) -> AsyncIterator[ServerSentEvent]: ...
 
 
-@runtime_checkable
-class McpEgressPolicy(Protocol):
+class McpEgressPolicy(ABC):
     """Authorize and pin an MCP endpoint before any bytes leave the process."""
 
+    @abstractmethod
     async def authorize(
         self,
         endpoint: str,
@@ -81,10 +82,10 @@ class McpEgressPolicy(Protocol):
         """Return the policy-approved endpoint, or raise to fail closed."""
 
 
-@runtime_checkable
-class McpTokenProvider(Protocol):
+class McpTokenProvider(ABC):
     """Resolve server-managed OAuth/service tokens without exposing secrets."""
 
+    @abstractmethod
     async def authorization_header(
         self,
         credential_ref: str,
@@ -93,21 +94,24 @@ class McpTokenProvider(Protocol):
     ) -> str: ...
 
 
-@runtime_checkable
-class OAuthMetadataResolver(Protocol):
+class OAuthMetadataResolver(ABC):
     """Discover protected-resource/authorization-server metadata via policy."""
 
-    async def protected_resource(self, endpoint: str) -> OAuthProtectedResourceMetadata: ...
+    @abstractmethod
+    async def protected_resource(
+        self, endpoint: str
+    ) -> OAuthProtectedResourceMetadata: ...
 
+    @abstractmethod
     async def authorization_server(
         self, issuer: str
     ) -> OAuthAuthorizationServerMetadata: ...
 
 
-@runtime_checkable
-class OAuthTokenIssuer(Protocol):
+class OAuthTokenIssuer(ABC):
     """Exchange a configured server credential for a scoped OAuth token."""
 
+    @abstractmethod
     async def issue(
         self,
         credential_ref: str,
@@ -116,25 +120,27 @@ class OAuthTokenIssuer(Protocol):
     ) -> OAuthTokenSet: ...
 
 
-@runtime_checkable
-class SandboxedStdioSession(Protocol):
+class SandboxedStdioSession(ABC):
     """A persistent, already-isolated byte session; one JSON message per line."""
 
+    @abstractmethod
     async def send_line(self, payload: bytes) -> None: ...
 
+    @abstractmethod
     async def receive_line(self) -> bytes | None: ...
 
+    @abstractmethod
     async def close(self) -> None: ...
 
 
-@runtime_checkable
-class SandboxedStdioSessionFactory(Protocol):
+class SandboxedStdioSessionFactory(ABC):
     """Launch a persistent MCP server through the injected sandbox backend.
 
     The factory must mount ``product_workspace`` only at ``/workspace`` and
     read-only. It receives no host environment or unrestricted path list.
     """
 
+    @abstractmethod
     async def open(
         self,
         config: McpServerConfig,
@@ -152,16 +158,17 @@ InboundNotificationHandler = Callable[
 ]
 
 
-@runtime_checkable
-class McpTransport(Protocol):
+class McpTransport(ABC):
     """Request/notification transport after JSON-RPC correlation."""
 
+    @abstractmethod
     async def start(
         self,
         request_handler: InboundRequestHandler,
         notification_handler: InboundNotificationHandler,
     ) -> None: ...
 
+    @abstractmethod
     async def request(
         self,
         method: str,
@@ -171,6 +178,7 @@ class McpTransport(Protocol):
         timeout_seconds: float,
     ) -> JsonValue: ...
 
+    @abstractmethod
     async def notify(
         self,
         method: str,
@@ -179,6 +187,7 @@ class McpTransport(Protocol):
         context: RequestScope | None = None,
     ) -> None: ...
 
+    @abstractmethod
     async def close(self) -> None: ...
 
 
@@ -191,10 +200,10 @@ class McpHttpResumeCheckpoint:
     updated_at: datetime
 
 
-@runtime_checkable
-class McpHttpResumeStore(Protocol):
+class McpHttpResumeStore(ABC):
     """Persistence port owned by the server, not by the MCP package."""
 
+    @abstractmethod
     async def load(
         self,
         *,
@@ -204,6 +213,7 @@ class McpHttpResumeStore(Protocol):
         endpoint: str,
     ) -> McpHttpResumeCheckpoint | None: ...
 
+    @abstractmethod
     async def save(
         self,
         *,
@@ -217,20 +227,21 @@ class McpHttpResumeStore(Protocol):
     ) -> McpHttpResumeCheckpoint: ...
 
 
-@runtime_checkable
-class ResumableMcpHttpTransport(McpTransport, Protocol):
+class ResumableMcpHttpTransport(McpTransport, ABC):
     """Streamable HTTP transport that can suspend without deleting a session."""
 
     @property
+    @abstractmethod
     def resume_state(self) -> HttpResumeState: ...
 
+    @abstractmethod
     async def close_for_resume(self) -> None: ...
 
 
-@runtime_checkable
-class LegacySseAdapter(Protocol):
+class LegacySseAdapter(ABC):
     """Explicit extension seam for the pre-Streamable-HTTP SSE transport."""
 
+    @abstractmethod
     def create_transport(
         self,
         config: McpServerConfig,
@@ -241,8 +252,8 @@ class LegacySseAdapter(Protocol):
     ) -> McpTransport: ...
 
 
-@runtime_checkable
-class McpTransportFactory(Protocol):
+class McpTransportFactory(ABC):
+    @abstractmethod
     def create(
         self,
         config: McpServerConfig,
@@ -254,10 +265,10 @@ class McpTransportFactory(Protocol):
     ) -> McpTransport: ...
 
 
-@runtime_checkable
-class McpSampler(Protocol):
+class McpSampler(ABC):
     """Privileged callback; production implementation must call ModelGateway."""
 
+    @abstractmethod
     async def create_message(
         self,
         context: McpOperationContext,
@@ -265,8 +276,8 @@ class McpSampler(Protocol):
     ) -> CreateMessageResult | CreateTaskResult: ...
 
 
-@runtime_checkable
-class McpElicitationHandler(Protocol):
+class McpElicitationHandler(ABC):
+    @abstractmethod
     async def elicit(
         self,
         context: McpOperationContext,
@@ -274,23 +285,26 @@ class McpElicitationHandler(Protocol):
     ) -> ElicitationResult | CreateTaskResult: ...
 
 
-@runtime_checkable
-class McpClientTaskHandler(Protocol):
+class McpClientTaskHandler(ABC):
     """Own client-side tasks created for sampling or elicitation callbacks."""
 
+    @abstractmethod
     async def get(self, context: McpOperationContext, task_id: str) -> McpTask: ...
 
+    @abstractmethod
     async def result(self, context: McpOperationContext, task_id: str) -> JsonValue: ...
 
+    @abstractmethod
     async def list(
         self, context: McpOperationContext, cursor: str | None
     ) -> ListTasksResult: ...
 
+    @abstractmethod
     async def cancel(self, context: McpOperationContext, task_id: str) -> McpTask: ...
 
 
-@runtime_checkable
-class McpLogSink(Protocol):
+class McpLogSink(ABC):
+    @abstractmethod
     async def append(
         self,
         context: McpOperationContext | None,
@@ -299,8 +313,8 @@ class McpLogSink(Protocol):
     ) -> None: ...
 
 
-@runtime_checkable
-class McpChangeSink(Protocol):
+class McpChangeSink(ABC):
+    @abstractmethod
     async def changed(
         self,
         context: McpOperationContext | None,

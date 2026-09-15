@@ -8,9 +8,9 @@ import json
 import re
 import time
 import zlib
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Protocol
 from urllib.parse import urljoin
 
 from .models import (
@@ -29,9 +29,10 @@ _REDIRECTS = frozenset({301, 302, 303, 307, 308})
 _CHARSET = re.compile(r"charset\s*=\s*['\"]?([^\s;'\"]+)", re.IGNORECASE)
 
 
-class PdfTextExtractor(Protocol):
+class PdfTextExtractor(ABC):
     """Optional seam for a sandboxed/maintained PDF parser."""
 
+    @abstractmethod
     async def extract(self, content: bytes, *, source_url: str) -> str: ...
 
 
@@ -63,7 +64,9 @@ class FetchTransportRegistry:
         try:
             return self._items[name]
         except KeyError as exc:
-            raise WebPolicyDenied("requested web egress profile is not configured") from exc
+            raise WebPolicyDenied(
+                "requested web egress profile is not configured"
+            ) from exc
 
 
 class _HtmlTextExtractor(HTMLParser):
@@ -81,7 +84,17 @@ class _HtmlTextExtractor(HTMLParser):
             self._ignored_depth += 1
         elif lowered == "title" and self._ignored_depth == 0:
             self._in_title = True
-        elif lowered in {"p", "div", "section", "article", "li", "br", "h1", "h2", "h3"}:
+        elif lowered in {
+            "p",
+            "div",
+            "section",
+            "article",
+            "li",
+            "br",
+            "h1",
+            "h2",
+            "h3",
+        }:
             self.text_parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
@@ -169,7 +182,9 @@ class WebFetchService:
         self._pdf_extractor = pdf_extractor
         self._user_agent = user_agent
 
-    async def fetch(self, url: str, *, egress_profile: str | None = None) -> FetchDocument:
+    async def fetch(
+        self, url: str, *, egress_profile: str | None = None
+    ) -> FetchDocument:
         binding = self._transports.resolve(egress_profile)
         requested_url = url
         current_url = url
@@ -193,7 +208,9 @@ class WebFetchService:
                 max_response_bytes=self._limits.max_compressed_bytes,
             )
             try:
-                response = await asyncio.wait_for(binding.transport.send(request), timeout=remaining)
+                response = await asyncio.wait_for(
+                    binding.transport.send(request), timeout=remaining
+                )
             except TimeoutError as exc:
                 raise WebAccessError("web fetch timed out") from exc
             self._policy.verify_connected_peer(target, response.connected_target_ip)
@@ -241,7 +258,9 @@ class WebFetchService:
             text = _clean_text(_decode(content, declared_type))
         elif media_type == "application/pdf":
             if self._pdf_extractor is None:
-                raise UnsupportedWebContent("PDF extraction requires a configured extractor")
+                raise UnsupportedWebContent(
+                    "PDF extraction requires a configured extractor"
+                )
             text = await self._pdf_extractor.extract(content, source_url=current_url)
         else:
             raise UnsupportedWebContent(f"unsupported web content type: {media_type}")

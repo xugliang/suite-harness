@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.plugins.protocols import PluginPrepareContextProtocol, PluginActivationContextProtocol
+
 import asyncio
 import threading
 from collections.abc import Iterable, Mapping
@@ -40,7 +42,7 @@ from suiteharness.plugins.protocols import (
 _MISSING = object()
 
 
-class PluginPrepareContext:
+class PluginPrepareContext(PluginPrepareContextProtocol):
     """Dependency injection view; permissions here are metadata, not authority."""
 
     def __init__(
@@ -83,7 +85,7 @@ class PluginPrepareContext:
         self._fiber.own(f"prepare:{label}", disposer)
 
 
-class _PendingContributionHandle:
+class _PendingContributionHandle(ContributionHandle):
     def __init__(self, context: PluginActivationContext, key: tuple[ContributionKind, str]) -> None:
         self._context = context
         self._key = key
@@ -98,7 +100,7 @@ class _PendingContributionHandle:
         self._context._revoke(self._key)
 
 
-class PluginActivationContext:
+class PluginActivationContext(PluginActivationContextProtocol):
     """Collect contributions privately; publication happens once, atomically."""
 
     def __init__(

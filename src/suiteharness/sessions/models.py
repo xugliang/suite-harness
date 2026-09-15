@@ -40,6 +40,19 @@ def _identifier(value: str, label: str) -> str:
     return value
 
 
+def memory_invalidation_source(payload: JsonValue) -> tuple[str, int] | None:
+    """Validate an optional ordered business-source stamp, independent of session identity."""
+    if not isinstance(payload, dict):
+        return None
+    namespace, version = payload.get('source_namespace'), payload.get('source_version')
+    if namespace is None and version is None:
+        return None
+    if (not isinstance(namespace, str) or not _IDENTIFIER.fullmatch(namespace)
+            or type(version) is not int or version < 1):
+        raise ValueError('source namespace and positive integer version must be supplied together')
+    return namespace, version
+
+
 def _utc(value: datetime, label: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{label} must be timezone-aware")
@@ -138,6 +151,7 @@ class TranscriptEventType(str, Enum):
     STATUS = "status"
     ERROR = "error"
     CANCEL = "cancel"
+    MEMORY_INVALIDATED = "memory_invalidated"
 
 
 class SessionIdentity(_FrozenModel):
@@ -159,6 +173,8 @@ class SessionRecord(_FrozenModel):
     identity: SessionIdentity
     status: SessionStatus = SessionStatus.ACTIVE
     revision: int = Field(default=0, ge=0)
+    memory_invalidated_revision: int = Field(default=0, ge=0)
+    memory_source_versions: dict[str, int] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

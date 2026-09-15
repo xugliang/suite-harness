@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
-from typing import Protocol
 
 from .models import FeishuAuthenticationError, FeishuPayloadError
 
@@ -19,7 +19,7 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
     return None
 
 
-class RawEventDecryptor(Protocol):
+class RawEventDecryptor(ABC):
     """Decrypt a raw callback envelope and return the inner JSON bytes.
 
     Implementations may parse only the provider's encrypted *envelope* in
@@ -27,16 +27,18 @@ class RawEventDecryptor(Protocol):
     after this method returns.
     """
 
+    @abstractmethod
     async def decrypt(self, body: bytes) -> bytes: ...
 
 
-class RawSignatureVerifier(Protocol):
+class RawSignatureVerifier(ABC):
     """Authenticate headers and the exact request bytes before JSON parsing."""
 
+    @abstractmethod
     def verify(self, headers: Mapping[str, str], body: bytes) -> None: ...
 
 
-class FeishuHeaderSignatureVerifier:
+class FeishuHeaderSignatureVerifier(RawSignatureVerifier):
     """Verify Feishu's SHA-256 callback signature over the untouched body.
 
     Feishu defines the input as ``timestamp + nonce + encrypt_key + body``.
@@ -85,17 +87,19 @@ class FeishuHeaderSignatureVerifier:
             raise FeishuAuthenticationError("invalid Feishu callback signature")
 
 
-class IdentityDecryptor:
+class IdentityDecryptor(RawEventDecryptor):
     """Explicit no-encryption implementation, useful for verified plaintext events."""
 
     async def decrypt(self, body: bytes) -> bytes:
         return body
 
 
-class BoundedDecryptor:
+class BoundedDecryptor(RawEventDecryptor):
     """Defend the parser from a decryptor returning an oversized plaintext."""
 
-    def __init__(self, delegate: RawEventDecryptor, *, max_plaintext_bytes: int) -> None:
+    def __init__(
+        self, delegate: RawEventDecryptor, *, max_plaintext_bytes: int
+    ) -> None:
         if max_plaintext_bytes <= 0:
             raise ValueError("max_plaintext_bytes must be positive")
         self._delegate = delegate

@@ -28,7 +28,7 @@ def _within(path: str, root: str) -> bool:
     return True
 
 
-class _NamespaceRuntime:
+class _NamespaceRuntime(PluginRuntime):
     def __init__(self, runtime: PluginRuntime, namespace: str) -> None:
         self._runtime = runtime
         self._namespace = namespace

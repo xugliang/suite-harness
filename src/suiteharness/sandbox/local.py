@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.sandbox.protocols import SandboxBackend
+
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -21,7 +23,7 @@ class LocalDevelopmentConfig:
             )
 
 
-class LocalDevelopmentSandboxBackend:
+class LocalDevelopmentSandboxBackend(SandboxBackend):
     """Not a security boundary; never valid for a production deployment."""
 
     def __init__(

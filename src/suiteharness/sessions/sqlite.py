@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from suiteharness.sessions.protocols import SessionStore
+
 import asyncio
 import hashlib
 import json
@@ -33,6 +35,7 @@ from suiteharness.sessions.models import (
     TranscriptEvent,
     TranscriptEventType,
     canonical_json,
+    memory_invalidation_source,
     utc_now,
 )
 
@@ -56,7 +59,7 @@ def _key(identity: SessionIdentity) -> tuple[str, str, str, str, str]:
     )
 
 
-class SQLiteSessionStore:
+class SQLiteSessionStore(SessionStore):
     """Transactional store with durable idempotency and optimistic concurrency."""
 
     def __init__(
@@ -96,6 +99,23 @@ class SQLiteSessionStore:
         self._clock = clock
         self._limits = limits or SessionStoreLimits()
         self._initialize()
+        # Serialize first-upgrade workers before detecting missing columns.
+        # Both additions commit together while preserving existing audit rows.
+        self._connection.execute('BEGIN IMMEDIATE')
+        try:
+            columns = {row['name'] for row in self._connection.execute('PRAGMA table_info(sessions)')}
+            if 'memory_invalidated_revision' not in columns:
+                self._connection.execute(
+                    'ALTER TABLE sessions ADD COLUMN memory_invalidated_revision INTEGER NOT NULL DEFAULT 0'
+                )
+            if 'memory_source_versions' not in columns:
+                self._connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN memory_source_versions TEXT NOT NULL DEFAULT '{}'"
+                )
+            self._connection.commit()
+        except BaseException:
+            self._connection.rollback()
+            raise
 
     def _initialize(self) -> None:
         self._connection.executescript(
@@ -328,6 +348,8 @@ class SQLiteSessionStore:
         occurred_at: datetime | None = None,
     ) -> TranscriptEvent:
         event_type = TranscriptEventType(event_type)
+        source = (memory_invalidation_source(payload)
+                  if event_type is TranscriptEventType.MEMORY_INVALIDATED else None)
         payload_json = canonical_json(payload)
         if len(payload_json.encode("utf-8")) > self._limits.max_transcript_payload_bytes:
             raise SessionPayloadTooLargeError(
@@ -352,6 +374,14 @@ class SQLiteSessionStore:
                             )
                         self._connection.commit()
                         return self._event(identity, prior)
+                if source is not None and source[1] <= record.memory_source_versions.get(source[0], 0):
+                    prior = self._connection.execute(
+                        f"SELECT * FROM transcript_events WHERE {_KEY_PREDICATE} AND revision=?",
+                        (*_key(identity), record.memory_invalidated_revision),
+                    ).fetchone()
+                    assert prior is not None
+                    self._connection.commit()
+                    return self._event(identity, prior)
                 self._check_revision(record, expected_revision)
                 per_session = int(
                     self._connection.execute(
@@ -410,6 +440,13 @@ class SQLiteSessionStore:
                     max(record.updated_at, event.occurred_at),
                     record.status,
                 )
+                if event_type is TranscriptEventType.MEMORY_INVALIDATED:
+                    versions = (record.memory_source_versions if source is None else
+                                {**record.memory_source_versions, source[0]: source[1]})
+                    self._connection.execute(
+                        f'UPDATE sessions SET memory_invalidated_revision=?, memory_source_versions=? WHERE {_KEY_PREDICATE}',
+                        (revision, canonical_json(versions), *_key(identity)),
+                    )
                 self._connection.commit()
                 return event
             except sqlite3.IntegrityError as exc:
@@ -668,6 +705,8 @@ class SQLiteSessionStore:
             identity=identity,
             status=SessionStatus(row["status"]),
             revision=int(row["revision"]),
+            memory_invalidated_revision=int(row['memory_invalidated_revision']),
+            memory_source_versions=json.loads(row['memory_source_versions']),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )

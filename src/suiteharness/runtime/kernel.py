@@ -14,14 +14,17 @@ owned by the product activation's :class:`~suiteharness.runtime.effects.EffectSc
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 import asyncio
 import secrets
-from collections.abc import Awaitable, Callable, Iterable, Mapping
-from contextlib import AbstractAsyncContextManager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import AbstractAsyncContextManager, aclosing
+from suiteharness.execution.events import RunEvent
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Protocol, TypeAlias, TypeVar, runtime_checkable
+from typing import Any, TypeAlias, TypeVar
 
 from pydantic import BaseModel
 
@@ -41,8 +44,10 @@ from suiteharness.execution.protocols import (
     ToolAuthorizationPolicy,
     ToolHandler,
     ToolRegistry,
+    ScopedToolRegistry,
 )
 from suiteharness.execution.runner import ExecutionPolicy, ExecutionRunner
+from suiteharness.execution.results import ToolResultStore
 from suiteharness.memory.in_memory import (
     InMemoryCustomer360Provider,
     InMemoryProfileDirectory,
@@ -86,19 +91,6 @@ InstallResourceT = TypeVar("InstallResourceT")
 InstallServiceT = TypeVar("InstallServiceT")
 
 
-@runtime_checkable
-class ScopedToolRegistry(ToolRegistry, Protocol):
-    """Root-owned registry surface exposed narrowly during trusted install."""
-
-    def register_owned(
-        self,
-        scope: ScopePath,
-        effects: EffectScope,
-        spec: ToolSpec,
-        handler: ToolHandler,
-    ) -> object: ...
-
-
 @dataclass(frozen=True, slots=True)
 class PreparedProduct:
     """Side-effect-free preparation result for one resolved product.
@@ -132,12 +124,12 @@ class PreparedProduct:
         object.__setattr__(self, "bindings", MappingProxyType(dict(self.bindings)))
 
 
-@runtime_checkable
-class ProductActivator(Protocol):
+class ProductActivator(ABC):
     """Trusted activation code, intentionally separate from descriptor packages."""
 
     descriptor: ProductDescriptor
 
+    @abstractmethod
     async def prepare(self, product: ResolvedCustomerProduct) -> PreparedProduct: ...
 
 
@@ -333,6 +325,16 @@ class ActivatedCustomerBundle:
         return ExecutionStrategies.from_bindings(self.product(product_id).bindings)
 
     async def run(self, request: RunRequest) -> RunResult:
+        result = None
+        async with aclosing(self.stream(request)) as source:
+            async for event in source:
+                if event.result is not None:
+                    result = event.result
+        if result is None:
+            raise RuntimeError('activation stream ended without a result')
+        return result
+
+    async def stream(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         """Run with strategies selected from the request's exact product scope.
 
         This is the application-facing path.  It prevents a host adapter from
@@ -388,7 +390,9 @@ class ActivatedCustomerBundle:
                     cause=exc,
                     product_id=request.scope.product_id,
                 ) from exc
-            return await self.runner.run(request, strategies)
+            async with aclosing(self.runner.stream(request, strategies)) as source:
+                async for event in source:
+                    yield event
         finally:
             await lease.leave()
 
@@ -426,6 +430,7 @@ class HarnessKernel:
         tool_authorization_policy: ToolAuthorizationPolicy | None = None,
         interactive_approvals: InteractiveApprovalBroker | None = None,
         customer360_factory: Customer360Factory | None = None,
+        tool_results: ToolResultStore | None = None,
     ) -> None:
         if root is not None and not isinstance(root, RootContext):
             raise TypeError("root must be a RootContext")
@@ -447,6 +452,7 @@ class HarnessKernel:
             policy=execution_policy,
             authorization_policy=tool_authorization_policy,
             interactive_approvals=interactive_approvals,
+            tool_results=tool_results,
         )
         self._customer360_factory = customer360_factory or InMemoryCustomer360Provider
         self._slots: dict[str, _ActivationSlot] = {}

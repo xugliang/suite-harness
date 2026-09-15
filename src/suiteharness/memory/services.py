@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from suiteharness.runtime.scopes import ScopeKind, ServiceKey
 
+from .session_memory import SessionConversationMemory
 from .protocols import Customer360Provider, EvidenceProvider, KnowledgeProvider, ProfileProvider
 
 # Private product data capabilities must be bound separately for every ProductContext.
@@ -34,8 +35,18 @@ CUSTOMER360_PROVIDER = ServiceKey(
     declared_at=ScopeKind.TENANT,
 )
 
+# Conversation memory is product-owned.  Hosts should bind a product-specific
+# provider when one exists; otherwise the runtime resolver supplies the generic
+# provider configured by the deployment.
+CONVERSATION_MEMORY = ServiceKey(
+    name="memory.conversation",
+    contract=SessionConversationMemory,
+    declared_at=ScopeKind.PRODUCT,
+)
+
 __all__ = [
     "CUSTOMER360_PROVIDER",
+    "CONVERSATION_MEMORY",
     "EVIDENCE_PROVIDER",
     "KNOWLEDGE_PROVIDER",
     "PROFILE_PROVIDER",
