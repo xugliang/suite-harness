@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 
-from suiteharness.models.usage import UsageLedger
-from suiteharness.models.context import ContextManager, PreparedContext, ContextCapacityError
-
+from suiteharness.models.context import ContextCapacityError, ContextManager, PreparedContext
 from suiteharness.models.errors import ModelErrorCode, ModelProviderError
 from suiteharness.models.protocols import ModelProvider, SecretResolver
 from suiteharness.models.registry import ProviderRegistry
@@ -24,6 +24,7 @@ from suiteharness.models.types import (
     ModelStreamEvent,
     ModelStreamEventType,
 )
+from suiteharness.models.usage import UsageLedger
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -109,6 +110,33 @@ class ModelGateway:
                 ModelErrorCode.PROFILE_NOT_FOUND,
                 f"model route {route_id!r} was not found",
             ) from exc
+
+    def resume_fingerprint(self, route_id: str) -> str:
+        """Bind effective route configuration without resolving or exposing secrets."""
+        route = self.route(route_id)
+        profiles = []
+        for profile_id in (route.primary_profile, *route.fallback_profiles):
+            profile = self.profile(profile_id)
+            descriptor = self._registry.descriptor(profile.provider_id)
+            if descriptor is None:
+                raise ModelProviderError(
+                    ModelErrorCode.PROVIDER_NOT_FOUND,
+                    f"provider {profile.provider_id!r} was not found",
+                )
+            profile_data = profile.model_dump(mode='json')
+            profile_data['allowed_models'] = sorted(profile.allowed_models)
+            provider_data = descriptor.model_dump(mode='json')
+            provider_data['aliases'] = sorted(descriptor.aliases)
+            profiles.append({
+                'profile': profile_data,
+                'provider': provider_data,
+                'effective_endpoint': profile.base_url or descriptor.default_base_url,
+            })
+        payload = json.dumps(
+            {'route': route.model_dump(mode='json'), 'profiles': profiles},
+            sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False,
+        )
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
     def _provider(self, profile: ModelProfile) -> ModelProvider:
         provider = self._providers.get(profile.profile_id)

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from suiteharness.execution.protocols import ScopedToolRegistry, CapabilityAuthority, ApprovalStore, AuditJournal
-
 import asyncio
 import hashlib
 import secrets
@@ -25,7 +23,11 @@ from suiteharness.execution.models import (
     ToolSpec,
 )
 from suiteharness.execution.protocols import (
+    ApprovalStore,
+    AuditJournal,
+    CapabilityAuthority,
     RegisteredTool,
+    ScopedToolRegistry,
     ToolHandler,
     registration_candidates,
 )
@@ -287,6 +289,8 @@ class InMemoryCapabilityAuthority(CapabilityAuthority):
         self._grant_owners: dict[str, str | None] = {}
         self._active_owners: dict[tuple[str, str], str] = {}
         self._owner_grants: dict[str, set[str]] = {}
+        self._grant_parents: dict[str, str] = {}
+        self._grant_children: dict[str, set[str]] = {}
         self._lock = asyncio.Lock()
 
     async def register(self, grant: CapabilityGrant) -> None:
@@ -327,11 +331,84 @@ class InMemoryCapabilityAuthority(CapabilityAuthority):
         await self.register(grant)
         return grant
 
+    async def issue_child(
+        self,
+        parent_grant_id: str,
+        scope: ScopePath,
+        *,
+        tool_identities: tuple[ToolIdentity, ...],
+        capabilities: frozenset[str],
+        principal_id: str,
+        lifetime: timedelta,
+    ) -> CapabilityGrant:
+        """Atomically issue an attenuated grant rooted in a live parent grant."""
+
+        if scope.kind is not ScopeKind.AGENT:
+            raise ValueError("child grants require an agent scope")
+        if lifetime <= timedelta(0):
+            raise ValueError("grant lifetime must be positive")
+        async with self._lock:
+            issued_at = _now()
+            parent = self._grants.get(parent_grant_id)
+            if parent is None or not self._grant_live_locked(parent_grant_id, issued_at):
+                raise ValueError("parent grant is not active")
+            if (parent.tenant_id, parent.product_id) != (
+                scope.tenant_id, scope.product_id
+            ):
+                raise ValueError("child grant cannot change tenant or product")
+            if parent.principal_id is not None and principal_id != parent.principal_id:
+                raise ValueError("child grant cannot change principal")
+            identities = frozenset(tool_identities)
+            if not identities <= parent.tool_identities:
+                raise ValueError("child grant cannot add tool identities")
+            if not capabilities <= parent.capabilities:
+                raise ValueError("child grant cannot add capabilities")
+
+            grant = CapabilityGrant(
+                grant_id=f"grant-{secrets.token_urlsafe(24)}",
+                tenant_id=parent.tenant_id,
+                product_id=parent.product_id,
+                tool_identities=identities,
+                capabilities=capabilities,
+                principal_id=principal_id,
+                issued_at=issued_at,
+                expires_at=min(parent.expires_at, issued_at + lifetime),
+            )
+            if grant.grant_id in self._grants:
+                raise ValueError(f"duplicate capability grant: {grant.grant_id}")
+            self._grants[grant.grant_id] = grant
+            owner = self._grant_owners[parent_grant_id]
+            self._grant_owners[grant.grant_id] = owner
+            if owner is not None:
+                self._owner_grants.setdefault(owner, set()).add(grant.grant_id)
+            self._grant_parents[grant.grant_id] = parent_grant_id
+            self._grant_children.setdefault(parent_grant_id, set()).add(grant.grant_id)
+            return grant
+
+    def _grant_live_locked(self, grant_id: str, now: datetime) -> bool:
+        """Validate every ancestor, including its activation and expiry."""
+
+        current_id: str | None = grant_id
+        while current_id is not None:
+            grant = self._grants.get(current_id)
+            if grant is None or grant.expires_at <= now:
+                return False
+            current_owner = self._active_owners.get(
+                (grant.tenant_id, grant.product_id)
+            )
+            grant_owner = self._grant_owners.get(current_id)
+            if grant_owner != current_owner:
+                return False
+            current_id = self._grant_parents.get(current_id)
+        return True
+
     async def resolve(self, grant_id: str) -> CapabilityGrant | None:
         async with self._lock:
             grant = self._grants.get(grant_id)
             if grant is None:
                 return None
+            if grant_id in self._grant_parents:
+                return grant if self._grant_live_locked(grant_id, _now()) else None
             current_owner = self._active_owners.get(
                 (grant.tenant_id, grant.product_id)
             )
@@ -344,15 +421,31 @@ class InMemoryCapabilityAuthority(CapabilityAuthority):
 
     async def revoke(self, grant_id: str) -> bool:
         async with self._lock:
-            grant = self._grants.pop(grant_id, None)
-            owner = self._grant_owners.pop(grant_id, None)
+            if grant_id not in self._grants:
+                return False
+            self._revoke_subtree_locked(grant_id)
+            return True
+
+    def _revoke_subtree_locked(self, grant_id: str) -> None:
+        pending = [grant_id]
+        while pending:
+            current_id = pending.pop()
+            pending.extend(self._grant_children.pop(current_id, ()))
+            parent_id = self._grant_parents.pop(current_id, None)
+            if parent_id is not None:
+                children = self._grant_children.get(parent_id)
+                if children is not None:
+                    children.discard(current_id)
+                    if not children:
+                        self._grant_children.pop(parent_id, None)
+            self._grants.pop(current_id, None)
+            owner = self._grant_owners.pop(current_id, None)
             if owner is not None:
                 owned = self._owner_grants.get(owner)
                 if owned is not None:
-                    owned.discard(grant_id)
+                    owned.discard(current_id)
                     if not owned:
                         self._owner_grants.pop(owner, None)
-            return grant is not None
 
     async def bind_activation(
         self,
@@ -386,10 +479,11 @@ class InMemoryCapabilityAuthority(CapabilityAuthority):
             ]
             for key in keys:
                 self._active_owners.pop(key, None)
-            grant_ids = self._owner_grants.pop(owner_token, set())
+            grant_ids = tuple(self._owner_grants.get(owner_token, ()))
             for grant_id in grant_ids:
-                self._grants.pop(grant_id, None)
-                self._grant_owners.pop(grant_id, None)
+                if grant_id in self._grants:
+                    self._revoke_subtree_locked(grant_id)
+            self._owner_grants.pop(owner_token, None)
 
 
 class InMemoryApprovalStore(ApprovalStore):

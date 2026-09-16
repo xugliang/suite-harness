@@ -542,6 +542,8 @@ tenants/{tenant}/products/{product}
 
 SQLite 实现用事务、修订号 CAS、幂等键和持久运行 claim 防并发覆盖/重复执行；恢复返回最近检查点及其后的事件。不同进程竞争同一消息时只有一个能取得执行权；租约过期后的运行标记为不确定而不是重新分配。会话/转录/claim 配额在 `BEGIN IMMEDIATE` 事务中检查，检查点按条数和累计 UTF-8 字节裁剪。
 
+运行恢复点使用独立的 `max_resume_*` 容量配置，与普通 `max_checkpoint_*` 快照预算分开。默认单点最多 512 KiB（包含完整 UTF-8 外层记录），每会话最多 8 条、2 MiB，全库最多 10,000 条、128 MiB；达到预算淘汰较旧恢复点。SQLite 重开及后续恢复读写、消息流水写入时清理超过 300 秒的记录，成功/失败终态清理对应恢复点，已取消运行的点保留到有效期或容量淘汰。该清理不删除原始消息、运行声明和防重复执行记录。
+
 ### `sessions/errors.py`
 
 区分身份冲突、修订冲突、幂等冲突、数据损坏和超限。
@@ -614,6 +616,8 @@ SQLite 实现用事务、修订号 CAS、幂等键和持久运行 claim 防并�
 
 过滤机器人/应用消息，群聊要求提及机器人，执行事件去重并转换为内部消息。可注入持久化去重器。claim 成功后的规范化、产品分发、所有回复和完成标记受一个总处理时限约束；去重器的 processing lease 不严格大于该时限时构造直接失败，避免首个回调仍运行时供应商重投被再次领取。
 
+规范化后的精确命令 `/停止` 只请求停止当前已认证作用域中的唯一活跃运行；`/停止 <provider-message-id>` 将提供方消息 ID 交给已认证 dispatcher 选择目标运行。命令不进入模型分发或长期记忆。它只用从已验证事件派生的会话/群线程作用域，绝不接受客户端声明的作用域；成功和幂等状态由现有终态飞书 sink 发送简短中文确认，未找到、歧义、拒绝或异常发送不回显内部详情的 FAILED。重复事件在调用停止和发送确认前即被去重。
+
 ### `channels/feishu/client.py`
 
 管理飞书 tenant token 的单飞缓存和文本消息发送，避免并发重复刷新。
@@ -628,7 +632,23 @@ SQLite 实现用事务、修订号 CAS、幂等键和持久运行 claim 防并�
 
 ### `channels/websocket/models.py`
 
-定义客户端 message、approval decision、ping 帧和服务器 ack/event/approval/error/pong 帧，严格区分类型和大小。
+定义客户端 `message`、`approval_decision`、`ping`、`stop`、`history`、`continue` 帧，以及服务器 `ack`、`event`、`approval_required`、`approval_decision_result`、`error`、`pong`、`stop_result`、`history_result` 帧，严格区分类型和大小。
+
+控制帧都携带 `conversation_id` 和可选 `product_id`，目标由服务器在认证后的精确会话作用域中解析：
+
+| 客户端帧 | 专用字段 | 服务器响应 |
+| --- | --- | --- |
+| `stop` | `stop_id`、`target_client_message_id` | `stop_result` 回显 `stop_id`；`outcome` 为 `requested`、`already_requested`、`already_finished` 或 `not_found` |
+| `history` | `history_id`、`limit`（1–1000）、可选 `before_sequence` | `history_result` 回显 `history_id`，返回有界的 `user`、`assistant`、`cancel` 展示事件及分页状态 |
+| `continue` | 新的 `client_message_id`、`target_client_message_id` | 复用 `ack` / `event` 流，创建新 `run_id`；不提供独立的 `continue_result` |
+
+`requested` 表示停止意图已持久化，运行终态通过原消息事件流确认。运行观察器在无增量输出时也检查停止意图，迟到成功受终态围栏约束，只能落为 `CANCEL`。取消片段受字节上限约束并标记不完整；Web 历史投影另有长度限制。历史只供展示，不把取消片段重新加入模型上下文，也不向客户端公开内部安全检查点。
+
+历史第一页不传 `before_sequence`，返回最新记录，页内按时间顺序排列。`has_more=true` 时，将响应 `next_cursor` 原样作为下一请求的 `before_sequence`，读取严格早于该序列的记录；游标绑定本次重新授权的会话选择，不能改变身份。分页能越过最近 1000 条存储记录，过滤内部审计项、续跑占位输入和已失效历史。每页按实际 JSON UTF-8 字节数控制大小，因此实际返回数量可少于 `limit`，未返回的边界记录保留给下一页。单条内容超过帧容量时返回 `truncated=true` 的预览（结构化 output 的预览为字符串），并继续提供可推进的游标。旧适配器无需实现分页：响应明确标识 `pagination_supported=false`，`has_more` 和 `next_cursor` 为 null，只提供初始历史，不接受游标请求。响应顶层 `truncated` 表示本次展示因字节预算被缩短。
+
+续跑只接受服务器保存的、仍有效的最近取消运行安全点：原用户轮次必须仍为最新，记忆失效水位和来源版本必须一致，安全点有效期为 300 秒。重新认证和授权后签发新的 grant，续跑强制只读，并由执行器重验内置工具白名单、工具身份、模型路由和提示词摘要；Web 搜索/抓取观察结果另受 300 秒有效期限制。相同续跑消息 ID 在执行中重试返回带 `replayed` 的 `run_in_progress`，完成后重放终态，不再次执行。
+
+续跑的幂等摘要同时绑定操作类型和原任务：同一个消息 ID 改换续跑目标，或改作普通消息，会报内容冲突。保存的只读工具结果带有原始调用参数；复用前重新验证当前参数规则、权限策略和审批要求。当前策略拒绝、需要审批或校验失败时，不把旧结果发送给模型。模型恢复指纹包含主线路、后备线路、服务商定义、适配器及实际生效端点，默认地址变化也会阻止旧检查点续跑。升级前缺少调用参数或使用旧模型指纹的记录可能被拒绝恢复，此时重新提问即可。
 
 ### `channels/websocket/auth.py`
 
@@ -637,6 +657,8 @@ SQLite 实现用事务、修订号 CAS、幂等键和持久运行 claim 防并�
 ### `channels/websocket/server.py`
 
 握手前核对精确 Origin 和认证，每个非断开客户端帧前重验原凭据；可注入 `WebSocketSessionRevalidator` 逐帧查询退出、吊销、账号状态和最新角色。复核返回空值、tenant/主体/角色与握手快照不同、超时或异常时均失败关闭，并取消该连接内的在途运行。服务还限制连接并发、帧大小和消息数，执行连接内去重，并把审批挑战只投递给相同公司与主体的 socket。
+
+`stop`、`history` 和 `continue` 与普通消息一样逐帧复核身份、路由产品并检查产品 ACL；共享会话还须通过成员 ACL。客户端提交的目标消息 ID 不能替代这些检查，也不能直接指定内部 `run_id`、安全检查点或其他主体的会话所有者。
 
 ### `channels/websocket/starlette.py`
 

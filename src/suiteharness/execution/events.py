@@ -1,4 +1,4 @@
-"""Public live output; identities and terminal results belong to the runner."""
+"""Runner events; checkpoints are internal and must never be sent to clients."""
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
@@ -22,7 +22,8 @@ class RunEvent(BaseModel):
     run_id: str
     sequence: int = Field(ge=1)
     kind: Literal['started', 'delta', 'status', 'usage', 'compact_started',
-                  'compact_completed', 'tool_started', 'tool_completed', 'completed', 'failed', 'cancelled']
+                  'compact_completed', 'tool_started', 'tool_completed', 'completed', 'failed', 'cancelled',
+                  'checkpoint']
     text: str = ''
     data: dict[str, JsonValue] = Field(default_factory=dict)
     result: RunResult | None = None

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from suiteharness.sessions.protocols import SessionStore
-
 import asyncio
 import hashlib
 import json
@@ -25,6 +23,9 @@ from suiteharness.sessions.errors import (
     SessionRevisionConflictError,
 )
 from suiteharness.sessions.models import (
+    RESUME_POINT_TTL_SECONDS,
+    RunResumePoint,
+    RunStopOutcome,
     SessionCheckpoint,
     SessionIdentity,
     SessionRecord,
@@ -35,9 +36,13 @@ from suiteharness.sessions.models import (
     TranscriptEvent,
     TranscriptEventType,
     canonical_json,
+    finished_resume_run_id,
     memory_invalidation_source,
+    safe_resume_point,
     utc_now,
+    validate_transcript_page,
 )
+from suiteharness.sessions.protocols import SessionStore
 
 _KEY_COLUMNS = "tenant_id, product_id, agent_id, session_id, principal_id"
 _KEY_PREDICATE = "tenant_id=? AND product_id=? AND agent_id=? AND session_id=? AND principal_id=?"
@@ -112,6 +117,17 @@ class SQLiteSessionStore(SessionStore):
                 self._connection.execute(
                     "ALTER TABLE sessions ADD COLUMN memory_source_versions TEXT NOT NULL DEFAULT '{}'"
                 )
+            resume_columns = {
+                row['name'] for row in self._connection.execute('PRAGMA table_info(session_run_resume_points)')
+            }
+            if 'point_bytes' not in resume_columns:
+                self._connection.execute(
+                    'ALTER TABLE session_run_resume_points ADD COLUMN point_bytes INTEGER NOT NULL DEFAULT 0'
+                )
+                self._connection.execute(
+                    'UPDATE session_run_resume_points SET point_bytes=LENGTH(CAST(point_json AS BLOB))'
+                )
+            self._expire_resume_points(self._now())
             self._connection.commit()
         except BaseException:
             self._connection.rollback()
@@ -202,6 +218,44 @@ class SQLiteSessionStore(SessionStore):
                     tenant_id, product_id, agent_id, session_id, principal_id
                 ) REFERENCES sessions(
                     tenant_id, product_id, agent_id, session_id, principal_id
+                ) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS session_run_resume_points (
+                tenant_id TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                point_json TEXT NOT NULL,
+                point_bytes INTEGER NOT NULL,
+                created_at_us INTEGER NOT NULL,
+                PRIMARY KEY (
+                    tenant_id, product_id, agent_id, session_id, principal_id, run_id
+                ),
+                FOREIGN KEY (
+                    tenant_id, product_id, agent_id, session_id, principal_id, run_id
+                ) REFERENCES session_run_claims(
+                    tenant_id, product_id, agent_id, session_id, principal_id, run_id
+                ) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS session_run_resume_points_expiry
+                ON session_run_resume_points(created_at_us);
+            CREATE TABLE IF NOT EXISTS session_run_stops (
+                tenant_id TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                requested_at_us INTEGER NOT NULL,
+                PRIMARY KEY (
+                    tenant_id, product_id, agent_id, session_id, principal_id, run_id
+                ),
+                FOREIGN KEY (
+                    tenant_id, product_id, agent_id, session_id, principal_id, run_id
+                ) REFERENCES session_run_claims(
+                    tenant_id, product_id, agent_id, session_id, principal_id, run_id
                 ) ON DELETE CASCADE
             );
             """
@@ -336,6 +390,180 @@ class SQLiteSessionStore(SessionStore):
                 self._connection.rollback()
                 raise
 
+    async def request_stop(
+        self,
+        identity: SessionIdentity,
+        *,
+        run_id: str,
+    ) -> RunStopOutcome:
+        self._validate_run_id(run_id)
+        async with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                now_us = self._epoch_us(self._now())
+                claim = self._connection.execute(
+                    f"SELECT claim_state, expires_at_us FROM session_run_claims "
+                    f"WHERE {_KEY_PREDICATE} AND run_id=?",
+                    (*_key(identity), run_id),
+                ).fetchone()
+                if claim is None:
+                    self._connection.commit()
+                    return RunStopOutcome.NOT_FOUND
+                if claim["claim_state"] != "active" or int(claim["expires_at_us"]) <= now_us:
+                    self._connection.commit()
+                    return RunStopOutcome.ALREADY_FINISHED
+                cursor = self._connection.execute(
+                    f"INSERT OR IGNORE INTO session_run_stops "
+                    f"({_KEY_COLUMNS}, run_id, requested_at_us) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (*_key(identity), run_id, now_us),
+                )
+                self._connection.commit()
+                return (
+                    RunStopOutcome.REQUESTED
+                    if cursor.rowcount == 1
+                    else RunStopOutcome.ALREADY_REQUESTED
+                )
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def stop_requested(
+        self,
+        identity: SessionIdentity,
+        *,
+        run_id: str,
+    ) -> bool:
+        self._validate_run_id(run_id)
+        async with self._lock:
+            row = self._connection.execute(
+                f"SELECT 1 FROM session_run_stops WHERE {_KEY_PREDICATE} AND run_id=?",
+                (*_key(identity), run_id),
+            ).fetchone()
+            return row is not None
+
+    async def active_run_ids(
+        self,
+        identity: SessionIdentity,
+        *,
+        limit: int = 4,
+    ) -> tuple[str, ...]:
+        self._validate_active_run_limit(limit)
+        async with self._lock:
+            now_us = self._epoch_us(self._now())
+            rows = self._connection.execute(
+                f"SELECT run_id FROM session_run_claims WHERE {_KEY_PREDICATE} "
+                "AND claim_state='active' AND expires_at_us>? "
+                "ORDER BY claimed_at_us, run_id LIMIT ?",
+                (*_key(identity), now_us, limit),
+            ).fetchall()
+            return tuple(str(row["run_id"]) for row in rows)
+
+    async def save_resume_point(
+        self, identity: SessionIdentity, point: RunResumePoint,
+    ) -> RunResumePoint | None:
+        checked = safe_resume_point(point)
+        if checked is None or checked.identity != identity:
+            return None
+        point_json = checked.model_dump_json()
+        point_bytes = len(point_json.encode("utf-8"))
+        if point_bytes > self._limits.max_resume_point_bytes:
+            return None
+        async with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                # Both the lease and TTL are evaluated after SQLite acquired its write lock.
+                now = self._now()
+                self._expire_resume_points(now)
+                key = (*_key(identity), checked.run_id)
+                claim = self._connection.execute(
+                    f"SELECT claim_state, expires_at_us FROM session_run_claims "
+                    f"WHERE {_KEY_PREDICATE} AND run_id=?", key,
+                ).fetchone()
+                stop = self._connection.execute(
+                    f"SELECT 1 FROM session_run_stops WHERE {_KEY_PREDICATE} AND run_id=?", key,
+                ).fetchone()
+                prior = self._connection.execute(
+                    f"SELECT created_at_us FROM session_run_resume_points WHERE {_KEY_PREDICATE} AND run_id=?", key,
+                ).fetchone()
+                if (claim is None or claim["claim_state"] != "active"
+                        or int(claim["expires_at_us"]) <= self._epoch_us(now) or stop is not None
+                        or not 0 <= (now - checked.created_at).total_seconds() < RESUME_POINT_TTL_SECONDS
+                        or (prior is not None and self._epoch_us(checked.created_at) < int(prior["created_at_us"]))):
+                    self._connection.commit()
+                    return None
+                record = self._require(identity)
+                if (checked.memory_invalidated_revision != record.memory_invalidated_revision
+                        or checked.memory_source_versions != record.memory_source_versions):
+                    self._connection.commit()
+                    return None
+                self._connection.execute(
+                    f"INSERT INTO session_run_resume_points ({_KEY_COLUMNS}, run_id, point_json, point_bytes, created_at_us) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    f"ON CONFLICT ({_KEY_COLUMNS}, run_id) DO UPDATE SET "
+                    "point_json=excluded.point_json, point_bytes=excluded.point_bytes, created_at_us=excluded.created_at_us",
+                    (*key, point_json, point_bytes, self._epoch_us(checked.created_at)),
+                )
+                keep_row = self._connection.execute(
+                    f"SELECT rowid FROM session_run_resume_points WHERE {_KEY_PREDICATE} AND run_id=?", key,
+                ).fetchone()
+                self._trim_resume_points(identity, int(keep_row["rowid"]))
+                self._connection.commit()
+                return checked
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def get_resume_point(
+        self, identity: SessionIdentity, *, run_id: str,
+    ) -> RunResumePoint | None:
+        self._validate_run_id(run_id)
+        async with self._lock:
+            self._expire_resume_points(self._now())
+            row = self._connection.execute(
+                f"SELECT point_json FROM session_run_resume_points WHERE {_KEY_PREDICATE} AND run_id=?",
+                (*_key(identity), run_id),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                point = safe_resume_point(RunResumePoint.model_validate_json(row["point_json"]))
+            except ValueError:
+                return None
+            if (point is None or point.identity != identity or point.run_id != run_id
+                    or not 0 <= (self._now() - point.created_at).total_seconds() < RESUME_POINT_TTL_SECONDS):
+                return None
+            return point
+
+    def _expire_resume_points(self, now: datetime) -> None:
+        self._connection.execute(
+            "DELETE FROM session_run_resume_points WHERE created_at_us<=?",
+            (self._epoch_us(now - timedelta(seconds=RESUME_POINT_TTL_SECONDS)),),
+        )
+
+    def _trim_resume_points(self, identity: SessionIdentity, keep_rowid: int) -> None:
+        """Evict cache data under the write transaction, preserving durable fences."""
+        for scope, max_count, max_bytes in (
+            (identity, self._limits.max_resume_points_per_session, self._limits.max_resume_bytes_per_session),
+            (None, self._limits.max_resume_points_total, self._limits.max_resume_bytes_total),
+        ):
+            where = f"WHERE {_KEY_PREDICATE}" if scope is not None else ""
+            rows = self._connection.execute(
+                f"SELECT rowid, point_bytes FROM session_run_resume_points {where} ORDER BY created_at_us, rowid",
+                _key(scope) if scope is not None else (),
+            ).fetchall()
+            count, size = len(rows), sum(int(row["point_bytes"]) for row in rows)
+            removed = []
+            for row in rows:
+                if count <= max_count and size <= max_bytes:
+                    break
+                if int(row["rowid"]) != keep_rowid:
+                    count -= 1
+                    size -= int(row["point_bytes"])
+                    removed.append((int(row["rowid"]),))
+            self._connection.executemany(
+                "DELETE FROM session_run_resume_points WHERE rowid=?", removed,
+            )
+
     async def append(
         self,
         identity: SessionIdentity,
@@ -446,6 +674,13 @@ class SQLiteSessionStore(SessionStore):
                     self._connection.execute(
                         f'UPDATE sessions SET memory_invalidated_revision=?, memory_source_versions=? WHERE {_KEY_PREDICATE}',
                         (revision, canonical_json(versions), *_key(identity)),
+                    )
+                self._expire_resume_points(self._now())
+                finished_run = finished_resume_run_id(event_type, payload)
+                if finished_run is not None:
+                    self._connection.execute(
+                        f"DELETE FROM session_run_resume_points WHERE {_KEY_PREDICATE} AND run_id=?",
+                        (*_key(identity), finished_run),
                     )
                 self._connection.commit()
                 return event
@@ -628,6 +863,20 @@ class SQLiteSessionStore(SessionStore):
             ).fetchall()
             return tuple(self._event(identity, item) for item in reversed(rows))
 
+    async def transcript_page(
+        self, identity: SessionIdentity, *, limit: int, before_sequence: int | None = None,
+    ) -> tuple[TranscriptEvent, ...]:
+        validate_transcript_page(limit, before_sequence)
+        async with self._lock:
+            self._require(identity)
+            cursor = "" if before_sequence is None else " AND sequence<?"
+            args = (*_key(identity), limit) if before_sequence is None else (*_key(identity), before_sequence, limit)
+            rows = self._connection.execute(
+                f"SELECT * FROM transcript_events WHERE {_KEY_PREDICATE}{cursor} ORDER BY sequence DESC LIMIT ?",
+                args,
+            ).fetchall()
+            return tuple(self._event(identity, item) for item in reversed(rows))
+
     async def close(self) -> None:
         async with self._lock:
             if self._closed:
@@ -669,8 +918,7 @@ class SQLiteSessionStore(SessionStore):
         owner_token: str,
         lease_seconds: float,
     ) -> None:
-        if not isinstance(run_id, str) or not _IDENTIFIER.fullmatch(run_id):
-            raise ValueError("invalid session run_id")
+        SQLiteSessionStore._validate_run_id(run_id)
         if not isinstance(owner_token, str) or not _OWNER_TOKEN.fullmatch(owner_token):
             raise ValueError("invalid session run owner_token")
         if (
@@ -681,6 +929,16 @@ class SQLiteSessionStore(SessionStore):
             or lease_seconds > 172_800
         ):
             raise ValueError("session run lease_seconds must be in (0, 172800]")
+
+    @staticmethod
+    def _validate_run_id(run_id: str) -> None:
+        if not isinstance(run_id, str) or not _IDENTIFIER.fullmatch(run_id):
+            raise ValueError("invalid session run_id")
+
+    @staticmethod
+    def _validate_active_run_limit(limit: int) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1_000:
+            raise ValueError("active run limit must be between 1 and 1000")
 
     def _update_session(
         self,

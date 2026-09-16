@@ -23,6 +23,7 @@ from suiteharness.channels import (
     ProductAccessAuthorizer,
     ProductRouter,
 )
+from suiteharness.channels.dispatch import HistoryPage
 from suiteharness.channels.feishu import (
     FeishuEventProcessor,
     FeishuHeaderSignatureVerifier,
@@ -57,6 +58,7 @@ from suiteharness.persistence import (
 )
 from suiteharness.runtime import ProductContext, ScopePath
 from suiteharness.sessions import SessionStore
+from suiteharness.sessions.models import RunStopOutcome, TranscriptEvent
 
 from .access import (
     AdditionalGrantMaterial,
@@ -126,6 +128,45 @@ class _HostedEnterpriseChannelGateway(EnterpriseChannelGateway):
     ) -> AsyncIterator[OutboundEvent]:
         self._require_open()
         async with aclosing(super().dispatch_authenticated(message, principal)) as source:
+            async for event in source:
+                yield event
+
+    async def stop(
+        self, message: InboundMessage, target_message_id: str | None = None,
+    ) -> RunStopOutcome:
+        self._require_open()
+        return await super().stop(message, target_message_id)
+
+    async def stop_authenticated(
+        self, message: InboundMessage, principal: AuthenticatedPrincipal,
+        target_message_id: str,
+    ) -> RunStopOutcome:
+        self._require_open()
+        return await super().stop_authenticated(message, principal, target_message_id)
+
+    async def history_authenticated(
+        self, message: InboundMessage, principal: AuthenticatedPrincipal, limit: int = 100,
+    ) -> tuple[TranscriptEvent, ...]:
+        self._require_open()
+        return await super().history_authenticated(message, principal, limit)
+
+    async def history_page_authenticated(
+        self, message: InboundMessage, principal: AuthenticatedPrincipal, limit: int = 100,
+        *, before_sequence: int | None = None,
+    ) -> HistoryPage:
+        self._require_open()
+        return await super().history_page_authenticated(
+            message, principal, limit, before_sequence=before_sequence,
+        )
+
+    async def continue_authenticated(
+        self, message: InboundMessage, principal: AuthenticatedPrincipal,
+        target_message_id: str,
+    ) -> AsyncIterator[OutboundEvent]:
+        self._require_open()
+        async with aclosing(super().continue_authenticated(
+            message, principal, target_message_id,
+        )) as source:
             async for event in source:
                 yield event
 

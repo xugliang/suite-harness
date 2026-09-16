@@ -6,6 +6,8 @@ import hashlib
 import os
 import stat
 import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from suiteharness.sessions.models import SessionIdentity, canonical_json
@@ -74,6 +76,64 @@ class MarkdownArchive:
     def store(self, identity: SessionIdentity, text: str) -> None:
         if not self.long_term_enabled:
             return
+        with self._locked(identity):
+            self._store(identity, text)
+
+    @contextmanager
+    def _locked(self, identity: SessionIdentity) -> Iterator[None]:
+        # Keep the lock file across replacements/deletes: locking the Markdown
+        # inode itself would stop coordinating as soon as os.replace runs.
+        destination = self._path(identity, create=True)
+        lock_path = destination.with_name(f'.{destination.stem}.lock')
+        self._check_component(lock_path, directory=False)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            actual = os.fstat(descriptor)
+            current = self._check_component(lock_path, directory=False)
+            if (not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1
+                    or current is None
+                    or (actual.st_dev, actual.st_ino) != (current.st_dev, current.st_ino)):
+                raise ValueError('archive lock changed or is not a regular file')
+            if os.name == 'nt':
+                import msvcrt
+
+                if actual.st_size == 0:
+                    os.write(descriptor, b'\0')
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == 'nt':
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def update(self, identity: SessionIdentity, transform: Callable[[str], str | None]) -> bool:
+        """Atomically read/transform/replace one archive across server processes.
+
+        Returning None from the trusted transform leaves the archive unchanged.
+        Disabled archives neither call the transform nor touch the filesystem.
+        """
+        if not self.long_term_enabled:
+            return False
+        with self._locked(identity):
+            previous = self.retrieve(identity, '', self.max_file_bytes)
+            updated = transform(previous)
+            if updated is None:
+                return False
+            self._store(identity, updated)
+            return True
+
+    def _store(self, identity: SessionIdentity, text: str) -> None:
         if not isinstance(text, str):
             raise ValueError("archive text must be a string")
         encoded = text.encode("utf-8")
@@ -127,8 +187,12 @@ class MarkdownArchive:
         if not self.long_term_enabled:
             return False
         path = self._path(identity)
-        try:
-            path.unlink()
-        except FileNotFoundError:
+        if self._check_component(path, directory=False) is None:
             return False
-        return True
+        with self._locked(identity):
+            path = self._path(identity)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return False
+            return True

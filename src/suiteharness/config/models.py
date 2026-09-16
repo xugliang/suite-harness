@@ -724,6 +724,75 @@ class ModelsConfig(_FrozenConfig):
         return self
 
 
+class AgentRoleDefinition(_FrozenConfig):
+    """One deployment-approved, same-product child-agent role."""
+
+    role_id: str
+    instruction: str = Field(min_length=1, max_length=12_000)
+    allowed_tools: tuple[str, ...] = ()
+    model_route: str
+
+    @field_validator("role_id", "model_route")
+    @classmethod
+    def validate_ids(cls, value: str, info: object) -> str:
+        return _identifier(value, getattr(info, "field_name", "identifier"))
+
+    @field_validator("instruction")
+    @classmethod
+    def validate_instruction(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("role instruction must not have leading or trailing whitespace")
+        return value
+
+    @field_validator("allowed_tools")
+    @classmethod
+    def validate_allowed_tools(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("role allowed_tools must not contain duplicates")
+        for tool_name in value:
+            _identifier(tool_name, "role allowed tool")
+        if "agent.delegate" in value:
+            raise ValueError("child role allowed_tools must not include agent.delegate")
+        return value
+
+
+class MultiAgentProductConfig(_FrozenConfig):
+    """Optional delegation policy for one selected product."""
+
+    enabled: bool = False
+    roles: tuple[AgentRoleDefinition, ...] = ()
+    max_children: int = Field(default=2, ge=1, le=2)
+    max_depth: Literal[1] = 1
+    max_parallel: int = Field(default=2, ge=1, le=2)
+
+    @model_validator(mode="after")
+    def validate_roles_and_parallelism(self) -> MultiAgentProductConfig:
+        role_ids = [role.role_id for role in self.roles]
+        if len(role_ids) != len(set(role_ids)):
+            raise ValueError("multi-agent roles must not repeat role_id")
+        if self.enabled and not self.roles:
+            raise ValueError("enabled multi-agent product requires at least one role")
+        if self.max_parallel > self.max_children:
+            raise ValueError("multi-agent max_parallel must not exceed max_children")
+        return self
+
+
+class MultiAgentConfig(_FrozenConfig):
+    """Deny-by-default product delegation settings for a deployment."""
+
+    products: dict[str, MultiAgentProductConfig] = Field(default_factory=dict)
+
+    @field_validator("products")
+    @classmethod
+    def validate_products(
+        cls, value: dict[str, MultiAgentProductConfig]
+    ) -> dict[str, MultiAgentProductConfig]:
+        return {
+            _identifier(product_id, "multi-agent product_id"): policy
+            for product_id, policy in value.items()
+        }
+
+
 class BaiduQianfanSearchConfig(_FrozenConfig):
     kind: Literal["baidu_qianfan"] = "baidu_qianfan"
     provider_id: Literal["baidu-qianfan"] = "baidu-qianfan"
@@ -1182,6 +1251,7 @@ class SuiteHarnessConfig(_FrozenConfig):
     sandbox: SandboxConfig
     models: ModelsConfig
     web_tools: WebToolsConfig
+    multi_agent: MultiAgentConfig = Field(default_factory=MultiAgentConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
@@ -1199,6 +1269,24 @@ class SuiteHarnessConfig(_FrozenConfig):
             raise ValueError(
                 "model product_routes reference products outside customer_bundle: "
                 f"{sorted(unknown_routes)}"
+            )
+        multi_agent_products = set(self.multi_agent.products)
+        if unknown_multi_agent := multi_agent_products - selected_products:
+            raise ValueError(
+                "multi-agent configuration references products outside customer_bundle: "
+                f"{sorted(unknown_multi_agent)}"
+            )
+        known_model_routes = {route.route_id for route in self.models.routes}
+        unknown_role_routes = {
+            role.model_route
+            for policy in self.multi_agent.products.values()
+            for role in policy.roles
+            if role.model_route not in known_model_routes
+        }
+        if unknown_role_routes:
+            raise ValueError(
+                "multi-agent roles reference unknown model routes: "
+                f"{sorted(unknown_role_routes)}"
             )
         mcp_products = set(self.mcp.servers_by_product)
         if unknown_mcp := mcp_products - selected_products:
@@ -1436,6 +1524,9 @@ __all__ = [
     "ProviderCredentials",
     "ServiceCredentials",
     "ModelCapabilitiesConfig",
+    "AgentRoleDefinition",
+    "MultiAgentProductConfig",
+    "MultiAgentConfig",
     "ModelProfileConfig",
     "ModelRouteConfig",
     "ModelsConfig",

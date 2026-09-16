@@ -2,6 +2,7 @@
 
 from .loader import ConfigLoadError, LoadedSuiteHarnessConfig, SuiteHarnessConfigLoader, YamlDecoder
 from .models import (
+    AgentRoleDefinition,
     BaiduQianfanSearchConfig,
     BrowserWorkerFetchConfig,
     ChannelConversationRouteConfig,
@@ -22,6 +23,8 @@ from .models import (
     ModelProfileConfig,
     ModelRouteConfig,
     ModelsConfig,
+    MultiAgentConfig,
+    MultiAgentProductConfig,
     PluginsConfig,
     ProviderCredentials,
     SandboxConfig,
@@ -43,6 +46,7 @@ from .models import (
 )
 
 __all__ = [
+    "AgentRoleDefinition",
     "ChannelsConfig",
     "ChannelConversationRouteConfig",
     "BaiduQianfanSearchConfig",
@@ -61,6 +65,8 @@ __all__ = [
     "LoadedSuiteHarnessConfig",
     "LocalDevelopmentSandboxConfig",
     "ManagedProxyFetchConfig",
+    "MultiAgentConfig",
+    "MultiAgentProductConfig",
     "McpChannelAccessConfig",
     "McpConfig",
     "McpProductChannelAccessConfig",

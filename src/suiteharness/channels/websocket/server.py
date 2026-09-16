@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -14,25 +15,32 @@ from suiteharness.channels.approvals import (
     ApprovalChallenge,
     InteractiveApprovalCoordinator,
 )
-from suiteharness.channels.dispatch import WebSocketDispatcher
+from suiteharness.channels.dispatch import HistoryPage, WebSocketDispatcher
 from suiteharness.channels.models import (
     AuthenticatedPrincipal,
     ChannelKind,
     InboundMessage,
 )
 from suiteharness.execution import RunRequest
+from suiteharness.sessions.models import TranscriptEvent, TranscriptEventType
 
 from .models import (
     AckFrame,
     ApprovalDecisionFrame,
     ApprovalDecisionResultFrame,
     ApprovalRequiredFrame,
+    ContinueFrame,
     ErrorFrame,
     EventFrame,
+    HistoryDisplayEvent,
+    HistoryFrame,
+    HistoryResultFrame,
     MessageFrame,
     PingFrame,
     PongFrame,
     ServerFrame,
+    StopFrame,
+    StopResultFrame,
     WebSocketHandshake,
     WebSocketPacket,
     WebSocketPacketKind,
@@ -146,6 +154,56 @@ class _SessionAuthenticationFailure(Exception):
         super().__init__(reason)
         self.close_code = close_code
         self.reason = reason
+
+
+def _display_history_event(event: TranscriptEvent) -> HistoryDisplayEvent | None:
+    """Project trusted audit records to the small Web history vocabulary.
+
+    Transcript payloads can contain attachment data, tool observations and
+    identity metadata.  Those are intentionally not a Web display contract.
+    """
+
+    payload = event.payload
+    if not isinstance(payload, dict):
+        return None
+    try:
+        if event.type is TranscriptEventType.USER_MESSAGE:
+            message = payload.get("message")
+            text = message.get("text") if isinstance(message, dict) else None
+            message_id = message.get("message_id") if isinstance(message, dict) else None
+            if not isinstance(text, str) or not isinstance(message_id, str):
+                return None
+            return HistoryDisplayEvent(
+                kind="user",
+                run_id=payload.get("run_id") if isinstance(payload.get("run_id"), str) else None,
+                message_id=message_id,
+                occurred_at=event.occurred_at,
+                text=text,
+            )
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str):
+            return None
+        if event.type is TranscriptEventType.ASSISTANT_MESSAGE:
+            if "output" not in payload:
+                return None
+            return HistoryDisplayEvent(
+                kind="assistant",
+                run_id=run_id,
+                occurred_at=event.occurred_at,
+                output=payload["output"],
+            )
+        if event.type is TranscriptEventType.CANCEL:
+            partial_output = payload.get("partial_output")
+            return HistoryDisplayEvent(
+                kind="cancel",
+                run_id=run_id,
+                occurred_at=event.occurred_at,
+                partial_output=(partial_output if isinstance(partial_output, str) else "")[:16_384],
+                incomplete=True,
+            )
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 class WebSocketApprovalHub:
@@ -374,7 +432,7 @@ class WebSocketSession:
 
     async def _handle_frame(
         self,
-        frame: MessageFrame | ApprovalDecisionFrame | PingFrame,
+        frame: MessageFrame | ApprovalDecisionFrame | PingFrame | StopFrame | HistoryFrame | ContinueFrame,
     ) -> None:
         if isinstance(frame, PingFrame):
             await self._send_frame(PongFrame(nonce=frame.nonce))
@@ -392,6 +450,12 @@ class WebSocketSession:
                     accepted=accepted,
                 )
             )
+            return
+        if isinstance(frame, StopFrame):
+            await self._handle_stop(frame)
+            return
+        if isinstance(frame, HistoryFrame):
+            await self._handle_history(frame)
             return
 
         client_id = frame.client_message_id
@@ -420,20 +484,117 @@ class WebSocketSession:
             return
         self._seen_message_ids.add(client_id)
         await self._send_frame(AckFrame(client_message_id=client_id))
-        self._tasks.try_start(lambda: self._dispatch(frame), name=f"suiteharness-web-{client_id}")
+        if isinstance(frame, ContinueFrame):
+            self._tasks.try_start(
+                lambda: self._continue(frame), name=f"suiteharness-web-{client_id}"
+            )
+        else:
+            self._tasks.try_start(
+                lambda: self._dispatch(frame), name=f"suiteharness-web-{client_id}"
+            )
+
+    async def _handle_stop(self, frame: StopFrame) -> None:
+        message = self._control_message(
+            control_id=frame.stop_id,
+            conversation_id=frame.conversation_id,
+            product_id=frame.product_id,
+        )
+        try:
+            outcome = await self._dispatcher.stop_authenticated(
+                message, self._principal, frame.target_client_message_id
+            )
+            value = outcome.value if hasattr(outcome, "value") else outcome
+            await self._send_frame(StopResultFrame(stop_id=frame.stop_id, outcome=value))
+        except Exception:
+            await self._send_frame(
+                ErrorFrame(code="application_error", message="the control request failed")
+            )
+
+    async def _handle_history(self, frame: HistoryFrame) -> None:
+        message = self._control_message(
+            control_id=frame.history_id,
+            conversation_id=frame.conversation_id,
+            product_id=frame.product_id,
+        )
+        try:
+            paginate = getattr(self._dispatcher, 'history_page_authenticated', None)
+            if callable(paginate):
+                page = await paginate(message, self._principal, frame.limit,
+                                      before_sequence=frame.before_sequence)
+            else:
+                if frame.before_sequence is not None:
+                    raise NotImplementedError('this dispatcher does not provide history pagination')
+                page = HistoryPage(
+                    await self._dispatcher.history_authenticated(message, self._principal, frame.limit),
+                    pagination_supported=False,
+                )
+            await self._send_frame(self._bounded_history_frame(frame.history_id, page))
+        except Exception:
+            await self._send_frame(
+                ErrorFrame(code="application_error", message="the control request failed")
+            )
+
+    def _bounded_history_frame(self, history_id: str, page: HistoryPage) -> HistoryResultFrame:
+        """Select a newest suffix using serialized bytes; never skip its older boundary."""
+        projected = tuple((event.sequence, item) for event in page.events
+                          if (item := _display_history_event(event)) is not None)
+
+        def frame_for(count: int, replacement: HistoryDisplayEvent | None = None):
+            selected = projected[-count:] if count else ()
+            omitted = count < len(projected)
+            cursor = (selected[0][0] if omitted and selected else page.next_cursor)
+            events = (replacement,) if replacement is not None else tuple(item for _, item in selected)
+            return HistoryResultFrame(
+                history_id=history_id, events=events,
+                next_cursor=cursor if page.pagination_supported else None,
+                has_more=(cursor is not None) if page.pagination_supported else None,
+                pagination_supported=page.pagination_supported,
+                truncated=omitted or replacement is not None,
+            )
+
+        def fits(value: HistoryResultFrame) -> bool:
+            return len(value.model_dump_json().encode('utf-8')) <= self._max_outbound_bytes
+
+        full = frame_for(len(projected))
+        if fits(full):
+            return full
+        low, high = 0, len(projected)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(frame_for(middle)):
+                low = middle
+            else:
+                high = middle - 1
+        if low:
+            return frame_for(low)
+        if not projected:
+            raise WebSocketProtocolError('outbound_frame_too_large', 'history metadata exceeds frame limit')
+        item = projected[-1][1]
+        field = {'user': 'text', 'assistant': 'output', 'cancel': 'partial_output'}[item.kind]
+        value = getattr(item, field)
+        preview = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        low, high = 0, len(preview)
+        # The marker remains even if only an empty preview fits. Cursor advances
+        # past this exact record so a single huge record cannot trap pagination.
+        empty = item.model_copy(update={field: '', 'truncated': True})
+        if not fits(frame_for(1, empty)):
+            raise WebSocketProtocolError('outbound_frame_too_large', 'history metadata exceeds frame limit')
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = item.model_copy(update={field: preview[:middle], 'truncated': True})
+            if fits(frame_for(1, candidate)):
+                low = middle
+            else:
+                high = middle - 1
+        return frame_for(1, item.model_copy(update={field: preview[:low], 'truncated': True}))
 
     async def _dispatch(self, frame: MessageFrame) -> None:
-        message = InboundMessage(
-            channel=ChannelKind.WEB,
-            event_id=f"{self._connection_id}:{frame.client_message_id}",
-            message_id=frame.client_message_id,
+        message = self._control_message(
+            control_id=frame.client_message_id,
             conversation_id=frame.conversation_id,
-            sender_external_id=self._principal.principal_id,
-            text=frame.text,
             product_id=frame.product_id,
+            text=frame.text,
             attachments=frame.attachments,
-            received_at=datetime.now(UTC),
-            metadata={"connection_id": self._connection_id},
         )
         try:
             async with aclosing(self._dispatcher.dispatch_authenticated(
@@ -454,6 +615,55 @@ class WebSocketSession:
                     client_message_id=frame.client_message_id,
                 )
             )
+
+    async def _continue(self, frame: ContinueFrame) -> None:
+        message = self._control_message(
+            control_id=frame.client_message_id,
+            conversation_id=frame.conversation_id,
+            product_id=frame.product_id,
+        )
+        try:
+            async with aclosing(self._dispatcher.continue_authenticated(
+                message,
+                self._principal,
+                frame.target_client_message_id,
+            )) as source:
+                async for event in source:
+                    await self._send_frame(
+                        EventFrame(client_message_id=frame.client_message_id, event=event)
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._send_frame(
+                ErrorFrame(
+                    code="application_error",
+                    message="the agent request failed",
+                    client_message_id=frame.client_message_id,
+                )
+            )
+
+    def _control_message(
+        self,
+        *,
+        control_id: str,
+        conversation_id: str,
+        product_id: str | None,
+        text: str = "",
+        attachments: tuple = (),
+    ) -> InboundMessage:
+        return InboundMessage(
+            channel=ChannelKind.WEB,
+            event_id=f"{self._connection_id}:{control_id}",
+            message_id=control_id,
+            conversation_id=conversation_id,
+            sender_external_id=self._principal.principal_id,
+            text=text,
+            product_id=product_id,
+            attachments=attachments,
+            received_at=datetime.now(UTC),
+            metadata={"connection_id": self._connection_id},
+        )
 
     async def _send_frame(self, frame: ServerFrame) -> None:
         raw = frame.model_dump_json()

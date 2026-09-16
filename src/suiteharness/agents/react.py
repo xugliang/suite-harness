@@ -7,13 +7,11 @@ handler.  Every returned :class:`ToolIntent` therefore still crosses the trusted
 
 from __future__ import annotations
 
-from suiteharness.execution.protocols import Workflow
-
-from dataclasses import dataclass
+import hashlib
 from collections.abc import AsyncIterator
 from contextlib import aclosing
+from dataclasses import dataclass
 from typing import Literal, cast
-from suiteharness.execution.events import WorkflowEvent, collect_decision
 
 from pydantic import JsonValue
 
@@ -26,14 +24,16 @@ from suiteharness.execution import (
     WorkflowDecision,
     WorkflowFrame,
 )
+from suiteharness.execution.events import WorkflowEvent, collect_decision
+from suiteharness.execution.protocols import Workflow
 from suiteharness.models import (
     FinishReason,
     ModelMessage,
     ModelRequest,
     ModelRole,
+    ModelStreamEventType,
     ModelTool,
     ModelToolCall,
-    ModelStreamEventType,
     TextContent,
 )
 from suiteharness.sessions.models import canonical_json
@@ -59,6 +59,36 @@ class ReActWorkflow(Workflow):
             raise ValueError("route_id must not be blank")
         if self.tool_choice not in {"auto", "none", "required"}:
             raise ValueError("tool_choice must be auto, none, or required")
+
+    def resume_key(
+        self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
+    ) -> str:
+        # Validate the saved request identity before the gateway sees any data.
+        self._restore_state(request, frame, prompt)
+        settings: dict[str, JsonValue] = {
+            'schema': _STATE_SCHEMA, 'route_id': self.route_id, 'model': self.model,
+            'temperature': self.temperature, 'max_output_tokens': self.max_output_tokens,
+            'tool_choice': self.tool_choice,
+        }
+        # The configured gateway exposes immutable administrator-owned routes
+        # and profiles. Bind their contents too: a stable route alias alone
+        # does not imply a stable model or endpoint after a server restart.
+        route_lookup = getattr(self.gateway, 'route', None)
+        profile_lookup = getattr(self.gateway, 'profile', None)
+        fingerprint = getattr(self.gateway, 'resume_fingerprint', None)
+        if callable(fingerprint):
+            settings['gateway_fingerprint'] = fingerprint(self.route_id)
+        elif callable(route_lookup) and callable(profile_lookup):
+            route = route_lookup(self.route_id)
+            settings['route'] = route.model_dump(mode='json')
+            profiles = []
+            for profile_id in (route.primary_profile, *route.fallback_profiles):
+                profile = profile_lookup(profile_id)
+                data = profile.model_dump(mode='json')
+                data['allowed_models'] = sorted(profile.allowed_models)
+                profiles.append(data)
+            settings['profiles'] = profiles
+        return hashlib.sha256(canonical_json(settings).encode('utf-8')).hexdigest()
 
     async def next(
         self,
@@ -198,7 +228,12 @@ class ReActWorkflow(Workflow):
             raise ReActStateError("workflow_state is not a suiteharness.react.v2 checkpoint")
         if state.get("route_id") != self.route_id:
             raise ReActStateError("workflow_state belongs to a different model route")
-        if state.get("request_identity") != self._request_identity(request):
+        identity = self._request_identity(request)
+        saved_identity = state.get("request_identity")
+        if request.resume is not None and isinstance(saved_identity, dict):
+            if saved_identity.get('run_id') == request.resume.source_run_id:
+                identity['run_id'] = request.resume.source_run_id
+        if saved_identity != identity:
             raise ReActStateError("workflow_state belongs to a different request scope")
         raw_messages = state.get("messages")
         consumed = state.get("consumed_observations")
@@ -245,7 +280,12 @@ class ReActWorkflow(Workflow):
 
     @staticmethod
     def _observation_message(observation: ToolObservation) -> ModelMessage:
-        payload: dict[str, JsonValue] = {"status": observation.status.value}
+        payload: dict[str, JsonValue] = {
+            "status": observation.status.value,
+            # Persist the original observation time. In particular, resumed
+            # web evidence must never look freshly fetched to the model.
+            "observed_at": observation.finished_at.isoformat(),
+        }
         if observation.result is not None:
             payload["result"] = observation.result
         if observation.failure is not None:
@@ -333,6 +373,15 @@ class ProductRoutedReActWorkflow(Workflow):
     temperature: float | None = None
     max_output_tokens: int = 4096
     tool_choice: str = "auto"
+
+    def resume_key(
+        self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
+    ) -> str:
+        return ReActWorkflow(
+            gateway=self.gateway, route_id=self.routes.route_for(request.scope.product_id),
+            model=self.model, temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens, tool_choice=self.tool_choice,
+        ).resume_key(request, frame, prompt)
 
     async def next(
         self,

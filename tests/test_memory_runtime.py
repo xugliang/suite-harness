@@ -7,24 +7,36 @@ import pytest
 from suiteharness.channels import ChannelKind, InboundMessage, OutboundEventKind
 from suiteharness.config import LoadedSuiteHarnessConfig
 from suiteharness.config.models import (
-    ChannelsConfig, ConversationMemoryConfig, DeploymentConfig, ModelsConfig,
-    SuiteHarnessConfig, SuiteHarnessSecrets,
+    ChannelsConfig,
+    ConversationMemoryConfig,
+    DeploymentConfig,
+    ModelsConfig,
+    SuiteHarnessConfig,
+    SuiteHarnessSecrets,
 )
 from suiteharness.execution import Workflow, WorkflowDecision
 from suiteharness.execution.in_memory import (
-    InMemoryApprovalStore, InMemoryAuditJournal, InMemoryCapabilityAuthority,
+    InMemoryApprovalStore,
+    InMemoryAuditJournal,
+    InMemoryCapabilityAuthority,
     InMemoryToolRegistry,
 )
 from suiteharness.execution.protocols import ExecutionStrategies, PromptStrategy
 from suiteharness.execution.runner import ExecutionRunner
 from suiteharness.memory.services import CONVERSATION_MEMORY
 from suiteharness.memory.session_memory import SessionConversationMemory
-from suiteharness.models import MODEL_GATEWAY, FinishReason, ModelGateway, ModelResponse, TextContent
+from suiteharness.models import (
+    MODEL_GATEWAY,
+    FinishReason,
+    ModelGateway,
+    ModelResponse,
+    TextContent,
+)
 from suiteharness.runtime import RequestScope, RootContext, ScopePath, ServiceBindings
 from suiteharness.runtime.customer_bundle import CustomerBundleManifest
 from suiteharness.server.access import ConfiguredGrantIssuer, ToolAccessTemplate
 from suiteharness.server.host import CompanyChannelRuntime, WebApprovalRuntime
-from suiteharness.sessions import InMemorySessionStore, SQLiteSessionStore, SessionIdentity
+from suiteharness.sessions import InMemorySessionStore, SessionIdentity, SQLiteSessionStore
 from suiteharness.sessions.errors import SessionIdempotencyConflictError
 
 
@@ -243,16 +255,17 @@ def test_history_can_show_invalidated_messages_without_reactivating_or_mutating_
 
 def test_invalidation_during_archive_write_cannot_publish_old_completion(tmp_path, monkeypatch):
     import threading
+
     from suiteharness.memory.markdown_archive import MarkdownArchive
     entered, release = threading.Event(), threading.Event()
-    original = MarkdownArchive.store
+    original = MarkdownArchive._store
 
     def delayed_store(self, session, text):
         entered.set()
         assert release.wait(timeout=5)
         return original(self, session, text)
 
-    monkeypatch.setattr(MarkdownArchive, 'store', delayed_store)
+    monkeypatch.setattr(MarkdownArchive, '_store', delayed_store)
 
     async def check():
         settings = ConversationMemoryConfig(model_summary_enabled=False,

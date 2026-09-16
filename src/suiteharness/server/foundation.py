@@ -42,6 +42,8 @@ from suiteharness.execution import (
     InMemoryToolRegistry,
     SQLiteAuditJournal,
 )
+from suiteharness.execution.in_memory import ToolRegistrationHandle
+from suiteharness.mcp.defaults import build_default_mcp_adapters
 from suiteharness.models import (
     MODEL_GATEWAY,
     BedrockConverseAdapter,
@@ -57,6 +59,13 @@ from suiteharness.models import (
     create_builtin_provider_registry,
 )
 from suiteharness.models import HttpTransport as ModelHttpTransport
+from suiteharness.multiagent.roles import ConfiguredAgentRoleRegistry
+from suiteharness.multiagent.service import (
+    ControlledDelegationService,
+    TrustedChildActivation,
+)
+from suiteharness.multiagent.sqlite import SQLiteAgentTaskStore
+from suiteharness.multiagent.tool import install_delegate_tool
 from suiteharness.persistence import (
     SQLiteDatabase,
     SQLiteMcpHttpResumeStore,
@@ -64,6 +73,7 @@ from suiteharness.persistence import (
     SQLiteSandboxQuarantineStore,
 )
 from suiteharness.runtime import HarnessKernel, RootContext, ServiceBindings
+from suiteharness.runtime.kernel import ActivatedCustomerBundle
 from suiteharness.sandbox import (
     AsyncioProcessTransport,
     DockerBackendConfig,
@@ -76,7 +86,6 @@ from suiteharness.sandbox import (
     SandboxUnavailable,
 )
 from suiteharness.sandbox.remote import RemoteSandboxBackend
-from suiteharness.mcp.defaults import build_default_mcp_adapters
 from suiteharness.sessions import SQLiteSessionStore
 from suiteharness.tools import (
     BashToolConfig,
@@ -426,6 +435,7 @@ class FoundationRuntime:
         self._started = False
         self._close_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
+        self._delegate_start_lock = asyncio.Lock()
         self.workspaces = WorkspaceLayout(self.config.workspace.root)
         self.config.workspace.root.mkdir(parents=True, exist_ok=True)
         self.config.storage.root.mkdir(parents=True, exist_ok=True)
@@ -540,6 +550,8 @@ class FoundationRuntime:
             builtin_installer.workspace_files_production_safe
         )
         self.builtins: BuiltinRegistrationSet = builtin_installer.install()
+        self._delegate_handle: ToolRegistrationHandle | None = None
+        self._delegate_activation: ActiveCustomerBundleView | None = None
         self._prepared_products: set[str] = set()
         self.extensions = ServerExtensionHost(
             loaded,
@@ -733,7 +745,58 @@ class FoundationRuntime:
         if self._closed:
             raise RuntimeError("foundation runtime is closed")
         await self.start()
-        return await self.extensions.start(activation)
+        async with self._delegate_start_lock:
+            return await self._start_extensions_locked(activation)
+
+    async def _start_extensions_locked(
+        self, activation: ActiveCustomerBundleView
+    ) -> ExtensionActivation:
+        if self._closed:
+            raise RuntimeError("foundation runtime is closed")
+        newly_registered = False
+        enabled_products = {
+            product_id
+            for product_id, policy in self.config.multi_agent.products.items()
+            if policy.enabled
+        }
+        if enabled_products:
+            if (
+                not isinstance(activation, ActivatedCustomerBundle)
+                or activation.closed
+                or activation.tenant_id != self.config.deployment.tenant_id
+                or enabled_products - set(activation.products)
+                or activation.runner is not self.kernel.runner
+                or await self.kernel.active(activation.tenant_id) is not activation
+            ):
+                raise FoundationStartupError(
+                    "enabled agent delegation requires a matching trusted customer activation"
+                )
+            if self._delegate_handle is None:
+                tasks = SQLiteAgentTaskStore(self.runtime_database)
+                await tasks.recover_interrupted()
+                service = ControlledDelegationService(
+                    activation=cast(TrustedChildActivation, activation),
+                    roles=ConfiguredAgentRoleRegistry(self.config.multi_agent),
+                    tools=self.tools,
+                    authority=self.capabilities,
+                    tasks=tasks,
+                    journal=self.audit,
+                )
+                self._delegate_handle = install_delegate_tool(self.tools, service)
+                self._delegate_activation = activation
+                newly_registered = True
+            elif self._delegate_activation is not activation:
+                raise FoundationStartupError(
+                    "delegation is already bound to a different customer activation"
+                )
+        try:
+            return await self.extensions.start(activation)
+        except BaseException:
+            if newly_registered and self._delegate_handle is not None:
+                self._delegate_handle.close()
+                self._delegate_handle = None
+                self._delegate_activation = None
+            raise
 
     async def close(self) -> None:
         async with self._close_lock:
@@ -749,6 +812,13 @@ class FoundationRuntime:
                     await close()
                 except BaseException as exc:
                     errors.append(exc)
+            if self._delegate_handle is not None:
+                try:
+                    self._delegate_handle.close()
+                except BaseException as exc:
+                    errors.append(exc)
+                self._delegate_handle = None
+                self._delegate_activation = None
             try:
                 self.builtins.close()
             except BaseException as exc:
@@ -783,6 +853,12 @@ class FoundationRuntime:
             except BaseException as exc:
                 errors.append(exc)
         builtins = getattr(self, "builtins", None)
+        delegate_handle = getattr(self, "_delegate_handle", None)
+        if delegate_handle is not None:
+            try:
+                delegate_handle.close()
+            except BaseException as exc:
+                errors.append(exc)
         if builtins is not None:
             try:
                 builtins.close()

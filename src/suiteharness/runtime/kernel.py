@@ -14,13 +14,11 @@ owned by the product activation's :class:`~suiteharness.runtime.effects.EffectSc
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-
 import asyncio
 import secrets
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager, aclosing
-from suiteharness.execution.events import RunEvent
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -28,6 +26,7 @@ from typing import Any, TypeAlias, TypeVar
 
 from pydantic import BaseModel
 
+from suiteharness.execution.events import RunEvent
 from suiteharness.execution.in_memory import (
     InMemoryApprovalStore,
     InMemoryAuditJournal,
@@ -41,13 +40,13 @@ from suiteharness.execution.protocols import (
     CapabilityAuthority,
     ExecutionStrategies,
     InteractiveApprovalBroker,
+    ScopedToolRegistry,
     ToolAuthorizationPolicy,
     ToolHandler,
     ToolRegistry,
-    ScopedToolRegistry,
 )
-from suiteharness.execution.runner import ExecutionPolicy, ExecutionRunner
 from suiteharness.execution.results import ToolResultStore
+from suiteharness.execution.runner import ExecutionPolicy, ExecutionRunner
 from suiteharness.memory.in_memory import (
     InMemoryCustomer360Provider,
     InMemoryProfileDirectory,
@@ -59,6 +58,7 @@ from suiteharness.memory.protocols import (
     ProfileProviderResolver,
 )
 from suiteharness.memory.services import CUSTOMER360_PROVIDER, PROFILE_PROVIDER
+from suiteharness.multiagent.budget import AggregateRunBudget
 from suiteharness.runtime.bundle import (
     Bundle,
     BundlePlan,
@@ -334,6 +334,20 @@ class ActivatedCustomerBundle:
             raise RuntimeError('activation stream ended without a result')
         return result
 
+    async def cancel(self, scope: RequestScope, run_id: str) -> bool:
+        """Notify the root runner only for this activation's authenticated scope."""
+        if not isinstance(scope, RequestScope) or self.closed:
+            return False
+        product = self.products.get(scope.product_id)
+        if scope.tenant_id != self.tenant_id or product is None:
+            return False
+        if not (
+            (scope.path.kind is ScopeKind.PRODUCT and scope.path == product.path)
+            or (scope.path.kind is ScopeKind.AGENT and scope.path.parent() == product.path)
+        ):
+            return False
+        return await self.runner.cancel(scope, run_id)
+
     async def stream(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         """Run with strategies selected from the request's exact product scope.
 
@@ -343,6 +357,49 @@ class ActivatedCustomerBundle:
         issued separately by the trusted control plane.
         """
 
+        async with aclosing(self._stream_validated(request)) as source:
+            async for event in source:
+                yield event
+
+    async def run_trusted_child(
+        self,
+        request: RunRequest,
+        strategies: ExecutionStrategies,
+        aggregate_budget: AggregateRunBudget,
+    ) -> RunResult:
+        """Host-only role entry; validation, product lease and runner remain in force."""
+
+        if not isinstance(request, RunRequest) or request.scope.path.kind is not ScopeKind.AGENT:
+            raise CustomerBundleActivationError(
+                CustomerBundleActivationCode.INVALID_RUN_REQUEST,
+                "delegated child requests must use an authenticated agent scope",
+            )
+        if not isinstance(strategies, ExecutionStrategies) or not isinstance(
+            aggregate_budget, AggregateRunBudget
+        ):
+            raise TypeError("trusted child requires validated strategies and aggregate budget")
+        result = None
+        async with aclosing(
+            self._stream_validated(
+                request,
+                strategies_override=strategies,
+                aggregate_budget=aggregate_budget,
+            )
+        ) as source:
+            async for event in source:
+                if event.result is not None:
+                    result = event.result
+        if result is None:
+            raise RuntimeError("delegated child stream ended without a result")
+        return result
+
+    async def _stream_validated(
+        self,
+        request: RunRequest,
+        *,
+        strategies_override: ExecutionStrategies | None = None,
+        aggregate_budget: AggregateRunBudget | None = None,
+    ) -> AsyncIterator[RunEvent]:
         if not isinstance(request, RunRequest):
             raise CustomerBundleActivationError(
                 CustomerBundleActivationCode.INVALID_RUN_REQUEST,
@@ -382,7 +439,11 @@ class ActivatedCustomerBundle:
             )
         try:
             try:
-                strategies = self.strategies(request.scope.product_id)
+                strategies = (
+                    self.strategies(request.scope.product_id)
+                    if strategies_override is None
+                    else strategies_override
+                )
             except (LookupError, ServiceBindingError, TypeError) as exc:
                 raise CustomerBundleActivationError(
                     CustomerBundleActivationCode.WORKFLOW_UNAVAILABLE,
@@ -390,7 +451,11 @@ class ActivatedCustomerBundle:
                     cause=exc,
                     product_id=request.scope.product_id,
                 ) from exc
-            async with aclosing(self.runner.stream(request, strategies)) as source:
+            async with aclosing(
+                self.runner.stream(
+                    request, strategies, aggregate_budget=aggregate_budget
+                )
+            ) as source:
                 async for event in source:
                     yield event
         finally:

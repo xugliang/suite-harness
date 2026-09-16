@@ -46,7 +46,7 @@ flowchart LR
 | 领域 | 当前实现 |
 | --- | --- |
 | 产品组合 | 严格产品描述、A/AB/ABC 组合解析、版本/配置校验、产品内部能力包依赖与冲突检查、两阶段激活及失败回滚 |
-| Agent | 默认 ReAct（Reason + Act，推理并行动）工作流、产品级工作流/提示词/反思替换点；工具只能形成调用意图，最终仍经过统一执行器 |
+| Agent | 默认 ReAct（Reason + Act，推理并行动）工作流、产品级工作流/提示词/反思替换点；可选受控多 Agent 委派，子任务仍经过统一执行器 |
 | 内置工具 | `fs.list/read/write/edit/glob/grep`、`Bash`、`web_search`、`web_fetch`；没有内置删除工具 |
 | 工具安全 | 精确工具身份、JSON Schema（JSON 结构规则）参数校验、短时能力授权、读写效果检查、一次性审批、预算、取消和结构化审计 |
 | 工作区与沙箱 | 按公司/产品划分目录，共享目录默认关闭；Docker 只读根、非特权用户、资源限制、默认断网，以及清理失败后的持久隔离与失败关闭 |
@@ -78,6 +78,7 @@ scripts/                   开源发行制品检查
 src/suiteharness/
   runtime/                 作用域、产品描述、能力包、客户组合与生命周期
   agents/                  ReAct、提示词、反思和 Agent 事件契约
+  multiagent/              可选同产品子 Agent 角色、任务状态、共享预算与受控委派
   execution/               统一工具执行、授权、审批、预算、取消与审计
   tools/ workspace/        内置工具及工作区路径策略
   sandbox/ web/            Docker/开发沙箱与国内搜索、受控抓取
@@ -142,6 +143,7 @@ python scripts/check_distributions.py dist
 - [架构说明](docs/architecture.md)
 - [中文模块指南](docs/module-guide.zh-CN.md)
 - [产品开发指南](docs/product-authoring.md)
+- [多 Agent 接入指南](docs/multi-agent.zh-CN.md)
 - [公司部署指南](docs/deployment.zh-CN.md)
 - [安全模型](docs/security-model.md)
 - [贡献指南](CONTRIBUTING.md)

@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import time
 import uuid
-from dataclasses import dataclass, field
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
 
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
+from suiteharness.execution.environment import with_runtime_environment
+from suiteharness.execution.events import RunEvent, WorkflowEvent
 from suiteharness.execution.models import (
     ApprovalBinding,
     ApprovalTarget,
@@ -27,6 +30,7 @@ from suiteharness.execution.models import (
     RunFailure,
     RunRequest,
     RunResult,
+    RunResumeState,
     RunStatus,
     ToolAuthorization,
     ToolCallStatus,
@@ -49,12 +53,12 @@ from suiteharness.execution.protocols import (
     InteractiveApprovalBroker,
     ToolAuthorizationPolicy,
     ToolCallContext,
+    ToolHandlerDenied,
     ToolRegistry,
 )
-from suiteharness.runtime.scopes import RequestScope, ScopePath
-from suiteharness.execution.environment import with_runtime_environment
-from suiteharness.execution.events import RunEvent, WorkflowEvent
 from suiteharness.execution.results import ToolResultStore
+from suiteharness.multiagent.budget import AggregateRunBudget
+from suiteharness.runtime.scopes import RequestScope, ScopePath
 
 _JSON = TypeAdapter(JsonValue)
 _ABSOLUTE_BYTE_LIMITS = {
@@ -69,6 +73,25 @@ _ABSOLUTE_BUDGET_LIMITS = {
     "max_tool_calls": 100_000,
     "max_parallel_calls": 1_024,
 }
+_RESUMABLE_TOOLS = {
+    **{f"suiteharness.fs.{name}": ("fs", frozenset({ToolEffect.READ}))
+       for name in ("list", "read", "glob", "grep")},
+    **{f"suiteharness.web.{name}": ("web", frozenset({ToolEffect.READ, ToolEffect.EXTERNAL}))
+       for name in ("search", "fetch")},
+}
+_WEB_RESUME_TTL_SECONDS = 300.0
+
+
+def _contains_run_credentials(value: JsonValue) -> bool:
+    """A run-scoped reference or approval must never cross the resume boundary."""
+    if isinstance(value, dict):
+        return bool(value.keys() & {'result_id', 'result_reference', 'approval_token',
+                                    'approval_binding', 'approval_credential'}) or any(
+            _contains_run_credentials(item) for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_run_credentials(item) for item in value)
+    return False
 
 
 def _utcnow() -> datetime:
@@ -131,6 +154,8 @@ class _RunState:
     tool_calls_used: int = 0
     observations: list[ToolObservation] = field(default_factory=list)
     call_ids: set[str] = field(default_factory=set)
+    aggregate_budget: AggregateRunBudget | None = None
+    cancel_signal: asyncio.Event | None = None
 
 
 @dataclass(slots=True)
@@ -180,10 +205,18 @@ class ExecutionRunner:
             active.cancel.set()
             return True
 
-    async def run(self, request: RunRequest, strategies: ExecutionStrategies) -> RunResult:
+    async def run(
+        self,
+        request: RunRequest,
+        strategies: ExecutionStrategies,
+        *,
+        aggregate_budget: AggregateRunBudget | None = None,
+    ) -> RunResult:
         """Collect the same event stream consumed by interactive channels."""
         result = None
-        async with contextlib.aclosing(self.stream(request, strategies)) as source:
+        async with contextlib.aclosing(
+            self.stream(request, strategies, aggregate_budget=aggregate_budget)
+        ) as source:
             async for event in source:
                 if event.result is not None:
                     result = event.result
@@ -192,7 +225,11 @@ class ExecutionRunner:
         return result
 
     async def stream(
-        self, request: RunRequest, strategies: ExecutionStrategies,
+        self,
+        request: RunRequest,
+        strategies: ExecutionStrategies,
+        *,
+        aggregate_budget: AggregateRunBudget | None = None,
     ) -> AsyncIterator[RunEvent]:
         queue: asyncio.Queue[RunEvent | BaseException | None] = asyncio.Queue(maxsize=16)
         sequence = 0
@@ -216,7 +253,9 @@ class ExecutionRunner:
         async def produce():
             try:
                 await publish('started')
-                result = await self._run(request, strategies, publish)
+                result = await self._run(
+                    request, strategies, publish, aggregate_budget=aggregate_budget
+                )
                 # _run translates cancellation into a structured result. Do not
                 # block writing that result into an abandoned full queue.
                 if asyncio.current_task().cancelling():
@@ -251,11 +290,26 @@ class ExecutionRunner:
     async def _run(
         self, request: RunRequest, strategies: ExecutionStrategies,
         publish: Callable[..., Awaitable[None]],
+        *,
+        aggregate_budget: AggregateRunBudget | None = None,
     ) -> RunResult:
         """Execute one run with an overall timeout and structured termination."""
 
-        state = _RunState(started_at=_utcnow(), started_monotonic=time.monotonic(), publish=publish)
+        started_monotonic = time.monotonic()
+        pool = aggregate_budget or AggregateRunBudget(
+            max_iterations=request.budget.max_iterations,
+            max_tool_calls=request.budget.max_tool_calls,
+            max_children=2,
+            deadline_monotonic=started_monotonic + request.budget.timeout_seconds,
+        )
+        state = _RunState(
+            started_at=_utcnow(),
+            started_monotonic=started_monotonic,
+            publish=publish,
+            aggregate_budget=pool,
+        )
         cancel_event = asyncio.Event()
+        state.cancel_signal = cancel_event
         run_key = self._run_key(request.scope, request.run_id)
         async with self.__active_lock:
             if run_key in self.__active:
@@ -275,7 +329,7 @@ class ExecutionRunner:
         try:
             done, _ = await asyncio.wait(
                 {loop_task, cancel_task},
-                timeout=request.budget.timeout_seconds,
+                timeout=min(request.budget.timeout_seconds, pool.remaining_seconds),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if loop_task in done:
@@ -371,7 +425,55 @@ class ExecutionRunner:
         assert grant is not None
 
         workflow_state: JsonValue = None
-        for iteration in range(1, request.budget.max_iterations + 1):
+        resume = request.resume
+        if resume is not None:
+            if not self._valid_resume(request, grant):
+                return await self._strategy_failure(
+                    request, state, FailureCode.WORKFLOW_ERROR,
+                    "resume checkpoint is unsafe or no longer authorized", 1,
+                )
+            state.iterations_used = resume.iterations_used
+            state.tool_calls_used = resume.tool_calls_used
+            state.observations = [item.model_copy(deep=True) for item in resume.observations]
+            state.call_ids = set(resume.call_ids)
+            workflow_state = resume.model_copy(deep=True).workflow_state
+            assert state.aggregate_budget is not None
+            # Charge inherited work to the new aggregate pool as well as the
+            # per-run counters. A continuation cannot replenish either budget.
+            for _ in range(resume.iterations_used):
+                if not await state.aggregate_budget.take_iteration():
+                    return await self._strategy_failure(
+                        request, state, FailureCode.ITERATION_BUDGET_EXCEEDED,
+                        "resume exceeds aggregate iteration budget", 1,
+                    )
+            if await state.aggregate_budget.take_tool_slots(resume.tool_calls_used) != resume.tool_calls_used:
+                return await self._strategy_failure(
+                    request, state, FailureCode.TOOL_BUDGET_EXCEEDED,
+                    "resume exceeds aggregate tool budget", 1,
+                )
+
+        first_iteration = state.iterations_used + 1
+        checkpoint_safe = True
+        checkpoint_pending: int | None = None
+        for iteration in range(first_iteration, request.budget.max_iterations + 1):
+            assert state.aggregate_budget is not None
+            if not await state.aggregate_budget.take_iteration():
+                return await self._finish(
+                    request,
+                    self._result(
+                        request,
+                        state,
+                        RunStatus.BUDGET_EXCEEDED,
+                        failure=RunFailure(
+                            code=FailureCode.ITERATION_BUDGET_EXCEEDED,
+                            message=(
+                                "parent and delegated runs exhausted their "
+                                "aggregate iteration budget"
+                            ),
+                            iteration=iteration,
+                        ),
+                    ),
+                )
             state.iterations_used = iteration
             grant, failure = await self._grant(request)
             if failure is not None:
@@ -410,6 +512,35 @@ class ExecutionRunner:
                         "prompt strategy returned an invalid result",
                         iteration,
                     )
+
+            # Bind the original rendered prompt, before the runtime clock is
+            # appended. Only run identity metadata is allowed to change.
+            prompt_digest = self._prompt_digest(request, prompt)
+            try:
+                route_key = strategies.workflow.resume_key(request, frame, prompt)
+            except Exception:
+                return await self._strategy_failure(
+                    request, state, FailureCode.WORKFLOW_ERROR,
+                    "workflow resume compatibility check failed", iteration,
+                )
+            if resume is not None and iteration == first_iteration and (
+                route_key is None or route_key != resume.route_key
+                or prompt_digest != resume.prompt_digest
+            ):
+                return await self._strategy_failure(
+                    request, state, FailureCode.WORKFLOW_ERROR,
+                    "resume route or prompt no longer matches", iteration,
+                )
+            if iteration == 1 and resume is None and route_key is not None:
+                await self._checkpoint(request, state, workflow_state, prompt_digest, route_key,
+                                       iterations_used=0)
+            elif checkpoint_pending is not None and route_key is not None:
+                # Bind the prompt for the frame that will consume these completed
+                # observations. Dynamic prompts may change after every batch.
+                await self._checkpoint(request, state, workflow_state, prompt_digest, route_key,
+                                       iterations_used=checkpoint_pending)
+            checkpoint_pending = None
+            if prompt is not None:
                 prompt = with_runtime_environment(prompt, instant=state.started_at)
 
             try:
@@ -422,6 +553,11 @@ class ExecutionRunner:
                         if isinstance(event, WorkflowDecision):
                             decision = event
                         elif isinstance(event, WorkflowEvent):
+                            if event.kind not in {
+                                'delta', 'status', 'usage',
+                                'compact_started', 'compact_completed',
+                            }:
+                                raise ValueError('workflow emitted a reserved event kind')
                             await state.publish(event.kind, event.text, event.data)
                         else:
                             raise TypeError('invalid workflow stream event')
@@ -499,7 +635,9 @@ class ExecutionRunner:
                 )
 
             remaining = request.budget.max_tool_calls - state.tool_calls_used
-            permitted_count = min(max(remaining, 0), len(decision.intents))
+            permitted_count = await state.aggregate_budget.take_tool_slots(
+                min(max(remaining, 0), len(decision.intents))
+            )
             permitted = decision.intents[:permitted_count]
             overflow = decision.intents[permitted_count:]
             state.tool_calls_used += len(permitted)
@@ -517,6 +655,14 @@ class ExecutionRunner:
                 state,
             )
             state.observations.extend(observations)
+            checkpoint_safe = checkpoint_safe and not overflow and all(
+                self._safe_observation(request, item) for item in observations
+            ) and not any(
+                intent.approval_token is not None or _contains_run_credentials(intent.arguments)
+                for intent in permitted
+            )
+            # A crash before the next frame/prompt is ready remains fail closed.
+            checkpoint_pending = iteration if checkpoint_safe else None
             if overflow:
                 for intent in overflow:
                     state.observations.append(
@@ -549,6 +695,139 @@ class ExecutionRunner:
                 ),
             ),
         )
+
+    @staticmethod
+    def _prompt_digest(request: RunRequest, prompt: PromptEnvelope | None) -> str:
+        rendered = None if prompt is None else prompt.model_dump(mode='json')
+        if rendered is not None:
+            rendered['metadata'].pop('run_id', None)
+        scope = request.scope
+        payload = {
+            'prompt': rendered, 'input': request.input,
+            'conversation': request.conversation.model_dump(mode='json'),
+            'identity': {
+                'tenant_id': scope.tenant_id, 'product_id': scope.product_id,
+                'agent_id': scope.path.agent_id, 'session_id': scope.path.session_id,
+                'principal_id': scope.principal_id,
+                'session_owner_id': scope.effective_session_owner_id,
+                'channel_id': scope.channel_id, 'roles': sorted(scope.roles),
+            },
+        }
+        return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+    def _safe_registration(self, request: RunRequest, name: str) -> bool:
+        expected = _RESUMABLE_TOOLS.get(name)
+        registered = self.__tools.resolve(request.scope, name)
+        if expected is None or registered is None:
+            return False
+        family, effects = expected
+        return (
+            registered.registration_scope == ScopePath.root()
+            and registered.identity == ToolIdentity(
+                namespace='suiteharness', name=name,
+                origin=f'suiteharness.builtin.{family}', version='1',
+            )
+            and registered.spec.effects == effects
+        )
+
+    def _safe_observation(self, request: RunRequest, observation: ToolObservation) -> bool:
+        if observation.status is not ToolCallStatus.SUCCEEDED:
+            return False
+        if not self._safe_registration(request, observation.tool_name):
+            return False
+        registered = self.__tools.resolve(request.scope, observation.tool_name)
+        return (
+            registered is not None and observation.tool_identity == registered.identity
+            and not _contains_run_credentials(observation.result)
+            and not _contains_run_credentials(observation.arguments)
+        )
+
+    def _valid_resume(self, request: RunRequest, grant: CapabilityGrant) -> bool:
+        resume = request.resume
+        assert resume is not None
+        if (
+            not request.read_only or request.run_id == resume.source_run_id
+            or resume.iterations_used >= request.budget.max_iterations
+            or resume.tool_calls_used > request.budget.max_tool_calls
+            or len(canonical_json(resume.model_dump(mode='json'))) > self._checkpoint_limit()
+            or _contains_run_credentials(resume.workflow_state)
+            or resume.tool_calls_used != len(resume.observations)
+            or len(resume.call_ids) != len(set(resume.call_ids))
+            or set(resume.call_ids) != {item.call_id for item in resume.observations}
+            or len(resume.call_ids) != len(resume.observations)
+            or (resume.observations and (resume.iterations_used == 0 or resume.workflow_state is None))
+        ):
+            return False
+        now = datetime.now(UTC)
+        for observation in resume.observations:
+            if not self._safe_observation(request, observation):
+                return False
+            if observation.tool_name in {'suiteharness.web.search', 'suiteharness.web.fetch'}:
+                age = (now - observation.finished_at).total_seconds()
+                if not 0 <= age < _WEB_RESUME_TTL_SECONDS:
+                    return False
+            registered = self.__tools.resolve(request.scope, observation.tool_name)
+            assert registered is not None
+            if (registered.identity not in grant.tool_identities
+                    or registered.spec.required_capabilities - grant.capabilities):
+                return False
+            authorization = ToolAuthorization.DEFAULT
+            arguments = observation.arguments
+            if arguments is not None:
+                payload = canonical_json(arguments)
+                if len(payload) > self.__policy.max_tool_argument_bytes:
+                    return False
+                # A policy or validator must not mutate the persisted snapshot.
+                arguments = json.loads(payload)
+                try:
+                    registered.input_validator.validate(arguments)
+                except Exception:
+                    return False
+            if self.__authorization_policy is not None:
+                # Older checkpoints cannot prove argument-scoped authorization.
+                if arguments is None:
+                    return False
+                try:
+                    authorization = self.__authorization_policy.evaluate(
+                        request, registered.identity, registered.spec, arguments,
+                    )
+                except Exception:
+                    return False
+            if (not isinstance(authorization, ToolAuthorization)
+                    or authorization in {ToolAuthorization.DENY, ToolAuthorization.REQUIRE_APPROVAL}
+                    or (authorization is ToolAuthorization.DEFAULT
+                        and self.__policy.requires_approval(registered.spec))):
+                # Reuse never consumes an old approval or prompts for a new one.
+                return False
+        return True
+
+    def _checkpoint_limit(self) -> int:
+        return min(256 * 1024, self.__policy.max_workflow_state_bytes,
+                   self.__policy.max_tool_result_bytes)
+
+    async def _checkpoint(
+        self, request: RunRequest, state: _RunState, workflow_state: JsonValue,
+        prompt_digest: str, route_key: str, *, iterations_used: int,
+    ) -> None:
+        if len(state.observations) > 1024 or len(state.call_ids) > 1024:
+            # Checkpoint storage is optional; its narrower bounds must not fail
+            # an otherwise valid execution using a larger approved budget.
+            return
+        if _contains_run_credentials(workflow_state):
+            return
+        # The checkpoint contains no grant or approval. The application must
+        # obtain a fresh grant and authorize the source run before constructing
+        # an internal RunRequest.resume.
+        resume = RunResumeState(
+            source_run_id=request.run_id, workflow_state=workflow_state,
+            observations=tuple(state.observations), iterations_used=iterations_used,
+            tool_calls_used=state.tool_calls_used, call_ids=tuple(sorted(state.call_ids)),
+            prompt_digest=prompt_digest, route_key=route_key,
+        )
+        data = {'resume_state': resume.model_dump(mode='json'), 'input': request.input,
+                'conversation': request.conversation.model_dump(mode='json')}
+        if len(canonical_json(data)) <= self._checkpoint_limit():
+            await state.publish('checkpoint', data=data)
 
     async def _execute_batch(
         self,
@@ -683,6 +962,12 @@ class ExecutionRunner:
                 "non-read tool is blocked for a read-only run",
                 tool_identity=registered.identity,
             )
+        if request.resume is not None and not self._safe_registration(request, intent.tool_name):
+            return await self._deny(
+                request, intent, iteration, started_at, FailureCode.POLICY_DENIED,
+                "only trusted read tools are available during resume",
+                tool_identity=registered.identity,
+            )
 
         try:
             registered.input_validator.validate(safe_arguments)
@@ -802,6 +1087,10 @@ class ExecutionRunner:
                 request.budget.timeout_seconds
                 - (time.monotonic() - state.started_monotonic),
             ),
+            grant_id=request.grant_id,
+            read_only=request.read_only,
+            aggregate_budget=state.aggregate_budget,
+            cancel_signal=state.cancel_signal,
         )
         try:
             raw_result = await registered.handler(context, safe_arguments)
@@ -809,6 +1098,13 @@ class ExecutionRunner:
             result_payload = canonical_json(validated)
         except asyncio.CancelledError:
             raise
+        except ToolHandlerDenied:
+            return await self._deny(
+                request, intent, iteration, started_at,
+                FailureCode.POLICY_DENIED,
+                "trusted tool handler denied this call",
+                tool_identity=registered.identity,
+            )
         except ValidationError:
             return await self._tool_failure(
                 request,
@@ -877,9 +1173,16 @@ class ExecutionRunner:
             tool_identity=registered.identity,
             data={"status": ToolCallStatus.SUCCEEDED.value},
         )
+        resume_arguments = None
+        if self._safe_registration(request, intent.tool_name):
+            original_arguments = json.loads(argument_payload)
+            if not _contains_run_credentials(original_arguments):
+                resume_arguments = original_arguments
         return ToolObservation(
             call_id=intent.call_id,
             tool_name=intent.tool_name,
+            tool_identity=registered.identity,
+            arguments=resume_arguments,
             status=ToolCallStatus.SUCCEEDED,
             result=result,
             started_at=started_at,
@@ -937,6 +1240,8 @@ class ExecutionRunner:
             if item.spec.required_capabilities - grant.capabilities:
                 continue
             if request.read_only and not item.spec.is_read:
+                continue
+            if request.resume is not None and not self._safe_registration(request, name):
                 continue
             visible.append(item.spec.model_copy(deep=True))
         return tuple(visible)

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from suiteharness.sessions.protocols import SessionStore
-
 import asyncio
 import copy
 import hashlib
@@ -22,6 +20,9 @@ from suiteharness.sessions.errors import (
     SessionRevisionConflictError,
 )
 from suiteharness.sessions.models import (
+    RESUME_POINT_TTL_SECONDS,
+    RunResumePoint,
+    RunStopOutcome,
     SessionCheckpoint,
     SessionIdentity,
     SessionRecord,
@@ -32,9 +33,13 @@ from suiteharness.sessions.models import (
     TranscriptEvent,
     TranscriptEventType,
     canonical_json,
+    finished_resume_run_id,
     memory_invalidation_source,
+    safe_resume_point,
     utc_now,
+    validate_transcript_page,
 )
+from suiteharness.sessions.protocols import SessionStore
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OWNER_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
@@ -66,6 +71,9 @@ class InMemorySessionStore(SessionStore):
         self._run_claims: dict[
             tuple[SessionIdentity, str], tuple[str, str, datetime]
         ] = {}
+        self._run_stops: set[tuple[SessionIdentity, str]] = set()
+        self._resume_points: dict[tuple[SessionIdentity, str], RunResumePoint] = {}
+        self._resume_point_bytes: dict[tuple[SessionIdentity, str], int] = {}
         self._clock = clock
         self._limits = limits or SessionStoreLimits()
         self._lock = asyncio.Lock()
@@ -150,6 +158,119 @@ class InMemorySessionStore(SessionStore):
             )
             return True
 
+    async def request_stop(
+        self,
+        identity: SessionIdentity,
+        *,
+        run_id: str,
+    ) -> RunStopOutcome:
+        self._validate_run_id(run_id)
+        async with self._lock:
+            now = self._now()
+            claim = self._run_claims.get((identity, run_id))
+            if claim is None:
+                return RunStopOutcome.NOT_FOUND
+            if claim[1] != "active" or claim[2] <= now:
+                return RunStopOutcome.ALREADY_FINISHED
+            key = (identity, run_id)
+            if key in self._run_stops:
+                return RunStopOutcome.ALREADY_REQUESTED
+            self._run_stops.add(key)
+            return RunStopOutcome.REQUESTED
+
+    async def stop_requested(
+        self,
+        identity: SessionIdentity,
+        *,
+        run_id: str,
+    ) -> bool:
+        self._validate_run_id(run_id)
+        async with self._lock:
+            return (identity, run_id) in self._run_stops
+
+    async def active_run_ids(
+        self,
+        identity: SessionIdentity,
+        *,
+        limit: int = 4,
+    ) -> tuple[str, ...]:
+        self._validate_active_run_limit(limit)
+        async with self._lock:
+            now = self._now()
+            return tuple(
+                run_id
+                for (claim_identity, run_id), (_, state, expires_at) in self._run_claims.items()
+                if claim_identity == identity and state == "active" and expires_at > now
+            )[:limit]
+
+    async def save_resume_point(
+        self, identity: SessionIdentity, point: RunResumePoint,
+    ) -> RunResumePoint | None:
+        checked = safe_resume_point(point)
+        if checked is None or checked.identity != identity:
+            return None
+        point_bytes = len(checked.model_dump_json().encode("utf-8"))
+        if point_bytes > self._limits.max_resume_point_bytes:
+            return None
+        async with self._lock:
+            now = self._now()
+            self._expire_resume_points(now)
+            key = (identity, checked.run_id)
+            claim = self._run_claims.get(key)
+            record = self._sessions.get(identity)
+            prior = self._resume_points.get(key)
+            if (claim is None or claim[1] != "active" or claim[2] <= now
+                    or key in self._run_stops or record is None
+                    or not 0 <= (now - checked.created_at).total_seconds() < RESUME_POINT_TTL_SECONDS
+                    or checked.memory_invalidated_revision != record.memory_invalidated_revision
+                    or checked.memory_source_versions != record.memory_source_versions
+                    or (prior is not None and checked.created_at < prior.created_at)):
+                return None
+            self._resume_points[key] = checked
+            self._resume_point_bytes[key] = point_bytes
+            self._trim_resume_points(identity, key)
+            return checked.model_copy(deep=True)
+
+    async def get_resume_point(
+        self, identity: SessionIdentity, *, run_id: str,
+    ) -> RunResumePoint | None:
+        self._validate_run_id(run_id)
+        async with self._lock:
+            now = self._now()
+            self._expire_resume_points(now)
+            point = self._resume_points.get((identity, run_id))
+            if point is None or not 0 <= (now - point.created_at).total_seconds() < RESUME_POINT_TTL_SECONDS:
+                return None
+            return point.model_copy(deep=True)
+
+    def _discard_resume_point(self, key: tuple[SessionIdentity, str]) -> None:
+        self._resume_points.pop(key, None)
+        self._resume_point_bytes.pop(key, None)
+
+    def _expire_resume_points(self, now: datetime) -> None:
+        expired = [key for key, point in self._resume_points.items()
+                   if (now - point.created_at).total_seconds() >= RESUME_POINT_TTL_SECONDS]
+        for key in expired:
+            self._discard_resume_point(key)
+
+    def _trim_resume_points(
+        self, identity: SessionIdentity, keep: tuple[SessionIdentity, str],
+    ) -> None:
+        for scope, max_count, max_bytes in (
+            (identity, self._limits.max_resume_points_per_session, self._limits.max_resume_bytes_per_session),
+            (None, self._limits.max_resume_points_total, self._limits.max_resume_bytes_total),
+        ):
+            keys = sorted((key for key in self._resume_points if scope is None or key[0] == scope),
+                          key=lambda key: self._resume_points[key].created_at)
+            count, size = len(keys), sum(self._resume_point_bytes[key] for key in keys)
+            for key in keys:
+                if count <= max_count and size <= max_bytes:
+                    break
+                if key != keep:
+                    count -= 1
+                    size -= self._resume_point_bytes[key]
+                    self._discard_resume_point(key)
+
     async def append(
         self,
         identity: SessionIdentity,
@@ -227,6 +348,10 @@ class InMemorySessionStore(SessionStore):
                     "updated_at": max(record.updated_at, event.occurred_at),
                 }
             )
+            self._expire_resume_points(self._now())
+            finished_run = finished_resume_run_id(event_type, payload_copy)
+            if finished_run is not None:
+                self._discard_resume_point((identity, finished_run))
             return event.model_copy(deep=True)
 
     async def save_checkpoint(
@@ -353,6 +478,17 @@ class InMemorySessionStore(SessionStore):
                 item.model_copy(deep=True) for item in self._events[identity][-limit:]
             )
 
+    async def transcript_page(
+        self, identity: SessionIdentity, *, limit: int, before_sequence: int | None = None,
+    ) -> tuple[TranscriptEvent, ...]:
+        validate_transcript_page(limit, before_sequence)
+        async with self._lock:
+            self._require(identity)
+            events = self._events[identity]
+            # Durable transcript sequences are contiguous and never pruned.
+            end = len(events) if before_sequence is None else min(len(events), before_sequence - 1)
+            return tuple(item.model_copy(deep=True) for item in events[max(0, end - limit):end])
+
     def _require(self, identity: SessionIdentity) -> SessionRecord:
         try:
             return self._sessions[identity]
@@ -371,8 +507,7 @@ class InMemorySessionStore(SessionStore):
         owner_token: str,
         lease_seconds: float,
     ) -> None:
-        if not isinstance(run_id, str) or not _IDENTIFIER.fullmatch(run_id):
-            raise ValueError("invalid session run_id")
+        InMemorySessionStore._validate_run_id(run_id)
         if not isinstance(owner_token, str) or not _OWNER_TOKEN.fullmatch(owner_token):
             raise ValueError("invalid session run owner_token")
         if (
@@ -383,6 +518,16 @@ class InMemorySessionStore(SessionStore):
             or lease_seconds > 172_800
         ):
             raise ValueError("session run lease_seconds must be in (0, 172800]")
+
+    @staticmethod
+    def _validate_run_id(run_id: str) -> None:
+        if not isinstance(run_id, str) or not _IDENTIFIER.fullmatch(run_id):
+            raise ValueError("invalid session run_id")
+
+    @staticmethod
+    def _validate_active_run_limit(limit: int) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1_000:
+            raise ValueError("active run limit must be between 1 and 1000")
 
     @staticmethod
     def _check_revision(record: SessionRecord, expected: int | None) -> None:

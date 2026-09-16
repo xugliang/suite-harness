@@ -24,6 +24,8 @@ products/product_a/
 
 产品不应复制 Harness 的认证、审批、审计、Bash、文件工具、Web 搜索/抓取、Docker 沙箱、模型厂商适配器或渠道服务器。这些能力由公司部署底座统一提供。
 
+受控多 Agent 也是底座的可选能力。产品仍可保持单 Agent；要启用同产品子任务，只需由部署配置定义角色并精确授权 `agent.delegate`，无需修改现有产品的 `Workflow`。只有选择自定义子工作流模型路由的产品，才须实现 `RoleRoutedWorkflow.with_role_route()`；详见[多 Agent 接入指南](multi-agent.zh-CN.md)。产品自己的客户归属和资料读取规则不能由子任务绕过。
+
 产品也不能假设公司 shared 工作区存在。每个产品默认只获得自己的 product 工作区；共享目录由部署配置默认关闭，即使启用也要逐产品赋予 `read_only`（只读）或 `read_write`（读写）。需要交换结构化用户事实时应走下文的 Customer360 策展流程，不要把共享文件夹当成绕过画像边界的数据库。
 
 ## 2. 第一步：定义严格配置和 ProductDescriptor

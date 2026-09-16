@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from suiteharness.execution.events import WorkflowEvent
-
-import json
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from pydantic import JsonValue
 
+from suiteharness.execution.events import WorkflowEvent
 from suiteharness.execution.models import (
-    ConversationMessage,
-    PromptMessage,
     ApprovalBinding,
     ApprovalTarget,
     AuditEvent,
     CapabilityGrant,
+    ConversationMessage,
     PromptEnvelope,
+    PromptMessage,
     RunRequest,
     ToolAuthorization,
     ToolIdentity,
@@ -36,6 +36,13 @@ from suiteharness.runtime.scopes import (
     ServiceKey,
 )
 
+if TYPE_CHECKING:
+    from suiteharness.multiagent.budget import AggregateRunBudget
+
+
+class ToolHandlerDenied(PermissionError):
+    """Trusted handler refusal that the runner records as a policy denial."""
+
 
 @dataclass(frozen=True, slots=True)
 class ToolCallContext:
@@ -45,6 +52,10 @@ class ToolCallContext:
     tool_identity: ToolIdentity
     tool: ToolSpec
     remaining_seconds: float
+    grant_id: str | None = None
+    read_only: bool = False
+    aggregate_budget: AggregateRunBudget | None = None
+    cancel_signal: asyncio.Event | None = None
 
 
 @runtime_checkable
@@ -152,6 +163,12 @@ class AuditJournal(ABC):
 
 
 class Workflow(ABC):
+    def resume_key(
+        self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
+    ) -> str | None:
+        """Opt in to internal checkpoints; unsupported workflows fail closed."""
+        return None
+
     async def stream(
         self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
     ) -> AsyncIterator[WorkflowEvent | WorkflowDecision]:
