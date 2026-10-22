@@ -79,8 +79,6 @@ def test_runner_emits_live_delta_and_authoritative_result_once():
             events = [await asyncio.wait_for(anext(source), 1)]
             assert events[0].kind == 'started'
             events.append(await asyncio.wait_for(anext(source), 1))
-            while events[-1].kind == 'checkpoint':
-                events.append(await asyncio.wait_for(anext(source), 1))
             assert events[-1].text == '你'
             assert not gateway.finished
             gateway.release.set()
@@ -113,9 +111,7 @@ def test_closing_stream_cancels_model_and_releases_active_run():
         strategies = ExecutionStrategies(workflow=ReActWorkflow(gateway, 'chat'))
         source = runner.stream(request, strategies)
         await anext(source)
-        event = await anext(source)
-        while event.kind == 'checkpoint':
-            event = await anext(source)
+        await anext(source)
         await asyncio.wait_for(source.aclose(), 1)
         assert gateway.closed
         assert not await runner.cancel(request.scope, request.run_id)

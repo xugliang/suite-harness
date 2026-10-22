@@ -4,6 +4,15 @@ Products may replace the exported strategy protocols, but every ToolIntent must
 still pass through :class:`ExecutionRunner` and its root-owned dependencies.
 """
 
+from suiteharness.execution.commands import (
+    CommandContext,
+    CommandHandler,
+    CommandRegistry,
+    CommandSpec,
+    InMemoryCommandRegistry,
+    UniqueCommandHandler,
+    command_text,
+)
 from suiteharness.execution.in_memory import (
     InMemoryApprovalStore,
     InMemoryAuditJournal,
@@ -55,7 +64,6 @@ from suiteharness.execution.protocols import (
     ToolAuthorizationPolicy,
     ToolCallContext,
     ToolHandler,
-    ToolHandlerDenied,
     ToolInputValidator,
     ToolRegistry,
     Workflow,
@@ -77,6 +85,10 @@ __all__ = [
     "AuditJournal",
     "CapabilityAuthority",
     "CapabilityGrant",
+    "CommandContext",
+    "CommandHandler",
+    "CommandRegistry",
+    "CommandSpec",
     "ConversationContext",
     "ConversationMessage",
     "ExecutionBudget",
@@ -87,6 +99,7 @@ __all__ = [
     "InMemoryApprovalStore",
     "InMemoryAuditJournal",
     "InMemoryCapabilityAuthority",
+    "InMemoryCommandRegistry",
     "InMemoryToolRegistry",
     "InteractiveApprovalBroker",
     "PromptEnvelope",
@@ -104,7 +117,6 @@ __all__ = [
     "ToolAuthorization",
     "ToolEffect",
     "ToolHandler",
-    "ToolHandlerDenied",
     "ToolIdentity",
     "ToolInputValidator",
     "ToolIntent",
@@ -113,9 +125,11 @@ __all__ = [
     "ToolAuthorizationPolicy",
     "ToolRegistrationHandle",
     "ToolSpec",
+    "UniqueCommandHandler",
     "Workflow",
     "WorkflowDecision",
     "WorkflowDecisionKind",
     "WorkflowFrame",
     "arguments_digest",
+    "command_text",
 ]

@@ -5,6 +5,8 @@ This reusable adapter depends only on SuiteHarness channel contracts.
 """
 from __future__ import annotations
 
+from suiteharness.diagnostics import traced_reply
+
 import asyncio
 import concurrent.futures
 import hashlib
@@ -13,9 +15,11 @@ import json
 import math
 import re
 import threading
+import time
 import unicodedata
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 from pydantic import SecretStr
@@ -53,6 +57,22 @@ class FeishuTextClient(Protocol):
     ) -> Any: ...
 
 
+class FeishuProgressClient(FeishuTextClient, Protocol):
+    """Optional Feishu surface used by the progressive reply adapter."""
+
+    async def add_reaction(self, message_id: str, emoji_type: str) -> None: ...
+
+    async def send_interactive_card(
+        self,
+        receive_id: str,
+        markdown: str,
+        *,
+        receive_id_type: str = "chat_id",
+        idempotency_key: str | None = None,
+    ) -> Any: ...
+
+    async def patch_interactive_card(self, message_id: str, markdown: str) -> None: ...
+
 class SafeFeishuTextFormatter:
     """Convert a terminal SuiteHarness event into bounded Feishu plain text."""
 
@@ -74,6 +94,13 @@ class SafeFeishuTextFormatter:
             )
         else:
             raise ValueError("only terminal SuiteHarness events can be formatted")
+        return self._sanitize(text)
+
+    def sanitize(self, text: str) -> str:
+        """Normalize untrusted streamed model text for an interactive card."""
+
+        if not isinstance(text, str):
+            raise TypeError("Feishu streamed text must be a string")
         return self._sanitize(text)
 
     @staticmethod
@@ -161,6 +188,7 @@ class FinalReplySink:
         # sufficient for this per-deployment idempotency namespace.
         return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
+    @traced_reply
     async def __call__(self, message: InboundMessage, event: OutboundEvent) -> None:
         if message.channel is not ChannelKind.FEISHU:
             raise ValueError("Feishu outbound sink received another channel")
@@ -217,6 +245,190 @@ class FinalReplySink:
             receive_id_type="chat_id",
             idempotency_key=key,
         )
+
+
+@dataclass(slots=True)
+class _ProgressiveDelivery:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    card_message_id: str | None = None
+    text: str = ""
+    last_published_chars: int = 0
+    last_update_at: float = 0.0
+    reaction_attempted: bool = False
+    terminal: bool = False
+
+
+class ProgressiveReplySink:
+    """Acknowledge a request and replace one Feishu card as text arrives.
+
+    Products continue emitting generic ``STARTED`` and ``DELTA`` events.  This
+    reusable channel adapter owns the Feishu-specific acknowledgement, card
+    creation and throttled in-place updates.
+    """
+
+    def __init__(
+        self,
+        client: FeishuProgressClient,
+        *,
+        formatter: SafeFeishuTextFormatter | None = None,
+        update_min_chars: int = 24,
+        update_interval_seconds: float = 0.8,
+        max_delivery_keys: int = 100_000,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        required = ("send_text", "add_reaction", "send_interactive_card", "patch_interactive_card")
+        if any(not callable(getattr(client, method, None)) for method in required):
+            raise TypeError("client must implement the Feishu progressive reply methods")
+        if not isinstance(update_min_chars, int) or isinstance(update_min_chars, bool) or update_min_chars <= 0:
+            raise ValueError("update_min_chars must be a positive integer")
+        if not isinstance(update_interval_seconds, (int, float)) or isinstance(update_interval_seconds, bool) or update_interval_seconds <= 0:
+            raise ValueError("update_interval_seconds must be positive")
+        if not isinstance(max_delivery_keys, int) or isinstance(max_delivery_keys, bool) or max_delivery_keys <= 0:
+            raise ValueError("max_delivery_keys must be a positive integer")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self._client = client
+        self._formatter = formatter or SafeFeishuTextFormatter()
+        self._update_min_chars = update_min_chars
+        self._update_interval = float(update_interval_seconds)
+        self._maximum = max_delivery_keys
+        self._clock = clock
+        self._deliveries: OrderedDict[str, _ProgressiveDelivery] = OrderedDict()
+        self._index_lock = asyncio.Lock()
+        self._fallback = FinalReplySink(client)
+
+    @traced_reply
+    async def __call__(self, message: InboundMessage, event: OutboundEvent) -> None:
+        if message.channel is not ChannelKind.FEISHU:
+            raise ValueError("Feishu outbound sink received another channel")
+        if event.kind not in {OutboundEventKind.STARTED, OutboundEventKind.DELTA, OutboundEventKind.COMPLETED, OutboundEventKind.FAILED}:
+            return
+        key = FinalReplySink._delivery_key(message, event)
+        delivery = await self._delivery_for_run(message, key)
+        async with delivery.lock:
+            if delivery.terminal:
+                return
+            if event.kind is OutboundEventKind.STARTED:
+                await self._start(message, delivery, key)
+                return
+            if event.kind is OutboundEventKind.DELTA:
+                fragment = event.payload.get("text")
+                if isinstance(fragment, str) and fragment:
+                    delivery.text += fragment
+                    await self._publish_if_due(delivery)
+                return
+            delivery.terminal = True
+            await self._finish(message, event, delivery, key)
+
+    async def acknowledge_received(self, message: InboundMessage) -> None:
+        """Show receipt feedback before session, memory, or agent setup begins."""
+
+        if message.channel is not ChannelKind.FEISHU:
+            raise ValueError("Feishu acknowledgement received another channel")
+        key = self._inbound_key(message)
+        delivery = await self._delivery_for(key)
+        async with delivery.lock:
+            if not delivery.terminal:
+                await self._start(message, delivery, key)
+
+    @staticmethod
+    def _inbound_key(message: InboundMessage) -> str:
+        material = "\x00".join((message.event_id, message.message_id, message.conversation_id))
+        return "inbound-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+    async def _delivery_for_run(
+        self,
+        message: InboundMessage,
+        run_key: str,
+    ) -> _ProgressiveDelivery:
+        inbound_key = self._inbound_key(message)
+        async with self._index_lock:
+            delivery = self._deliveries.get(run_key)
+            inbound = self._deliveries.pop(inbound_key, None)
+            if delivery is None:
+                delivery = inbound or _ProgressiveDelivery()
+                self._deliveries[run_key] = delivery
+            elif inbound is not None and inbound is not delivery:
+                # A replay may race a new run.  The run-keyed state remains the
+                # owner; discard only the duplicate pre-run acknowledgement.
+                pass
+            self._deliveries.move_to_end(run_key)
+            self._prune_completed()
+            return delivery
+
+    async def _delivery_for(self, key: str) -> _ProgressiveDelivery:
+        async with self._index_lock:
+            delivery = self._deliveries.get(key)
+            if delivery is None:
+                delivery = _ProgressiveDelivery()
+                self._deliveries[key] = delivery
+            else:
+                self._deliveries.move_to_end(key)
+            self._prune_completed()
+            return delivery
+
+    def _prune_completed(self) -> None:
+        while len(self._deliveries) > self._maximum:
+            oldest_key, oldest = next(iter(self._deliveries.items()))
+            if not oldest.terminal:
+                break
+            self._deliveries.pop(oldest_key, None)
+
+    async def _start(self, message: InboundMessage, delivery: _ProgressiveDelivery, key: str) -> None:
+        if delivery.card_message_id is not None:
+            return
+        reaction = None
+        if not delivery.reaction_attempted:
+            delivery.reaction_attempted = True
+            reaction = self._client.add_reaction(message.message_id, "OK")
+        try:
+            card = self._client.send_interactive_card(
+                message.conversation_id,
+                "⏳ 正在思考…",
+                receive_id_type="chat_id",
+                idempotency_key=key,
+            )
+            results = await asyncio.gather(
+                *(() if reaction is None else (reaction,)),
+                card,
+                return_exceptions=True,
+            )
+            result = results[-1]
+            if isinstance(result, BaseException):
+                raise result
+            message_id = getattr(result, "message_id", None)
+            if not isinstance(message_id, str) or not message_id:
+                raise RuntimeError("Feishu interactive card create returned no message id")
+            delivery.card_message_id = message_id
+            delivery.last_update_at = self._clock()
+        except Exception:
+            delivery.card_message_id = None
+
+    async def _publish_if_due(self, delivery: _ProgressiveDelivery) -> None:
+        if delivery.card_message_id is None or not delivery.text:
+            return
+        now = self._clock()
+        new_chars = len(delivery.text) - delivery.last_published_chars
+        if new_chars < self._update_min_chars and now - delivery.last_update_at < self._update_interval:
+            return
+        try:
+            await self._client.patch_interactive_card(delivery.card_message_id, self._formatter.sanitize(delivery.text))
+            delivery.last_published_chars = len(delivery.text)
+            delivery.last_update_at = now
+        except Exception:
+            delivery.card_message_id = None
+
+    async def _finish(self, message: InboundMessage, event: OutboundEvent, delivery: _ProgressiveDelivery, key: str) -> None:
+        text = self._formatter.format(event)
+        if delivery.card_message_id is not None:
+            try:
+                await self._client.patch_interactive_card(delivery.card_message_id, text)
+                delivery.last_published_chars = len(text)
+                delivery.last_update_at = self._clock()
+                return
+            except Exception:
+                delivery.card_message_id = None
+        await self._fallback._send(message, text, key)
 
 
 class LarkLongConnectionClient(Protocol):
@@ -556,7 +768,7 @@ def validate_feishu_credentials(
 
 __all__ = [
     "AsyncCloser", "FeishuDeploymentConfigurationError", "FeishuLongConnectionError",
-    "FeishuTextClient", "FinalReplySink", "LarkClientFactory", "LarkLongConnectionClient",
-    "OfficialLarkLongConnectionSdk", "SafeFeishuTextFormatter", "SdkEventHandler",
+    "FeishuProgressClient", "FeishuTextClient", "FinalReplySink", "LarkClientFactory", "LarkLongConnectionClient",
+    "OfficialLarkLongConnectionSdk", "ProgressiveReplySink", "SafeFeishuTextFormatter", "SdkEventHandler",
     "default_lark_client_factory", "validate_feishu_credentials",
 ]

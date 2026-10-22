@@ -41,7 +41,7 @@ _OWNER_SCHEMA = (
 )
 
 
-class SQLiteSandboxQuarantineStore(SandboxQuarantineStore):
+class SQLSandboxQuarantineOperations(SandboxQuarantineStore):
     """Persist only deterministic container names and sanitized failure reasons."""
 
     def __init__(
@@ -212,6 +212,11 @@ class SQLiteSandboxQuarantineStore(SandboxQuarantineStore):
             or not all(char.isascii() and (char.isalnum() or char in "_-") for char in owner_token)
         ):
             raise ValueError("invalid sandbox lease owner_token")
+
+
+class SQLiteSandboxQuarantineStore(SQLSandboxQuarantineOperations):
+    """SQLite adapter retaining the original public API."""
+
 
 
 __all__ = ["SQLiteSandboxQuarantineStore"]

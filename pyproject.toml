@@ -36,6 +36,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+postgres = [
+    "psycopg[binary,pool]>=3.2,<4",
+]
 feishu = [
     "lark-oapi>=1.4,<2",
 ]

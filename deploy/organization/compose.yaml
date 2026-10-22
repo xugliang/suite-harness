@@ -1,0 +1,33 @@
+services:
+  organization:
+    profiles: [organization]
+    build:
+      context: ../..
+      dockerfile: deploy/organization/Dockerfile
+    image: suite-harness-organization:local
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1
+    tmpfs: [/tmp]
+    volumes:
+      - /etc/suite-products/organization.yaml:/run/config/organization.yaml:ro
+      - /etc/suite-products/organization.secrets.yaml:/run/secrets/organization.yaml:ro
+    command:
+      - python
+      - -m
+      - suiteharness.organization
+      - --config
+      - /run/config/organization.yaml
+      - --secrets
+      - /run/secrets/organization.yaml
+      - serve
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18797/healthz',timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

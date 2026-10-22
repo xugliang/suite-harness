@@ -64,7 +64,7 @@ class SinglePassModelReflectionStrategy(ReflectionStrategy):
             ModelRequest(
                 messages=(
                     ModelMessage.text(ModelRole.SYSTEM, self.system_prompt),
-                    ModelMessage.text(ModelRole.USER, candidate),
+                    ModelMessage.text(ModelRole.USER, candidate, context_category="current_execution"),
                 ),
                 model=self.model,
                 tools=(),

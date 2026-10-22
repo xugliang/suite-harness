@@ -99,7 +99,7 @@ def _epoch_us(value: datetime) -> int:
     return int(value.astimezone(UTC).timestamp() * 1_000_000)
 
 
-class SQLiteChannelEventDeduplicator(EventDeduplicator):
+class SQLChannelEventOperations(EventDeduplicator):
     """Durable bounded implementation of the Feishu ``EventDeduplicator`` protocol.
 
     Bind one instance to a validated scope, then pass it directly to
@@ -340,6 +340,11 @@ class SQLiteChannelEventDeduplicator(EventDeduplicator):
         if task is None:
             raise RuntimeError("channel event claims require an asyncio task")
         return task
+
+
+class SQLiteChannelEventDeduplicator(SQLChannelEventOperations):
+    """SQLite adapter retaining the original public API."""
+
 
 
 __all__ = ["SQLiteChannelEventDeduplicator"]

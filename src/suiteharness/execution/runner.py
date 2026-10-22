@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import math
 import time
@@ -17,8 +16,13 @@ from typing import cast
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
+from suiteharness.diagnostics import emit as diagnostic
+from suiteharness.diagnostics import traced_run, traced_tool
+from suiteharness.diagnostics import update as diagnostic_update
+from suiteharness.execution.commands import CommandContext, CommandRegistry
 from suiteharness.execution.environment import with_runtime_environment
 from suiteharness.execution.events import RunEvent, WorkflowEvent
+from suiteharness.execution.input_errors import input_error_hint
 from suiteharness.execution.models import (
     ApprovalBinding,
     ApprovalTarget,
@@ -30,7 +34,6 @@ from suiteharness.execution.models import (
     RunFailure,
     RunRequest,
     RunResult,
-    RunResumeState,
     RunStatus,
     ToolAuthorization,
     ToolCallStatus,
@@ -53,12 +56,13 @@ from suiteharness.execution.protocols import (
     InteractiveApprovalBroker,
     ToolAuthorizationPolicy,
     ToolCallContext,
-    ToolHandlerDenied,
     ToolRegistry,
 )
 from suiteharness.execution.results import ToolResultStore
-from suiteharness.multiagent.budget import AggregateRunBudget
 from suiteharness.runtime.scopes import RequestScope, ScopePath
+from suiteharness.skills.models import SkillError
+from suiteharness.skills.protocols import SkillProvider
+from suiteharness.skills.runtime import SkillRuntime, bind_skill_runtime, preload_skill
 
 _JSON = TypeAdapter(JsonValue)
 _ABSOLUTE_BYTE_LIMITS = {
@@ -73,29 +77,20 @@ _ABSOLUTE_BUDGET_LIMITS = {
     "max_tool_calls": 100_000,
     "max_parallel_calls": 1_024,
 }
-_RESUMABLE_TOOLS = {
-    **{f"suiteharness.fs.{name}": ("fs", frozenset({ToolEffect.READ}))
-       for name in ("list", "read", "glob", "grep")},
-    **{f"suiteharness.web.{name}": ("web", frozenset({ToolEffect.READ, ToolEffect.EXTERNAL}))
-       for name in ("search", "fetch")},
-}
-_WEB_RESUME_TTL_SECONDS = 300.0
-
-
-def _contains_run_credentials(value: JsonValue) -> bool:
-    """A run-scoped reference or approval must never cross the resume boundary."""
-    if isinstance(value, dict):
-        return bool(value.keys() & {'result_id', 'result_reference', 'approval_token',
-                                    'approval_binding', 'approval_credential'}) or any(
-            _contains_run_credentials(item) for item in value.values()
-        )
-    if isinstance(value, list):
-        return any(_contains_run_credentials(item) for item in value)
-    return False
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _skill_failure_code(error: SkillError) -> FailureCode:
+    # Third-party providers may use an extension code. Preserve fail-closed
+    # behavior instead of raising a second ValueError while reporting it.
+    try:
+        code = FailureCode(error.code)
+    except ValueError:
+        return FailureCode.SKILL_READ_FAILED
+    return code if code.value.startswith("skill_") else FailureCode.SKILL_READ_FAILED
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,8 +149,10 @@ class _RunState:
     tool_calls_used: int = 0
     observations: list[ToolObservation] = field(default_factory=list)
     call_ids: set[str] = field(default_factory=set)
-    aggregate_budget: AggregateRunBudget | None = None
-    cancel_signal: asyncio.Event | None = None
+    command_context: CommandContext | None = None
+    command_allowed_identities: frozenset[ToolIdentity] | None = None
+    command_denied_identities: frozenset[ToolIdentity] = frozenset()
+    skills: SkillRuntime | None = None
 
 
 @dataclass(slots=True)
@@ -182,6 +179,8 @@ class ExecutionRunner:
         authorization_policy: ToolAuthorizationPolicy | None = None,
         interactive_approvals: InteractiveApprovalBroker | None = None,
         tool_results: ToolResultStore | None = None,
+        command_registry: CommandRegistry | None = None,
+        skill_provider: SkillProvider | None = None,
     ) -> None:
         self.__tools = tools
         self.__capabilities = capabilities
@@ -191,6 +190,12 @@ class ExecutionRunner:
         self.__authorization_policy = authorization_policy
         self.__interactive_approvals = interactive_approvals
         self.__tool_results = tool_results
+        if command_registry is not None and not isinstance(command_registry, CommandRegistry):
+            raise TypeError("command_registry must implement CommandRegistry")
+        self.__commands = command_registry
+        if skill_provider is not None and not isinstance(skill_provider, SkillProvider):
+            raise TypeError("skill_provider must implement SkillProvider")
+        self.__skill_provider = skill_provider
         self.__active: dict[tuple[ScopePath, str, str], _ActiveRun] = {}
         self.__active_lock = asyncio.Lock()
 
@@ -205,18 +210,10 @@ class ExecutionRunner:
             active.cancel.set()
             return True
 
-    async def run(
-        self,
-        request: RunRequest,
-        strategies: ExecutionStrategies,
-        *,
-        aggregate_budget: AggregateRunBudget | None = None,
-    ) -> RunResult:
+    async def run(self, request: RunRequest, strategies: ExecutionStrategies) -> RunResult:
         """Collect the same event stream consumed by interactive channels."""
         result = None
-        async with contextlib.aclosing(
-            self.stream(request, strategies, aggregate_budget=aggregate_budget)
-        ) as source:
+        async with contextlib.aclosing(self.stream(request, strategies)) as source:
             async for event in source:
                 if event.result is not None:
                     result = event.result
@@ -225,11 +222,7 @@ class ExecutionRunner:
         return result
 
     async def stream(
-        self,
-        request: RunRequest,
-        strategies: ExecutionStrategies,
-        *,
-        aggregate_budget: AggregateRunBudget | None = None,
+        self, request: RunRequest, strategies: ExecutionStrategies,
     ) -> AsyncIterator[RunEvent]:
         queue: asyncio.Queue[RunEvent | BaseException | None] = asyncio.Queue(maxsize=16)
         sequence = 0
@@ -253,9 +246,7 @@ class ExecutionRunner:
         async def produce():
             try:
                 await publish('started')
-                result = await self._run(
-                    request, strategies, publish, aggregate_budget=aggregate_budget
-                )
+                result = await self._run(request, strategies, publish)
                 # _run translates cancellation into a structured result. Do not
                 # block writing that result into an abandoned full queue.
                 if asyncio.current_task().cancelling():
@@ -287,29 +278,15 @@ class ExecutionRunner:
                 producer.cancel()
             await asyncio.gather(producer, return_exceptions=True)
 
+    @traced_run
     async def _run(
         self, request: RunRequest, strategies: ExecutionStrategies,
         publish: Callable[..., Awaitable[None]],
-        *,
-        aggregate_budget: AggregateRunBudget | None = None,
     ) -> RunResult:
         """Execute one run with an overall timeout and structured termination."""
 
-        started_monotonic = time.monotonic()
-        pool = aggregate_budget or AggregateRunBudget(
-            max_iterations=request.budget.max_iterations,
-            max_tool_calls=request.budget.max_tool_calls,
-            max_children=2,
-            deadline_monotonic=started_monotonic + request.budget.timeout_seconds,
-        )
-        state = _RunState(
-            started_at=_utcnow(),
-            started_monotonic=started_monotonic,
-            publish=publish,
-            aggregate_budget=pool,
-        )
+        state = _RunState(started_at=_utcnow(), started_monotonic=time.monotonic(), publish=publish)
         cancel_event = asyncio.Event()
-        state.cancel_signal = cancel_event
         run_key = self._run_key(request.scope, request.run_id)
         async with self.__active_lock:
             if run_key in self.__active:
@@ -329,7 +306,7 @@ class ExecutionRunner:
         try:
             done, _ = await asyncio.wait(
                 {loop_task, cancel_task},
-                timeout=min(request.budget.timeout_seconds, pool.remaining_seconds),
+                timeout=request.budget.timeout_seconds,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if loop_task in done:
@@ -338,7 +315,8 @@ class ExecutionRunner:
                     await cancel_task
                 try:
                     return await loop_task
-                except Exception:
+                except Exception as exc:
+                    diagnostic("run.infrastructure_failed", error=exc, stage="execution")
                     result = self._result(
                         request,
                         state,
@@ -391,6 +369,17 @@ class ExecutionRunner:
         strategies: ExecutionStrategies,
         state: _RunState,
     ) -> RunResult:
+        provider = strategies.skills if strategies.skills is not None else self.__skill_provider
+        state.skills = SkillRuntime(request, provider) if provider is not None else None
+        with bind_skill_runtime(state.skills):
+            return await self._run_loop_impl(request, strategies, state)
+
+    async def _run_loop_impl(
+        self,
+        request: RunRequest,
+        strategies: ExecutionStrategies,
+        state: _RunState,
+    ) -> RunResult:
         await self._emit(request, AuditEventType.RUN_STARTED)
         budget_failure = self._budget_policy_failure(request)
         if budget_failure is not None:
@@ -424,56 +413,59 @@ class ExecutionRunner:
             )
         assert grant is not None
 
-        workflow_state: JsonValue = None
-        resume = request.resume
-        if resume is not None:
-            if not self._valid_resume(request, grant):
-                return await self._strategy_failure(
-                    request, state, FailureCode.WORKFLOW_ERROR,
-                    "resume checkpoint is unsafe or no longer authorized", 1,
-                )
-            state.iterations_used = resume.iterations_used
-            state.tool_calls_used = resume.tool_calls_used
-            state.observations = [item.model_copy(deep=True) for item in resume.observations]
-            state.call_ids = set(resume.call_ids)
-            workflow_state = resume.model_copy(deep=True).workflow_state
-            assert state.aggregate_budget is not None
-            # Charge inherited work to the new aggregate pool as well as the
-            # per-run counters. A continuation cannot replenish either budget.
-            for _ in range(resume.iterations_used):
-                if not await state.aggregate_budget.take_iteration():
-                    return await self._strategy_failure(
-                        request, state, FailureCode.ITERATION_BUDGET_EXCEEDED,
-                        "resume exceeds aggregate iteration budget", 1,
-                    )
-            if await state.aggregate_budget.take_tool_slots(resume.tool_calls_used) != resume.tool_calls_used:
-                return await self._strategy_failure(
-                    request, state, FailureCode.TOOL_BUDGET_EXCEEDED,
-                    "resume exceeds aggregate tool budget", 1,
-                )
+        if state.skills is not None:
+            await state.skills.initialize()
 
-        first_iteration = state.iterations_used + 1
-        checkpoint_safe = True
-        checkpoint_pending: int | None = None
-        for iteration in range(first_iteration, request.budget.max_iterations + 1):
-            assert state.aggregate_budget is not None
-            if not await state.aggregate_budget.take_iteration():
+        if self.__commands is not None:
+            try:
+                context = self.__commands.resolve(request)
+                if context is not None:
+                    if not isinstance(context, CommandContext) or (
+                        context.scope != request.scope or context.run_id != request.run_id
+                    ):
+                        raise ValueError("command context does not belong to this request")
+                    state.command_context = context
+
+                    def identities(names: frozenset[str]) -> frozenset[ToolIdentity]:
+                        return frozenset(
+                            item.identity for name in names
+                            if (item := self.__tools.resolve(request.scope, name)) is not None
+                        )
+
+                    if context.allowed_tools is not None:
+                        state.command_allowed_identities = identities(context.allowed_tools)
+                    state.command_denied_identities = identities(context.denied_tools)
+            except Exception as exc:
+                diagnostic("command.failed", error=exc, stage="command_routing")
                 return await self._finish(
                     request,
-                    self._result(
-                        request,
-                        state,
-                        RunStatus.BUDGET_EXCEEDED,
-                        failure=RunFailure(
-                            code=FailureCode.ITERATION_BUDGET_EXCEEDED,
-                            message=(
-                                "parent and delegated runs exhausted their "
-                                "aggregate iteration budget"
-                            ),
-                            iteration=iteration,
-                        ),
-                    ),
+                    self._result(request, state, RunStatus.FAILED, failure=RunFailure(
+                        code=FailureCode.POLICY_DENIED,
+                        message="trusted command routing failed",
+                    )),
                 )
+            if state.command_context is not None:
+                await self._emit(request, AuditEventType.COMMAND_ROUTED, data={
+                    "command_id": state.command_context.command_id,
+                    "matched_commands": list(state.command_context.matched_commands),
+                    "input_digest": state.command_context.input_digest,
+                })
+
+        if state.skills is not None:
+            state.skills.command_context = state.command_context
+            try:
+                if state.command_context is not None:
+                    for skill_id in state.command_context.preload_skills:
+                        await preload_skill(request, skill_id, source="command")
+            except SkillError as exc:
+                return await self._finish(request, self._result(
+                    request, state, RunStatus.FAILED, failure=RunFailure(
+                        code=_skill_failure_code(exc), message=exc.message,
+                    ),
+                ))
+        workflow_state: JsonValue = None
+        for iteration in range(1, request.budget.max_iterations + 1):
+            diagnostic_update(iteration=iteration)
             state.iterations_used = iteration
             grant, failure = await self._grant(request)
             if failure is not None:
@@ -482,11 +474,12 @@ class ExecutionRunner:
                     self._result(request, state, RunStatus.FAILED, failure=failure),
                 )
             assert grant is not None
-            available = self._visible_tools(request, grant)
+            available = self._visible_tools(request, grant, state)
             frame = WorkflowFrame(
                 iteration=iteration,
                 observations=tuple(item.model_copy(deep=True) for item in state.observations),
                 available_tools=available,
+                command_context=state.command_context,
                 workflow_state=workflow_state,
                 tool_calls_used=state.tool_calls_used,
                 elapsed_seconds=max(0.0, time.monotonic() - state.started_monotonic),
@@ -496,7 +489,8 @@ class ExecutionRunner:
             if strategies.prompt is not None:
                 try:
                     prompt = await strategies.prompt.render(request, frame)
-                except Exception:
+                except Exception as exc:
+                    diagnostic("prompt.failed", error=exc, stage="prompt_render")
                     return await self._strategy_failure(
                         request,
                         state,
@@ -512,35 +506,6 @@ class ExecutionRunner:
                         "prompt strategy returned an invalid result",
                         iteration,
                     )
-
-            # Bind the original rendered prompt, before the runtime clock is
-            # appended. Only run identity metadata is allowed to change.
-            prompt_digest = self._prompt_digest(request, prompt)
-            try:
-                route_key = strategies.workflow.resume_key(request, frame, prompt)
-            except Exception:
-                return await self._strategy_failure(
-                    request, state, FailureCode.WORKFLOW_ERROR,
-                    "workflow resume compatibility check failed", iteration,
-                )
-            if resume is not None and iteration == first_iteration and (
-                route_key is None or route_key != resume.route_key
-                or prompt_digest != resume.prompt_digest
-            ):
-                return await self._strategy_failure(
-                    request, state, FailureCode.WORKFLOW_ERROR,
-                    "resume route or prompt no longer matches", iteration,
-                )
-            if iteration == 1 and resume is None and route_key is not None:
-                await self._checkpoint(request, state, workflow_state, prompt_digest, route_key,
-                                       iterations_used=0)
-            elif checkpoint_pending is not None and route_key is not None:
-                # Bind the prompt for the frame that will consume these completed
-                # observations. Dynamic prompts may change after every batch.
-                await self._checkpoint(request, state, workflow_state, prompt_digest, route_key,
-                                       iterations_used=checkpoint_pending)
-            checkpoint_pending = None
-            if prompt is not None:
                 prompt = with_runtime_environment(prompt, instant=state.started_at)
 
             try:
@@ -553,15 +518,11 @@ class ExecutionRunner:
                         if isinstance(event, WorkflowDecision):
                             decision = event
                         elif isinstance(event, WorkflowEvent):
-                            if event.kind not in {
-                                'delta', 'status', 'usage',
-                                'compact_started', 'compact_completed',
-                            }:
-                                raise ValueError('workflow emitted a reserved event kind')
                             await state.publish(event.kind, event.text, event.data)
                         else:
                             raise TypeError('invalid workflow stream event')
-            except Exception:
+            except Exception as exc:
+                diagnostic("workflow.failed", error=exc, stage="workflow_stream")
                 return await self._strategy_failure(
                     request,
                     state,
@@ -582,7 +543,8 @@ class ExecutionRunner:
             if strategies.reflection is not None:
                 try:
                     decision = await strategies.reflection.review(request, frame, decision)
-                except Exception:
+                except Exception as exc:
+                    diagnostic("reflection.failed", error=exc, stage="reflection")
                     return await self._strategy_failure(
                         request,
                         state,
@@ -635,9 +597,7 @@ class ExecutionRunner:
                 )
 
             remaining = request.budget.max_tool_calls - state.tool_calls_used
-            permitted_count = await state.aggregate_budget.take_tool_slots(
-                min(max(remaining, 0), len(decision.intents))
-            )
+            permitted_count = min(max(remaining, 0), len(decision.intents))
             permitted = decision.intents[:permitted_count]
             overflow = decision.intents[permitted_count:]
             state.tool_calls_used += len(permitted)
@@ -655,14 +615,6 @@ class ExecutionRunner:
                 state,
             )
             state.observations.extend(observations)
-            checkpoint_safe = checkpoint_safe and not overflow and all(
-                self._safe_observation(request, item) for item in observations
-            ) and not any(
-                intent.approval_token is not None or _contains_run_credentials(intent.arguments)
-                for intent in permitted
-            )
-            # A crash before the next frame/prompt is ready remains fail closed.
-            checkpoint_pending = iteration if checkpoint_safe else None
             if overflow:
                 for intent in overflow:
                     state.observations.append(
@@ -695,139 +647,6 @@ class ExecutionRunner:
                 ),
             ),
         )
-
-    @staticmethod
-    def _prompt_digest(request: RunRequest, prompt: PromptEnvelope | None) -> str:
-        rendered = None if prompt is None else prompt.model_dump(mode='json')
-        if rendered is not None:
-            rendered['metadata'].pop('run_id', None)
-        scope = request.scope
-        payload = {
-            'prompt': rendered, 'input': request.input,
-            'conversation': request.conversation.model_dump(mode='json'),
-            'identity': {
-                'tenant_id': scope.tenant_id, 'product_id': scope.product_id,
-                'agent_id': scope.path.agent_id, 'session_id': scope.path.session_id,
-                'principal_id': scope.principal_id,
-                'session_owner_id': scope.effective_session_owner_id,
-                'channel_id': scope.channel_id, 'roles': sorted(scope.roles),
-            },
-        }
-        return hashlib.sha256(canonical_json(payload)).hexdigest()
-
-    def _safe_registration(self, request: RunRequest, name: str) -> bool:
-        expected = _RESUMABLE_TOOLS.get(name)
-        registered = self.__tools.resolve(request.scope, name)
-        if expected is None or registered is None:
-            return False
-        family, effects = expected
-        return (
-            registered.registration_scope == ScopePath.root()
-            and registered.identity == ToolIdentity(
-                namespace='suiteharness', name=name,
-                origin=f'suiteharness.builtin.{family}', version='1',
-            )
-            and registered.spec.effects == effects
-        )
-
-    def _safe_observation(self, request: RunRequest, observation: ToolObservation) -> bool:
-        if observation.status is not ToolCallStatus.SUCCEEDED:
-            return False
-        if not self._safe_registration(request, observation.tool_name):
-            return False
-        registered = self.__tools.resolve(request.scope, observation.tool_name)
-        return (
-            registered is not None and observation.tool_identity == registered.identity
-            and not _contains_run_credentials(observation.result)
-            and not _contains_run_credentials(observation.arguments)
-        )
-
-    def _valid_resume(self, request: RunRequest, grant: CapabilityGrant) -> bool:
-        resume = request.resume
-        assert resume is not None
-        if (
-            not request.read_only or request.run_id == resume.source_run_id
-            or resume.iterations_used >= request.budget.max_iterations
-            or resume.tool_calls_used > request.budget.max_tool_calls
-            or len(canonical_json(resume.model_dump(mode='json'))) > self._checkpoint_limit()
-            or _contains_run_credentials(resume.workflow_state)
-            or resume.tool_calls_used != len(resume.observations)
-            or len(resume.call_ids) != len(set(resume.call_ids))
-            or set(resume.call_ids) != {item.call_id for item in resume.observations}
-            or len(resume.call_ids) != len(resume.observations)
-            or (resume.observations and (resume.iterations_used == 0 or resume.workflow_state is None))
-        ):
-            return False
-        now = datetime.now(UTC)
-        for observation in resume.observations:
-            if not self._safe_observation(request, observation):
-                return False
-            if observation.tool_name in {'suiteharness.web.search', 'suiteharness.web.fetch'}:
-                age = (now - observation.finished_at).total_seconds()
-                if not 0 <= age < _WEB_RESUME_TTL_SECONDS:
-                    return False
-            registered = self.__tools.resolve(request.scope, observation.tool_name)
-            assert registered is not None
-            if (registered.identity not in grant.tool_identities
-                    or registered.spec.required_capabilities - grant.capabilities):
-                return False
-            authorization = ToolAuthorization.DEFAULT
-            arguments = observation.arguments
-            if arguments is not None:
-                payload = canonical_json(arguments)
-                if len(payload) > self.__policy.max_tool_argument_bytes:
-                    return False
-                # A policy or validator must not mutate the persisted snapshot.
-                arguments = json.loads(payload)
-                try:
-                    registered.input_validator.validate(arguments)
-                except Exception:
-                    return False
-            if self.__authorization_policy is not None:
-                # Older checkpoints cannot prove argument-scoped authorization.
-                if arguments is None:
-                    return False
-                try:
-                    authorization = self.__authorization_policy.evaluate(
-                        request, registered.identity, registered.spec, arguments,
-                    )
-                except Exception:
-                    return False
-            if (not isinstance(authorization, ToolAuthorization)
-                    or authorization in {ToolAuthorization.DENY, ToolAuthorization.REQUIRE_APPROVAL}
-                    or (authorization is ToolAuthorization.DEFAULT
-                        and self.__policy.requires_approval(registered.spec))):
-                # Reuse never consumes an old approval or prompts for a new one.
-                return False
-        return True
-
-    def _checkpoint_limit(self) -> int:
-        return min(256 * 1024, self.__policy.max_workflow_state_bytes,
-                   self.__policy.max_tool_result_bytes)
-
-    async def _checkpoint(
-        self, request: RunRequest, state: _RunState, workflow_state: JsonValue,
-        prompt_digest: str, route_key: str, *, iterations_used: int,
-    ) -> None:
-        if len(state.observations) > 1024 or len(state.call_ids) > 1024:
-            # Checkpoint storage is optional; its narrower bounds must not fail
-            # an otherwise valid execution using a larger approved budget.
-            return
-        if _contains_run_credentials(workflow_state):
-            return
-        # The checkpoint contains no grant or approval. The application must
-        # obtain a fresh grant and authorize the source run before constructing
-        # an internal RunRequest.resume.
-        resume = RunResumeState(
-            source_run_id=request.run_id, workflow_state=workflow_state,
-            observations=tuple(state.observations), iterations_used=iterations_used,
-            tool_calls_used=state.tool_calls_used, call_ids=tuple(sorted(state.call_ids)),
-            prompt_digest=prompt_digest, route_key=route_key,
-        )
-        data = {'resume_state': resume.model_dump(mode='json'), 'input': request.input,
-                'conversation': request.conversation.model_dump(mode='json')}
-        if len(canonical_json(data)) <= self._checkpoint_limit():
-            await state.publish('checkpoint', data=data)
 
     async def _execute_batch(
         self,
@@ -868,6 +687,7 @@ class ExecutionRunner:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
+    @traced_tool
     async def _execute_intent(
         self,
         request: RunRequest,
@@ -952,6 +772,13 @@ class ExecutionRunner:
                 "tool requires capabilities not present in the product grant",
                 tool_identity=registered.identity,
             )
+        if not self._command_permits(state, registered.identity):
+            return await self._deny(
+                request, intent, iteration, started_at,
+                FailureCode.POLICY_DENIED,
+                "the current command route does not permit this tool",
+                tool_identity=registered.identity,
+            )
         if request.read_only and not registered.spec.is_read:
             return await self._deny(
                 request,
@@ -962,24 +789,20 @@ class ExecutionRunner:
                 "non-read tool is blocked for a read-only run",
                 tool_identity=registered.identity,
             )
-        if request.resume is not None and not self._safe_registration(request, intent.tool_name):
-            return await self._deny(
-                request, intent, iteration, started_at, FailureCode.POLICY_DENIED,
-                "only trusted read tools are available during resume",
-                tool_identity=registered.identity,
-            )
 
         try:
             registered.input_validator.validate(safe_arguments)
-        except JsonSchemaValidationError:
+        except JsonSchemaValidationError as exc:
+            message, validation_details = input_error_hint(exc)
             return await self._deny(
                 request,
                 intent,
                 iteration,
                 started_at,
                 FailureCode.TOOL_INPUT_INVALID,
-                "tool arguments do not match the declared input schema",
+                message,
                 tool_identity=registered.identity,
+                validation_details=validation_details,
             )
 
         authorization = ToolAuthorization.DEFAULT
@@ -1005,6 +828,23 @@ class ExecutionRunner:
                 "the trusted channel policy denied this tool call",
                 tool_identity=registered.identity,
             )
+
+        if registered.spec.required_skills:
+            try:
+                missing = (registered.spec.required_skills if state.skills is None else
+                           state.skills.missing(intent.call_id, registered.spec.required_skills))
+            except SkillError as exc:
+                return await self._deny(
+                    request, intent, iteration, started_at, _skill_failure_code(exc), exc.message,
+                    tool_identity=registered.identity,
+                )
+            if missing:
+                return await self._deny(
+                    request, intent, iteration, started_at, FailureCode.SKILL_REQUIRED,
+                    "本次未执行业务动作。请先调用 suiteharness.skill.read 读取 "
+                    + ", ".join(missing) + "，再重新调用该工具。",
+                    tool_identity=registered.identity,
+                )
 
         approved_by: str | None = None
         destructive = ToolEffect.DESTRUCTIVE in registered.spec.effects
@@ -1087,45 +927,20 @@ class ExecutionRunner:
                 request.budget.timeout_seconds
                 - (time.monotonic() - state.started_monotonic),
             ),
-            grant_id=request.grant_id,
-            read_only=request.read_only,
-            aggregate_budget=state.aggregate_budget,
-            cancel_signal=state.cancel_signal,
         )
         try:
             raw_result = await registered.handler(context, safe_arguments)
-            validated = _JSON.validate_python(raw_result, strict=True)
-            result_payload = canonical_json(validated)
         except asyncio.CancelledError:
             raise
-        except ToolHandlerDenied:
-            return await self._deny(
-                request, intent, iteration, started_at,
-                FailureCode.POLICY_DENIED,
-                "trusted tool handler denied this call",
-                tool_identity=registered.identity,
-            )
-        except ValidationError:
+        except SkillError as exc:
+            if state.skills is not None:
+                state.skills.pending_reads.pop(intent.call_id, None)
             return await self._tool_failure(
-                request,
-                intent,
-                iteration,
-                started_at,
-                FailureCode.INVALID_TOOL_RESULT,
-                "tool returned a non-JSON value",
-                tool_identity=registered.identity,
+                request, intent, iteration, started_at, _skill_failure_code(exc), exc.message,
+                tool_identity=registered.identity, diagnostic_stage="skill_read",
             )
-        except (TypeError, ValueError):
-            return await self._tool_failure(
-                request,
-                intent,
-                iteration,
-                started_at,
-                FailureCode.INVALID_TOOL_RESULT,
-                "tool returned a non-JSON value",
-                tool_identity=registered.identity,
-            )
-        except Exception:
+        except Exception as exc:
+            diagnostic("tool.handler_failed", error=exc, stage="tool_handler")
             return await self._tool_failure(
                 request,
                 intent,
@@ -1134,6 +949,24 @@ class ExecutionRunner:
                 FailureCode.TOOL_ERROR,
                 "tool handler failed",
                 tool_identity=registered.identity,
+                diagnostic_stage="handler",
+                exception_type=self._exception_type(exc),
+            )
+
+        try:
+            validated = _JSON.validate_python(raw_result, strict=True)
+            result_payload = canonical_json(validated)
+        except (ValidationError, TypeError, ValueError) as exc:
+            return await self._tool_failure(
+                request,
+                intent,
+                iteration,
+                started_at,
+                FailureCode.INVALID_TOOL_RESULT,
+                "tool returned a non-JSON value",
+                tool_identity=registered.identity,
+                diagnostic_stage="result_validation",
+                exception_type=self._exception_type(exc),
             )
 
         if len(result_payload) > self.__policy.max_tool_result_bytes:
@@ -1150,6 +983,19 @@ class ExecutionRunner:
             JsonValue,
             json.loads(result_payload.decode("utf-8")),
         )
+
+        if (registered.identity.namespace == "suiteharness"
+                and registered.identity.origin == "suiteharness.builtin.skill"
+                and registered.identity.name == "suiteharness.skill.read"):
+            try:
+                if state.skills is None:
+                    raise SkillError("skill_not_available", "当前产品未启用技能。")
+                state.skills.commit_read(intent.call_id, result)
+            except SkillError as exc:
+                return await self._tool_failure(
+                    request, intent, iteration, started_at, _skill_failure_code(exc), exc.message,
+                    tool_identity=registered.identity, diagnostic_stage="skill_complete",
+                )
 
         reader = self.__tools.resolve(request.scope, "suiteharness.result.read")
         can_read_result = (reader is not None and reader.identity in grant.tool_identities
@@ -1173,16 +1019,9 @@ class ExecutionRunner:
             tool_identity=registered.identity,
             data={"status": ToolCallStatus.SUCCEEDED.value},
         )
-        resume_arguments = None
-        if self._safe_registration(request, intent.tool_name):
-            original_arguments = json.loads(argument_payload)
-            if not _contains_run_credentials(original_arguments):
-                resume_arguments = original_arguments
         return ToolObservation(
             call_id=intent.call_id,
             tool_name=intent.tool_name,
-            tool_identity=registered.identity,
-            arguments=resume_arguments,
             status=ToolCallStatus.SUCCEEDED,
             result=result,
             started_at=started_at,
@@ -1228,10 +1067,13 @@ class ExecutionRunner:
         self,
         request: RunRequest,
         grant: CapabilityGrant,
+        state: _RunState,
     ) -> tuple[ToolSpec, ...]:
         visible: list[ToolSpec] = []
         names = {identity.name for identity in grant.tool_identities}
         for name in sorted(names):
+            if name == "suiteharness.skill.read" and (state.skills is None or not state.skills.enabled):
+                continue
             item = self.__tools.resolve(request.scope, name)
             if item is None:
                 continue
@@ -1241,10 +1083,28 @@ class ExecutionRunner:
                 continue
             if request.read_only and not item.spec.is_read:
                 continue
-            if request.resume is not None and not self._safe_registration(request, name):
+            if not self._command_permits(state, item.identity):
                 continue
             visible.append(item.spec.model_copy(deep=True))
         return tuple(visible)
+
+    @staticmethod
+    def _command_permits(state: _RunState, identity: ToolIdentity) -> bool:
+        # Use runner-owned identities captured before strategies execute. A
+        # forged frame, model tool list or same-name registration cannot widen it.
+        if (state.command_allowed_identities is not None
+                and identity not in state.command_allowed_identities):
+            return False
+        if identity in state.command_denied_identities:
+            return False
+        context = state.command_context
+        return context is None or identity.name not in context.denied_tools
+
+    @staticmethod
+    def _exception_type(exc: Exception) -> str:
+        # Never log exception messages, arguments, source lines or local values.
+        name = type(exc).__name__
+        return name if name.isascii() and name.isidentifier() and len(name) <= 80 else "Exception"
 
     def _budget_policy_failure(self, request: RunRequest) -> RunFailure | None:
         requested = request.budget
@@ -1297,6 +1157,7 @@ class ExecutionRunner:
         message: str,
         *,
         tool_identity: ToolIdentity | None = None,
+        validation_details: dict | None = None,
     ) -> ToolObservation:
         failure = RunFailure(
             code=code,
@@ -1311,7 +1172,7 @@ class ExecutionRunner:
             call_id=intent.call_id,
             tool_name=intent.tool_name,
             tool_identity=tool_identity,
-            data={"code": code.value},
+            data={"code": code.value, **(validation_details or {})},
         )
         return ToolObservation(
             call_id=intent.call_id,
@@ -1332,6 +1193,8 @@ class ExecutionRunner:
         message: str,
         *,
         tool_identity: ToolIdentity,
+        diagnostic_stage: str | None = None,
+        exception_type: str | None = None,
     ) -> ToolObservation:
         failure = RunFailure(
             code=code,
@@ -1340,13 +1203,18 @@ class ExecutionRunner:
             call_id=intent.call_id,
             tool_name=intent.tool_name,
         )
+        diagnostics: dict[str, JsonValue] = {"status": ToolCallStatus.FAILED.value, "code": code.value}
+        if diagnostic_stage is not None:
+            diagnostics["stage"] = diagnostic_stage
+        if exception_type is not None:
+            diagnostics["exception_type"] = exception_type
         await self._emit(
             request,
             AuditEventType.TOOL_FINISHED,
             call_id=intent.call_id,
             tool_name=intent.tool_name,
             tool_identity=tool_identity,
-            data={"status": ToolCallStatus.FAILED.value, "code": code.value},
+            data=diagnostics,
         )
         return ToolObservation(
             call_id=intent.call_id,
@@ -1500,3 +1368,8 @@ class ExecutionRunner:
             data=data or {},
         )
         await self.__journal.append(event)
+        diagnostic("audit." + event_type.value, request_id=request.scope.request_id,
+                   run_id=request.run_id, tool_call_id=call_id, tool_name=tool_name,
+                   **{key: value for key, value in (data or {}).items()
+                      if key in {"status", "code", "arguments_digest", "input_digest", "exception_type",
+                                 "validation_path", "validation_rule", "validation_constraint"}})

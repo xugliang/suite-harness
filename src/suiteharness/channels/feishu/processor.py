@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+from contextlib import aclosing
 import heapq
 import hmac
 import json
@@ -16,7 +16,6 @@ import weakref
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import aclosing
 from datetime import UTC, datetime
 from typing import Any, TypeAlias
 
@@ -25,9 +24,7 @@ from suiteharness.channels.models import (
     ChannelKind,
     InboundMessage,
     OutboundEvent,
-    OutboundEventKind,
 )
-from suiteharness.sessions import RunStopOutcome
 
 from .models import (
     FeishuAuthenticationError,
@@ -44,7 +41,7 @@ from .security import (
 
 JsonObject: TypeAlias = dict[str, Any]
 OutboundSink: TypeAlias = Callable[[InboundMessage, OutboundEvent], Awaitable[None]]
-_STOP_COMMAND = re.compile(r"/停止(?: ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}))?")
+InboundAcknowledgementSink: TypeAlias = Callable[[InboundMessage], Awaitable[None]]
 
 
 def _duplicate_rejecting_object(pairs: list[tuple[str, Any]]) -> JsonObject:
@@ -255,6 +252,7 @@ class FeishuEventProcessor:
         default_product_id: str | None = None,
         deduplicator: EventDeduplicator | None = None,
         outbound_sink: OutboundSink | None = None,
+        inbound_acknowledgement_sink: InboundAcknowledgementSink | None = None,
         clock: Callable[[], datetime] | None = None,
         processing_timeout_seconds: float = 600.0,
     ) -> None:
@@ -294,6 +292,9 @@ class FeishuEventProcessor:
         self._default_product_id = default_product_id
         self._deduplicator = selected_deduplicator
         self._outbound_sink = outbound_sink
+        if inbound_acknowledgement_sink is not None and not callable(inbound_acknowledgement_sink):
+            raise TypeError("inbound_acknowledgement_sink must be callable")
+        self._inbound_acknowledgement_sink = inbound_acknowledgement_sink
         self._clock = clock or (lambda: datetime.now(UTC))
         self._processing_timeout = float(processing_timeout_seconds)
 
@@ -321,76 +322,22 @@ class FeishuEventProcessor:
                 if message is None:
                     await self._deduplicator.complete(event_id)
                     return FeishuEventOutcome.IGNORED
-                if not await self._handle_stop_command(message):
-                    async with aclosing(self._dispatcher.dispatch(message)) as source:
-                        async for outbound in source:
-                            if self._outbound_sink is not None:
-                                await self._outbound_sink(message, outbound)
+                if self._inbound_acknowledgement_sink is not None:
+                    try:
+                        await self._inbound_acknowledgement_sink(message)
+                    except Exception:
+                        # The acknowledgement is a UX enhancement.  It must not
+                        # prevent a validated business request from running.
+                        pass
+                async with aclosing(self._dispatcher.dispatch(message)) as source:
+                    async for outbound in source:
+                        if self._outbound_sink is not None:
+                            await self._outbound_sink(message, outbound)
                 await self._deduplicator.complete(event_id)
         except BaseException:
             await self._deduplicator.release(event_id)
             raise
         return FeishuEventOutcome.DISPATCHED
-
-    async def _handle_stop_command(self, message: InboundMessage) -> bool:
-        command = _STOP_COMMAND.fullmatch(message.text)
-        if command is None:
-            return False
-        target_message_id = command.group(1)
-        try:
-            outcome = await self._dispatcher.stop(message, target_message_id)
-        except NotImplementedError:
-            outbound = self._stop_failure(message, "停止功能暂不可用。")
-        except PermissionError:
-            outbound = self._stop_failure(message, "无权停止该任务。")
-        except Exception:
-            outbound = self._stop_failure(message, "停止请求失败。")
-        else:
-            outbound = self._stop_outcome(message, outcome)
-        if self._outbound_sink is not None:
-            await self._outbound_sink(message, outbound)
-        return True
-
-    @staticmethod
-    def _stop_outcome(message: InboundMessage, outcome: object) -> OutboundEvent:
-        outputs = {
-            RunStopOutcome.REQUESTED: "已请求停止。",
-            RunStopOutcome.ALREADY_REQUESTED: "停止请求已存在。",
-            RunStopOutcome.ALREADY_FINISHED: "任务已结束。",
-        }
-        output = outputs.get(outcome)
-        if output is None:
-            return FeishuEventProcessor._stop_failure(message, "未找到可停止的任务。")
-        return FeishuEventProcessor._stop_event(
-            message,
-            kind=OutboundEventKind.COMPLETED,
-            payload={"output": output},
-        )
-
-    @staticmethod
-    def _stop_failure(message: InboundMessage, text: str) -> OutboundEvent:
-        return FeishuEventProcessor._stop_event(
-            message,
-            kind=OutboundEventKind.FAILED,
-            payload={"failure": {"message": text}},
-        )
-
-    @staticmethod
-    def _stop_event(
-        message: InboundMessage,
-        *,
-        kind: OutboundEventKind,
-        payload: dict[str, Any],
-    ) -> OutboundEvent:
-        digest = hashlib.sha256(
-            f"{message.event_id}\x1f{message.message_id}".encode()
-        ).hexdigest()[:40]
-        return OutboundEvent(
-            kind=kind,
-            request_id=f"feishu-stop-{digest}",
-            correlation_id=f"feishu-stop-command-{digest}",
-            payload=payload,
-        )
 
     def _normalize_message(
         self,
@@ -604,6 +551,7 @@ __all__ = [
     "FeishuEventProcessor",
     "FeishuWebhookHandler",
     "InMemoryEventDeduplicator",
+    "InboundAcknowledgementSink",
     "OutboundSink",
     "decode_json_object",
 ]

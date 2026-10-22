@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from suiteharness.execution import ToolEffect, ToolHandler, ToolIdentity, ToolSpec
+from suiteharness.execution.results import ToolResultStore
 from suiteharness.sandbox import SandboxBackend
 from suiteharness.web import WebFetchService, WebSearchService
 from suiteharness.workspace import SecurePosixWorkspaceFileSystem
-from suiteharness.execution.results import ToolResultStore
 
 from .egress import ProductEgressArgumentPolicy
 from .shell import BashTool, BashToolConfig
@@ -72,10 +72,12 @@ _PATH = {"type": "string", "minLength": 1, "maxLength": 4096}
 
 
 def _specs() -> dict[str, ToolSpec]:
+    from suiteharness.skills.runtime import skill_read_spec
     read = frozenset({ToolEffect.READ})
     write = frozenset({ToolEffect.WRITE})
     external_read = frozenset({ToolEffect.READ, ToolEffect.EXTERNAL})
     return {
+        "suiteharness.skill.read": skill_read_spec(),
         "suiteharness.result.read": ToolSpec(
             name="suiteharness.result.read",
             description="分页读取本次执行已保存的完整工具结果；offset 为字符位置，其他用户/会话/执行不可读取。",
@@ -262,6 +264,8 @@ class BuiltinToolInstaller:
             "suiteharness.web.search": WebSearchTool(web_search, egress_policy),
             "suiteharness.web.fetch": WebFetchTool(web_fetch, egress_policy),
         }
+        from suiteharness.skills.runtime import read_skill_tool
+        self._handlers["suiteharness.skill.read"] = read_skill_tool
         if tool_results is not None:
             async def read_result(context, arguments):
                 return await tool_results.read(context.scope, context.run_id, arguments["result_id"],

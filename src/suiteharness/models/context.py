@@ -10,8 +10,14 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from suiteharness.models.characters import CharacterCounts, measure_characters
 from suiteharness.models.types import (
-    DocumentContent, ImageContent, ModelMessage, ModelRequest, ModelRole, TextContent,
+    DocumentContent,
+    ImageContent,
+    ModelMessage,
+    ModelRequest,
+    ModelRole,
+    TextContent,
 )
 
 
@@ -21,6 +27,14 @@ class ContextBudgetError(ValueError):
 
 class ContextCapacityError(ContextBudgetError):
     """A valid request may fit another explicitly configured model profile."""
+
+    def __init__(self, message: str, *, character_counts: CharacterCounts | None = None,
+                 removed_rounds: int = 0, truncated_tools: int = 0):
+        super().__init__(message)
+        # Counts only, not the rejected prompt. Existing callers need no changes.
+        self.character_counts = character_counts
+        self.removed_rounds = removed_rounds
+        self.truncated_tools = truncated_tools
 
 
 class TokenEstimator(ABC):
@@ -93,24 +107,31 @@ class ContextManager:
             raise ContextBudgetError('tool calls are missing their results')
 
     def prepare(self, request: ModelRequest, *, window_tokens: int) -> PreparedContext:
+        # Lazy import keeps the optional runtime independent from model types.
+        # Labels are diagnostics only: the runtime checks actual run-owned
+        # instruction provenance, not text claiming to be a trusted Skill.
+        from suiteharness.skills.runtime import is_protected_skill_message
+
         if isinstance(window_tokens, bool) or not isinstance(window_tokens, int) or window_tokens < 1:
             raise ValueError('window_tokens must be a positive integer')
         self._validate_pairs(request.messages)
         reserve = request.max_output_tokens or 4096
         budget = window_tokens - reserve
         if budget <= 0:
-            raise ContextCapacityError('output reserve exhausts context budget')
+            raise ContextCapacityError('output reserve exhausts context budget',
+                                       character_counts=measure_characters(request))
         current = request.model_copy(deep=True)
         if self.estimate(current) <= budget:
             return PreparedContext(current, self.estimate(current))
 
         # Result excerpts remain valid JSON; tool call arguments are never edited.
-        tool_count = sum(m.role is ModelRole.TOOL for m in current.messages)
+        tool_count = sum(m.role is ModelRole.TOOL and not is_protected_skill_message(m)
+                         for m in current.messages)
         per_tool = max(64, min(2048, budget // max(4, tool_count * 2)))
         truncated = 0
         messages = []
         for message in current.messages:
-            if message.role is ModelRole.TOOL:
+            if message.role is ModelRole.TOOL and not is_protected_skill_message(message):
                 raw = '\n'.join(p.text for p in message.content if isinstance(p, TextContent))
                 if self.estimator.text_tokens(raw) > per_tool:
                     excerpt = raw.encode('utf-8')[:max(0, per_tool - 64)].decode('utf-8', errors='ignore')
@@ -133,9 +154,13 @@ class ContextManager:
 
         # Indices rather than role regrouping keep system-message order intact.
         rounds: list[list[int]] = []
+        summary_indices: list[int] = []
         answered = False
         for index, message in enumerate(messages):
             if message.role is ModelRole.SYSTEM:
+                continue
+            if message.context_category == 'conversation_summary' and not is_protected_skill_message(message):
+                summary_indices.append(index)
                 continue
             if not rounds or (message.role is ModelRole.USER and answered):
                 rounds.append([])
@@ -148,13 +173,25 @@ class ContextManager:
         for old_round in rounds[:-1]:
             if self.estimate(current) <= budget:
                 break
+            if any(is_protected_skill_message(messages[index]) for index in old_round):
+                # Retain the whole round, including assistant tool calls and all
+                # paired results. Removing only the result or keeping an orphan
+                # call would make the request invalid for provider adapters.
+                continue
             removed.update(old_round)
             removed_rounds += 1
             current = current.model_copy(update={
                 'messages': tuple(m for index, m in enumerate(messages) if index not in removed),
             })
+        if self.estimate(current) > budget and summary_indices:
+            removed.update(summary_indices)
+            current = current.model_copy(update={
+                'messages': tuple(m for index, m in enumerate(messages) if index not in removed),
+            })
         estimate = self.estimate(current)
         if estimate > budget:
-            raise ContextCapacityError('required current input exceeds context budget')
+            raise ContextCapacityError('required current input exceeds context budget',
+                character_counts=measure_characters(current), removed_rounds=removed_rounds,
+                truncated_tools=truncated)
         self._validate_pairs(current.messages)
         return PreparedContext(current, estimate, removed_rounds, truncated)

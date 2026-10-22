@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from pydantic import JsonValue
 
@@ -36,13 +35,6 @@ from suiteharness.runtime.scopes import (
     ServiceKey,
 )
 
-if TYPE_CHECKING:
-    from suiteharness.multiagent.budget import AggregateRunBudget
-
-
-class ToolHandlerDenied(PermissionError):
-    """Trusted handler refusal that the runner records as a policy denial."""
-
 
 @dataclass(frozen=True, slots=True)
 class ToolCallContext:
@@ -52,10 +44,6 @@ class ToolCallContext:
     tool_identity: ToolIdentity
     tool: ToolSpec
     remaining_seconds: float
-    grant_id: str | None = None
-    read_only: bool = False
-    aggregate_budget: AggregateRunBudget | None = None
-    cancel_signal: asyncio.Event | None = None
 
 
 @runtime_checkable
@@ -163,12 +151,6 @@ class AuditJournal(ABC):
 
 
 class Workflow(ABC):
-    def resume_key(
-        self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
-    ) -> str | None:
-        """Opt in to internal checkpoints; unsupported workflows fail closed."""
-        return None
-
     async def stream(
         self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
     ) -> AsyncIterator[WorkflowEvent | WorkflowDecision]:
@@ -207,18 +189,19 @@ class PromptStrategy(ABC):
             history.append(self._history_message(item, participant_alias=alias))
         memory_messages = ()
         if request.conversation.working_summary or request.conversation.long_term_context:
-            memory_messages = (PromptMessage(role='user', content=json.dumps({
-                'context_type': 'untrusted_conversation_memory',
+            memory_messages = (PromptMessage(role='assistant', content=json.dumps({
+                'context_type': 'conversation_summary',
+                'trust': 'untrusted',
                 'working_summary': request.conversation.working_summary,
                 'long_term_context': request.conversation.long_term_context,
                 'degraded': request.conversation.memory_degraded,
-            }, ensure_ascii=False)),)
+            }, ensure_ascii=False), context_category="conversation_summary"),)
         return PromptEnvelope(
             messages=(
-                PromptMessage(role="system", content=self.system_prompt),
-                *history,
+                PromptMessage(role="system", content=self.system_prompt, context_category="system_prompt"),
                 *memory_messages,
-                PromptMessage(role="user", content=self._text(request.input)),
+                *history,
+                PromptMessage(role="user", content=self._text(request.input), context_category="current_question"),
             ),
             metadata={
                 "run_id": request.run_id,
@@ -241,7 +224,7 @@ class PromptStrategy(ABC):
             # Stable only inside this bounded prompt window: the external model
             # can distinguish speakers without receiving company principal ids.
             content = f"[authenticated {participant_alias}]\n{content}"
-        return PromptMessage(role=message.role, content=content)
+        return PromptMessage(role=message.role, content=content, context_category="history_memory")
 
     @staticmethod
     def _text(value: object) -> str:
@@ -290,6 +273,7 @@ class ExecutionStrategies:
     workflow: Workflow
     prompt: PromptStrategy | None = None
     reflection: ReflectionStrategy | None = None
+    skills: object | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.workflow, Workflow):
@@ -298,9 +282,14 @@ class ExecutionStrategies:
             raise TypeError("prompt does not implement PromptStrategy")
         if self.reflection is not None and not isinstance(self.reflection, ReflectionStrategy):
             raise TypeError("reflection does not implement ReflectionStrategy")
+        if self.skills is not None:
+            from suiteharness.skills.protocols import SkillProvider
+            if not isinstance(self.skills, SkillProvider):
+                raise TypeError("skills must implement SkillProvider")
 
     @classmethod
     def from_bindings(cls, bindings: ServiceBindings) -> ExecutionStrategies:
+        from suiteharness.skills.services import SKILL_PROVIDER
         return cls(
             workflow=bindings.resolve(WORKFLOW),
             prompt=(bindings.resolve(PROMPT_STRATEGY) if bindings.contains(PROMPT_STRATEGY) else None),
@@ -309,6 +298,7 @@ class ExecutionStrategies:
                 if bindings.contains(REFLECTION_STRATEGY)
                 else None
             ),
+            skills=bindings.resolve(SKILL_PROVIDER) if bindings.contains(SKILL_PROVIDER) else None,
         )
 
 

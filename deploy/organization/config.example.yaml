@@ -1,0 +1,27 @@
+# No application ID => inert: no Feishu calls and no database connections.
+enabled: false
+provider: feishu
+app_id: null
+credentials_ref: organization_feishu
+dsn_secret_ref: organization_database
+database_name: organization_directory
+refresh_seconds: 86400
+consumer_ttl_seconds: 600
+check_interval_seconds: 30
+listen_host: 127.0.0.1
+listen_port: 18797
+clients:
+  feature-assistant:
+    credentials_ref: product_a_directory
+    allow_directory_search: true
+    fields:
+      - employee_id
+      - display_name
+      - department_ids
+      - department_names
+      - job_title
+      - status
+      - updated_at
+      - source_updated_at
+      - revision
+    department_fields: [department_id, name, parent_id]

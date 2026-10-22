@@ -87,7 +87,7 @@ def _reject_approval_credentials(value: JsonValue) -> None:
             _reject_approval_credentials(child)
 
 
-class SQLiteProductStateStore:
+class SQLProductStateOperations:
     """Durable, non-secret product state with mandatory CAS and idempotency.
 
     Revision zero means a key does not yet exist. Every mutation requires both
@@ -384,6 +384,11 @@ class SQLiteProductStateStore:
             created_at=datetime.fromisoformat(str(row["result_created_at"])),  # type: ignore[index]
             updated_at=datetime.fromisoformat(str(row["result_updated_at"])),  # type: ignore[index]
         )
+
+
+class SQLiteProductStateStore(SQLProductStateOperations):
+    """SQLite adapter retaining the original public API."""
+
 
 
 __all__ = ["SQLiteProductStateStore"]

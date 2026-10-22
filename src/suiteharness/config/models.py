@@ -22,6 +22,7 @@ from pydantic import (
     SecretStr,
     field_validator,
     model_validator,
+    model_serializer,
 )
 
 from suiteharness.mcp.models import McpServerConfig, McpToolSecurityOverride
@@ -178,10 +179,44 @@ class WorkspaceConfig(_FrozenConfig):
         return self
 
 
+class PostgresStorageConfig(_FrozenConfig):
+    """Trusted PostgreSQL connection settings; credentials live in secrets."""
+
+    dsn_secret_ref: str
+    schema_name: str = Field(default="harness", alias="schema")
+    pool_min_size: int = Field(default=1, ge=0, le=64)
+    pool_max_size: int = Field(default=6, ge=1, le=64)
+    connect_timeout_seconds: float = Field(default=10, gt=0, le=120)
+    pool_timeout_seconds: float = Field(default=10, gt=0, le=120)
+    statement_timeout_ms: int = Field(default=30_000, ge=100, le=300_000)
+    lock_timeout_ms: int = Field(default=5_000, ge=100, le=60_000)
+    idle_transaction_timeout_ms: int = Field(default=15_000, ge=100, le=300_000)
+
+    @field_validator("dsn_secret_ref")
+    @classmethod
+    def validate_dsn_ref(cls, value: str) -> str:
+        return _secret_ref(value, "database DSN secret reference")
+
+    @field_validator("schema_name")
+    @classmethod
+    def validate_schema_name(cls, value: str) -> str:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", value) or value.startswith("pg_") or value in {"public", "information_schema"}:
+            raise ValueError("invalid application PostgreSQL schema")
+        return value
+
+    @model_validator(mode="after")
+    def validate_pool_bounds(self) -> PostgresStorageConfig:
+        if self.pool_min_size > self.pool_max_size:
+            raise ValueError("pool_min_size must not exceed pool_max_size")
+        return self
+
+
 class StorageConfig(_FrozenConfig):
     """Durable server state, deliberately separate from product workspaces."""
 
     root: Path
+    backend: Literal["sqlite", "postgresql"] = "sqlite"
+    postgres: PostgresStorageConfig | None = None
     sessions_database: str = "sessions.sqlite3"
     audit_database: str = "audit.sqlite3"
     runtime_database: str = "runtime.sqlite3"
@@ -202,6 +237,13 @@ class StorageConfig(_FrozenConfig):
 
     @model_validator(mode="after")
     def distinct_databases(self) -> StorageConfig:
+        if self.backend == "postgresql":
+            if self.postgres is None:
+                raise ValueError("PostgreSQL storage requires postgres connection configuration")
+            if {"sessions_database", "audit_database", "runtime_database"} & self.model_fields_set:
+                raise ValueError("PostgreSQL storage cannot configure legacy SQLite database files")
+        elif self.postgres is not None:
+            raise ValueError("postgres configuration requires backend=postgresql")
         databases = (
             self.sessions_database,
             self.audit_database,
@@ -211,13 +253,29 @@ class StorageConfig(_FrozenConfig):
             raise ValueError("session, audit and runtime databases must use different files")
         return self
 
+    @model_serializer(mode="wrap")
+    def serialize_selected_backend(self, handler):
+        result = handler(self)
+        if self.backend == "postgresql":
+            for key in ("sessions_database", "audit_database", "runtime_database"):
+                result.pop(key, None)
+            if self.postgres is not None:
+                result["postgres"] = self.postgres.model_dump(by_alias=True)
+        return result
+
     def sessions_path(self) -> Path:
+        if self.backend == "postgresql":
+            raise ValueError("PostgreSQL storage has no SQLite database file path")
         return self.root.joinpath(*PurePosixPath(self.sessions_database).parts)
 
     def audit_path(self) -> Path:
+        if self.backend == "postgresql":
+            raise ValueError("PostgreSQL storage has no SQLite database file path")
         return self.root.joinpath(*PurePosixPath(self.audit_database).parts)
 
     def runtime_path(self) -> Path:
+        if self.backend == "postgresql":
+            raise ValueError("PostgreSQL storage has no SQLite database file path")
         return self.root.joinpath(*PurePosixPath(self.runtime_database).parts)
 
 
@@ -724,75 +782,6 @@ class ModelsConfig(_FrozenConfig):
         return self
 
 
-class AgentRoleDefinition(_FrozenConfig):
-    """One deployment-approved, same-product child-agent role."""
-
-    role_id: str
-    instruction: str = Field(min_length=1, max_length=12_000)
-    allowed_tools: tuple[str, ...] = ()
-    model_route: str
-
-    @field_validator("role_id", "model_route")
-    @classmethod
-    def validate_ids(cls, value: str, info: object) -> str:
-        return _identifier(value, getattr(info, "field_name", "identifier"))
-
-    @field_validator("instruction")
-    @classmethod
-    def validate_instruction(cls, value: str) -> str:
-        if value != value.strip():
-            raise ValueError("role instruction must not have leading or trailing whitespace")
-        return value
-
-    @field_validator("allowed_tools")
-    @classmethod
-    def validate_allowed_tools(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(value) != len(set(value)):
-            raise ValueError("role allowed_tools must not contain duplicates")
-        for tool_name in value:
-            _identifier(tool_name, "role allowed tool")
-        if "agent.delegate" in value:
-            raise ValueError("child role allowed_tools must not include agent.delegate")
-        return value
-
-
-class MultiAgentProductConfig(_FrozenConfig):
-    """Optional delegation policy for one selected product."""
-
-    enabled: bool = False
-    roles: tuple[AgentRoleDefinition, ...] = ()
-    max_children: int = Field(default=2, ge=1, le=2)
-    max_depth: Literal[1] = 1
-    max_parallel: int = Field(default=2, ge=1, le=2)
-
-    @model_validator(mode="after")
-    def validate_roles_and_parallelism(self) -> MultiAgentProductConfig:
-        role_ids = [role.role_id for role in self.roles]
-        if len(role_ids) != len(set(role_ids)):
-            raise ValueError("multi-agent roles must not repeat role_id")
-        if self.enabled and not self.roles:
-            raise ValueError("enabled multi-agent product requires at least one role")
-        if self.max_parallel > self.max_children:
-            raise ValueError("multi-agent max_parallel must not exceed max_children")
-        return self
-
-
-class MultiAgentConfig(_FrozenConfig):
-    """Deny-by-default product delegation settings for a deployment."""
-
-    products: dict[str, MultiAgentProductConfig] = Field(default_factory=dict)
-
-    @field_validator("products")
-    @classmethod
-    def validate_products(
-        cls, value: dict[str, MultiAgentProductConfig]
-    ) -> dict[str, MultiAgentProductConfig]:
-        return {
-            _identifier(product_id, "multi-agent product_id"): policy
-            for product_id, policy in value.items()
-        }
-
-
 class BaiduQianfanSearchConfig(_FrozenConfig):
     kind: Literal["baidu_qianfan"] = "baidu_qianfan"
     provider_id: Literal["baidu-qianfan"] = "baidu-qianfan"
@@ -1239,6 +1228,14 @@ class ConversationMemoryConfig(_FrozenConfig):
         return self
 
 
+class DiagnosticsConfig(_FrozenConfig):
+    enabled: bool = True
+    file_enabled: bool = True
+    max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
+    backups: int = Field(default=5, ge=1, le=10)
+    release: str = Field(default="unversioned", pattern=r"^[a-zA-Z0-9_.-]{1,80}$")
+
+
 class SuiteHarnessConfig(_FrozenConfig):
     """Non-secret deployment configuration."""
 
@@ -1248,10 +1245,10 @@ class SuiteHarnessConfig(_FrozenConfig):
     customer_bundle: CustomerBundleManifest
     workspace: WorkspaceConfig
     storage: StorageConfig
+    diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
     sandbox: SandboxConfig
     models: ModelsConfig
     web_tools: WebToolsConfig
-    multi_agent: MultiAgentConfig = Field(default_factory=MultiAgentConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
@@ -1269,24 +1266,6 @@ class SuiteHarnessConfig(_FrozenConfig):
             raise ValueError(
                 "model product_routes reference products outside customer_bundle: "
                 f"{sorted(unknown_routes)}"
-            )
-        multi_agent_products = set(self.multi_agent.products)
-        if unknown_multi_agent := multi_agent_products - selected_products:
-            raise ValueError(
-                "multi-agent configuration references products outside customer_bundle: "
-                f"{sorted(unknown_multi_agent)}"
-            )
-        known_model_routes = {route.route_id for route in self.models.routes}
-        unknown_role_routes = {
-            role.model_route
-            for policy in self.multi_agent.products.values()
-            for role in policy.roles
-            if role.model_route not in known_model_routes
-        }
-        if unknown_role_routes:
-            raise ValueError(
-                "multi-agent roles reference unknown model routes: "
-                f"{sorted(unknown_role_routes)}"
             )
         mcp_products = set(self.mcp.servers_by_product)
         if unknown_mcp := mcp_products - selected_products:
@@ -1439,6 +1418,12 @@ class ServiceCredentials(_FrozenConfig):
         return self
 
 
+class DatabaseCredentials(_FrozenConfig):
+    """A database connection string, redacted in all model representations."""
+
+    dsn: SecretStr = Field(min_length=1)
+
+
 class SuiteHarnessSecrets(_FrozenConfig):
     """Secrets loaded only from the separate secret configuration file.
 
@@ -1452,8 +1437,9 @@ class SuiteHarnessSecrets(_FrozenConfig):
     feishu: dict[str, FeishuCredentials] = Field(default_factory=dict)
     model_providers: dict[str, ProviderCredentials] = Field(default_factory=dict)
     services: dict[str, ServiceCredentials] = Field(default_factory=dict)
+    databases: dict[str, DatabaseCredentials] = Field(default_factory=dict)
 
-    @field_validator("web", "feishu", "model_providers", "services")
+    @field_validator("web", "feishu", "model_providers", "services", "databases")
     @classmethod
     def validate_secret_refs(cls, value: dict[str, object]) -> dict[str, object]:
         for key in value:
@@ -1464,6 +1450,10 @@ class SuiteHarnessSecrets(_FrozenConfig):
 def validate_secret_references(config: SuiteHarnessConfig, secrets: SuiteHarnessSecrets) -> None:
     """Validate cross-file credential references without exposing secret values."""
 
+    if config.storage.backend == "postgresql":
+        postgres = config.storage.postgres
+        if postgres is None or postgres.dsn_secret_ref not in secrets.databases:
+            raise ValueError("PostgreSQL database credentials_ref was not found in the secrets file")
     if config.channels.web.enabled:
         ref = config.channels.web.credentials_ref
         if ref not in secrets.web:
@@ -1524,9 +1514,6 @@ __all__ = [
     "ProviderCredentials",
     "ServiceCredentials",
     "ModelCapabilitiesConfig",
-    "AgentRoleDefinition",
-    "MultiAgentProductConfig",
-    "MultiAgentConfig",
     "ModelProfileConfig",
     "ModelRouteConfig",
     "ModelsConfig",

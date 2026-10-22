@@ -15,7 +15,7 @@ from .state import SQLiteProductStateStore
 _SERVER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
-class SQLiteMcpHttpResumeStore(McpHttpResumeStore):
+class SQLMcpHttpResumeOperations(McpHttpResumeStore):
     """Persist only MCP session/event cursors, never credentials or auth headers.
 
     The endpoint is represented by a SHA-256 fingerprint in the state key. A
@@ -120,6 +120,11 @@ class SQLiteMcpHttpResumeStore(McpHttpResumeStore):
                 not value or len(value) > 4096 or "\x00" in value or "\r" in value or "\n" in value
             ):
                 raise ValueError(f"invalid MCP {label}")
+
+
+class SQLiteMcpHttpResumeStore(SQLMcpHttpResumeOperations):
+    """SQLite adapter retaining the original public API."""
+
 
 
 __all__ = ["McpHttpResumeCheckpoint", "SQLiteMcpHttpResumeStore"]

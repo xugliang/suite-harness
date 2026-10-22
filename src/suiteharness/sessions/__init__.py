@@ -10,8 +10,6 @@ from suiteharness.sessions.errors import (
 )
 from suiteharness.sessions.memory import InMemorySessionStore
 from suiteharness.sessions.models import (
-    RunResumePoint,
-    RunStopOutcome,
     SessionCheckpoint,
     SessionIdentity,
     SessionRecord,
@@ -28,8 +26,6 @@ from suiteharness.sessions.sqlite import SQLiteSessionStore
 __all__ = [
     "InMemorySessionStore",
     "SQLiteSessionStore",
-    "RunStopOutcome",
-    "RunResumePoint",
     "SessionCheckpoint",
     "SessionCapacityError",
     "SessionIdentity",

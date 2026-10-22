@@ -18,6 +18,8 @@ from uuid import uuid4
 
 
 class ToolResultStore(ABC):
+    async def clear_runs(self, scope, run_ids: tuple[str, ...]) -> int:
+        raise NotImplementedError('tool result store does not support conversation clearing')
     @abstractmethod
     async def put(self, scope, run_id: str, content: str) -> dict: ...
 
@@ -25,32 +27,8 @@ class ToolResultStore(ABC):
     async def read(self, scope, run_id: str, result_id: str, *, offset: int = 0, limit: int = 2048) -> dict: ...
 
 
-class SQLiteToolResultStore(ToolResultStore):
-    def __init__(self, path: Path, *, max_total_bytes: int = 256 * 1024 * 1024):
-        path = Path(path).absolute()
-        if any(p.is_symlink() for p in (path, *path.parents)):
-            raise ValueError("tool result database must not be a symlink")
-        if max_total_bytes < 1:
-            raise ValueError("result quota must be positive")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.path = path
-        self.maximum = max_total_bytes
-        created = not path.exists()
-        with self._connect() as db:
-            db.execute("CREATE TABLE IF NOT EXISTS tool_results (id TEXT PRIMARY KEY, owner TEXT NOT NULL, content TEXT NOT NULL, size INTEGER NOT NULL, expires REAL NOT NULL)")
-            db.execute("CREATE INDEX IF NOT EXISTS tool_results_expiry ON tool_results(expires)")
-        if created and os.name != "nt":
-            path.chmod(0o600)
+class SQLToolResultOperations(ToolResultStore):
 
-    @contextmanager
-    def _connect(self):
-        connection = sqlite3.connect(self.path, timeout=10)
-        try:
-            connection.execute(f"PRAGMA max_page_count={max(64, (self.maximum + 16 * 1024 * 1024) // 4096)}")
-            with connection:
-                yield connection
-        finally:
-            connection.close()
 
     @staticmethod
     def _owner(scope, run_id):
@@ -68,12 +46,27 @@ class SQLiteToolResultStore(ToolResultStore):
         result_id = uuid4().hex
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if db.execute('SELECT 1 FROM cleared_result_owners WHERE owner=?', (owner,)).fetchone():
+                raise LookupError('tool result run has been cleared')
             db.execute("DELETE FROM tool_results WHERE expires < ?", (time.time(),))
             total, count = db.execute("SELECT COALESCE(SUM(size),0), COUNT(*) FROM tool_results").fetchone()
             if total + size > self.maximum or count >= 10000:
                 raise ValueError("tool result storage quota exceeded")
             db.execute("INSERT INTO tool_results VALUES(?,?,?,?,?)", (result_id, owner, content, size, time.time() + 86400))
         return {"result_id": result_id, "read_tool": "suiteharness.result.read", "characters": len(content), "bytes": size}
+
+    async def clear_runs(self, scope, run_ids: tuple[str, ...]) -> int:
+        return await asyncio.to_thread(self._clear_runs,
+                                       tuple(self._owner(scope, run) for run in run_ids))
+
+    def _clear_runs(self, owners) -> int:
+        count = 0
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            for owner in owners:
+                db.execute('INSERT OR IGNORE INTO cleared_result_owners VALUES (?)', (owner,))
+                count += db.execute('DELETE FROM tool_results WHERE owner=?', (owner,)).rowcount
+        return count
 
     async def read(self, scope, run_id: str, result_id: str, *, offset: int = 0, limit: int = 2048) -> dict:
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -94,3 +87,34 @@ class SQLiteToolResultStore(ToolResultStore):
     async def tool(self, context, arguments):
         return await self.read(context.scope, context.run_id, arguments["result_id"],
                                offset=arguments.get("offset", 0), limit=arguments.get("limit", 2048))
+
+
+class SQLiteToolResultStore(SQLToolResultOperations):
+    """SQLite connection ownership; SQL state rules are shared with PostgreSQL."""
+
+    def __init__(self, path: Path, *, max_total_bytes: int = 256 * 1024 * 1024):
+        path = Path(path).absolute()
+        if any(p.is_symlink() for p in (path, *path.parents)):
+            raise ValueError("tool result database must not be a symlink")
+        if max_total_bytes < 1:
+            raise ValueError("result quota must be positive")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.maximum = max_total_bytes
+        created = not path.exists()
+        with self._connect() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS tool_results (id TEXT PRIMARY KEY, owner TEXT NOT NULL, content TEXT NOT NULL, size INTEGER NOT NULL, expires REAL NOT NULL)")
+            db.execute("CREATE INDEX IF NOT EXISTS tool_results_expiry ON tool_results(expires)")
+            db.execute('CREATE TABLE IF NOT EXISTS cleared_result_owners (owner TEXT PRIMARY KEY)')
+        if created and os.name != "nt":
+            path.chmod(0o600)
+
+    @contextmanager
+    def _connect(self):
+        connection = sqlite3.connect(self.path, timeout=10)
+        try:
+            connection.execute(f"PRAGMA max_page_count={max(64, (self.maximum + 16 * 1024 * 1024) // 4096)}")
+            with connection:
+                yield connection
+        finally:
+            connection.close()

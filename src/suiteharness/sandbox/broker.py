@@ -313,7 +313,7 @@ async def _serve_app(app, listener):
         await server.serve(sockets=[listener])
 
 
-async def serve(config_path, socket_path):
+async def serve(config_path, socket_path, secrets_path=None):
     from suiteharness.config.loader import _default_yaml_decoder, _read_document
     from suiteharness.config.models import DockerSandboxConfig, SuiteHarnessConfig
     from suiteharness.persistence.database import SQLiteDatabase
@@ -339,11 +339,24 @@ async def serve(config_path, socket_path):
                           config.deployment.instance_id + ':' + product_id)
     if policy.limits.output_bytes > MAX_OUTPUT_BYTES:
         raise SandboxConfigurationError('configured output ceiling exceeds broker protocol')
-    database = SQLiteDatabase(config.storage.runtime_path())
+    if config.storage.backend == "postgresql":
+        if secrets_path is None:
+            raise SandboxConfigurationError("PostgreSQL broker requires --secrets with a database credential reference")
+        from suiteharness.config import SuiteHarnessConfigLoader
+        from suiteharness.server.storage import create_runtime_database
+        from suiteharness.persistence.postgres import PostgresSandboxQuarantineStore
+        loaded = SuiteHarnessConfigLoader().load(config_path, secrets_path)
+        database = create_runtime_database(loaded)
+        quarantine = PostgresSandboxQuarantineStore(database, deployment_id=config.deployment.instance_id)
+    else:
+        database = SQLiteDatabase(config.storage.runtime_path())
+        quarantine = SQLiteSandboxQuarantineStore(database, deployment_id=config.deployment.instance_id)
     try:
+        if config.storage.backend == "postgresql":
+            await database.open()
         backend = DockerSandboxBackend(DockerBackendConfig(image=sandbox.image, allowed_host_roots=(root,), binary=sandbox.binary,
                                        context=sandbox.context, require_rootless=True, production=True, egress_networks=sandbox.network.egress_profiles),
-                                       AsyncioProcessTransport(), quarantine_store=SQLiteSandboxQuarantineStore(database, deployment_id=config.deployment.instance_id),
+                                       AsyncioProcessTransport(), quarantine_store=quarantine,
                                        probe_limits=policy.limits)
         with _owned_socket(socket_path) as listener:
             await _serve_app(create_app(policy, backend, database), listener)
@@ -355,9 +368,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True, type=Path)
     parser.add_argument('--socket', required=True, type=Path)
+    parser.add_argument('--secrets', type=Path, help='Private credentials file required for PostgreSQL storage')
     args = parser.parse_args()
     try:
-        asyncio.run(serve(args.config, args.socket))
+        asyncio.run(serve(args.config, args.socket, args.secrets))
     except Exception:
         parser.exit(1, 'sandbox broker startup failed; verify public configuration, socket directory and rootless runtime\n')
 

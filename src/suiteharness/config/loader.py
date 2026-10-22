@@ -197,6 +197,8 @@ def _iter_secret_values(secrets: SuiteHarnessSecrets) -> list[str]:
         ):
             if optional is not None:
                 values.append(optional.get_secret_value())
+    for credential in secrets.databases.values():
+        values.append(credential.dsn.get_secret_value())
     for credential in secrets.services.values():
         for optional in (
             credential.token,

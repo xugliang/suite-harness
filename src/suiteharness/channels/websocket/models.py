@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Literal
 
@@ -13,7 +12,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    JsonValue,
     TypeAdapter,
     field_serializer,
     field_validator,
@@ -109,84 +107,8 @@ class PingFrame(_Frame):
         return value
 
 
-class StopFrame(_Frame):
-    type: Literal["stop"]
-    stop_id: str
-    target_client_message_id: str
-    conversation_id: str
-    product_id: str | None = None
-
-    @field_validator("stop_id", "target_client_message_id")
-    @classmethod
-    def validate_ids(cls, value: str) -> str:
-        if not _ID.fullmatch(value):
-            raise ValueError("invalid control identifier")
-        return value
-
-    @field_validator("conversation_id")
-    @classmethod
-    def validate_conversation_id(cls, value: str) -> str:
-        return MessageFrame.validate_conversation_id(value)
-
-    @field_validator("product_id")
-    @classmethod
-    def validate_product_id(cls, value: str | None) -> str | None:
-        return MessageFrame.validate_product_id(value)
-
-
-class HistoryFrame(_Frame):
-    type: Literal["history"]
-    history_id: str
-    conversation_id: str
-    product_id: str | None = None
-    limit: int = Field(ge=1, le=1_000)
-    before_sequence: int | None = Field(default=None, ge=1)
-
-    @field_validator("history_id")
-    @classmethod
-    def validate_history_id(cls, value: str) -> str:
-        if not _ID.fullmatch(value):
-            raise ValueError("invalid history_id")
-        return value
-
-    @field_validator("conversation_id")
-    @classmethod
-    def validate_conversation_id(cls, value: str) -> str:
-        return MessageFrame.validate_conversation_id(value)
-
-    @field_validator("product_id")
-    @classmethod
-    def validate_product_id(cls, value: str | None) -> str | None:
-        return MessageFrame.validate_product_id(value)
-
-
-class ContinueFrame(_Frame):
-    type: Literal["continue"]
-    client_message_id: str
-    target_client_message_id: str
-    conversation_id: str
-    product_id: str | None = None
-
-    @field_validator("client_message_id", "target_client_message_id")
-    @classmethod
-    def validate_ids(cls, value: str) -> str:
-        if not _ID.fullmatch(value):
-            raise ValueError("invalid control identifier")
-        return value
-
-    @field_validator("conversation_id")
-    @classmethod
-    def validate_conversation_id(cls, value: str) -> str:
-        return MessageFrame.validate_conversation_id(value)
-
-    @field_validator("product_id")
-    @classmethod
-    def validate_product_id(cls, value: str | None) -> str | None:
-        return MessageFrame.validate_product_id(value)
-
-
 ClientFrame = Annotated[
-    MessageFrame | ApprovalDecisionFrame | PingFrame | StopFrame | HistoryFrame | ContinueFrame,
+    MessageFrame | ApprovalDecisionFrame | PingFrame,
     Field(discriminator="type"),
 ]
 _CLIENT_FRAME_ADAPTER: TypeAdapter[ClientFrame] = TypeAdapter(ClientFrame)
@@ -241,62 +163,6 @@ class ErrorFrame(_Frame):
     client_message_id: str | None = None
 
 
-class StopResultFrame(_Frame):
-    type: Literal["stop_result"] = "stop_result"
-    stop_id: str
-    outcome: Literal["requested", "already_requested", "already_finished", "not_found"]
-
-
-class HistoryDisplayEvent(_Frame):
-    """Deliberately small, display-only projection of a transcript event."""
-
-    kind: Literal["user", "assistant", "cancel"]
-    run_id: str | None
-    message_id: str | None = None
-    occurred_at: datetime
-    text: str | None = Field(default=None, max_length=1_000_000)
-    output: JsonValue | None = None
-    partial_output: str | None = Field(default=None, max_length=16_384)
-    incomplete: bool | None = None
-    truncated: bool | None = None
-
-    @field_validator("run_id", "message_id")
-    @classmethod
-    def validate_display_id(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
-        if not _ID.fullmatch(value):
-            raise ValueError("invalid display identifier")
-        return value
-
-    @field_validator("occurred_at")
-    @classmethod
-    def validate_occurred_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("occurred_at must be timezone-aware")
-        return value.astimezone(UTC)
-
-
-class HistoryResultFrame(_Frame):
-    type: Literal["history_result"] = "history_result"
-    history_id: str
-    events: tuple[HistoryDisplayEvent, ...]
-    next_cursor: int | None = Field(default=None, ge=1)
-    has_more: bool | None = None
-    pagination_supported: bool = False
-    truncated: bool = False
-
-    @field_serializer("events")
-    def serialize_events(self, value: tuple[HistoryDisplayEvent, ...]) -> list[dict[str, object]]:
-        serialized: list[dict[str, object]] = []
-        for item in value:
-            result = item.model_dump(mode="json", exclude_none=True)
-            if item.run_id is None:
-                result["run_id"] = None
-            serialized.append(result)
-        return serialized
-
-
 ServerFrame = (
     AckFrame
     | EventFrame
@@ -304,8 +170,6 @@ ServerFrame = (
     | ApprovalDecisionResultFrame
     | PongFrame
     | ErrorFrame
-    | StopResultFrame
-    | HistoryResultFrame
 )
 
 
@@ -377,18 +241,12 @@ __all__ = [
     "ApprovalDecisionResultFrame",
     "ApprovalRequiredFrame",
     "ClientFrame",
-    "ContinueFrame",
     "ErrorFrame",
     "EventFrame",
-    "HistoryDisplayEvent",
-    "HistoryFrame",
-    "HistoryResultFrame",
     "MessageFrame",
     "PingFrame",
     "PongFrame",
     "ServerFrame",
-    "StopFrame",
-    "StopResultFrame",
     "WebSocketHandshake",
     "WebSocketPacket",
     "WebSocketPacketKind",

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator, Mapping
 
+from suiteharness import observability
+from suiteharness.diagnostics import emit as diagnostic
+from suiteharness.models.characters import comparison_fields, measure_characters
 from suiteharness.models.context import ContextCapacityError, ContextManager, PreparedContext
 from suiteharness.models.errors import ModelErrorCode, ModelProviderError
 from suiteharness.models.protocols import ModelProvider, SecretResolver
@@ -16,6 +18,7 @@ from suiteharness.models.registry import ProviderRegistry
 from suiteharness.models.transport import HttpTransport
 from suiteharness.models.types import (
     DocumentContent,
+    FinishReason,
     ImageContent,
     ModelProfile,
     ModelRequest,
@@ -23,10 +26,43 @@ from suiteharness.models.types import (
     ModelRoute,
     ModelStreamEvent,
     ModelStreamEventType,
+    ModelToolCall,
 )
 from suiteharness.models.usage import UsageLedger
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _can_record_skill_response(
+    request: ModelRequest, calls: tuple[ModelToolCall, ...], finish_reason: FinishReason | None,
+) -> bool:
+    """Accept only successful output for this final, host-prepared request.
+
+    Some OpenAI-compatible services finish one explicitly named function call
+    with STOP rather than TOOL_CALLS. Keep that compatibility deliberately
+    narrower than ordinary tool responses: one complete call, exactly the
+    named function, and that function present in the actual request's tools.
+    This records provenance only; it neither grants tool authority nor changes
+    provider events or relaxes normal ReAct finish-reason validation.
+    """
+    if not calls:
+        return finish_reason is FinishReason.STOP
+    if finish_reason is FinishReason.TOOL_CALLS:
+        return True
+    if finish_reason is not FinishReason.STOP or len(calls) != 1:
+        return False
+    choice = request.tool_choice
+    if (not isinstance(choice, dict) or set(choice) != {"type", "function"}
+            or choice.get("type") != "function"):
+        return False
+    function = choice.get("function")
+    if not isinstance(function, dict) or set(function) != {"name"}:
+        return False
+    name = function.get("name")
+    if not isinstance(name, str) or name not in {tool.name for tool in request.tools}:
+        return False
+    call = calls[0]
+    return isinstance(call, ModelToolCall) and call.name == name
 
 
 class ModelGateway:
@@ -111,33 +147,6 @@ class ModelGateway:
                 f"model route {route_id!r} was not found",
             ) from exc
 
-    def resume_fingerprint(self, route_id: str) -> str:
-        """Bind effective route configuration without resolving or exposing secrets."""
-        route = self.route(route_id)
-        profiles = []
-        for profile_id in (route.primary_profile, *route.fallback_profiles):
-            profile = self.profile(profile_id)
-            descriptor = self._registry.descriptor(profile.provider_id)
-            if descriptor is None:
-                raise ModelProviderError(
-                    ModelErrorCode.PROVIDER_NOT_FOUND,
-                    f"provider {profile.provider_id!r} was not found",
-                )
-            profile_data = profile.model_dump(mode='json')
-            profile_data['allowed_models'] = sorted(profile.allowed_models)
-            provider_data = descriptor.model_dump(mode='json')
-            provider_data['aliases'] = sorted(descriptor.aliases)
-            profiles.append({
-                'profile': profile_data,
-                'provider': provider_data,
-                'effective_endpoint': profile.base_url or descriptor.default_base_url,
-            })
-        payload = json.dumps(
-            {'route': route.model_dump(mode='json'), 'profiles': profiles},
-            sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False,
-        )
-        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
-
     def _provider(self, profile: ModelProfile) -> ModelProvider:
         provider = self._providers.get(profile.profile_id)
         if provider is None:
@@ -196,6 +205,16 @@ class ModelGateway:
 
     async def complete(self, route_id: str, request: ModelRequest) -> ModelResponse:
         started = time.monotonic()
+        request = request.model_copy(update={"metadata": {
+            **request.metadata, "model_call_id": "model-" + uuid.uuid4().hex}})
+        fields = {key: request.metadata[key] for key in ("run_id", "iteration", "model_call_id") if key in request.metadata}
+        fields["route_id"] = route_id
+        observability.capture("model.input.before", lambda: {
+            **fields, "request": observability.model_request_payload(request),
+        })
+        diagnostic("model.started", **fields, message_count=len(request.messages), tool_count=len(request.tools),
+                   streaming=False, provider_invoked=False, max_output_tokens=request.max_output_tokens,
+                   **comparison_fields(measure_characters(request), None))
         status = 'failed'
         usage = None
         try:
@@ -206,8 +225,14 @@ class ModelGateway:
         except asyncio.CancelledError:
             status = 'cancelled'
             raise
+        except Exception as exc:
+            diagnostic("model.failed", **fields, error=exc, stage="model_complete")
+            raise
         finally:
             self._record_call(route_id, status, started, usage)
+            diagnostic("model.finished", **fields, status=status, seconds=time.monotonic() - started,
+                       input_tokens=None if usage is None else usage.input_tokens,
+                       output_tokens=None if usage is None else usage.output_tokens)
 
     def _prepare_context(self, profile: ModelProfile, request: ModelRequest) -> PreparedContext:
         descriptor = self._registry.descriptor(profile.provider_id)
@@ -219,21 +244,73 @@ class ModelGateway:
                 profile.profile_id, prepared.estimated_input_tokens, prepared.removed_rounds, prepared.truncated_tools)
         return prepared
 
+    def _prepare_observed(self, profile, request, fields, *, streaming=False):
+        """One profile's measurements, including locally rejected requests.
+
+        provider_invoked means the provider adapter method was entered, not an
+        assertion that the remote service received or billed an HTTP request.
+        """
+        from suiteharness.skills.runtime import (
+            prepare_skill_model_request,
+            verify_skill_model_request,
+        )
+
+        before = measure_characters(request)
+        diagnostic("model.context_prepare", **fields, streaming=streaming,
+                   provider_invoked=False)
+        try:
+            request = prepare_skill_model_request(request)
+            before = measure_characters(request)
+            self._validate_request(profile, request, streaming=streaming)
+            prepared = self._prepare_context(profile, request)
+            # Verify *after* profile-specific trimming and immediately before
+            # provider use. A run having read a Skill in the past is not proof
+            # that its full instructions reached this particular model call.
+            verify_skill_model_request(prepared.request)
+        except BaseException as exc:
+            # Capacity failures expose the final attempted size even when
+            # truncation/removal could not make the protected input fit.
+            after = exc.character_counts if isinstance(exc, ContextCapacityError) else None
+            diagnostic("model.context_failed", **fields, error=exc, stage="context_prepare",
+                       streaming=streaming, provider_invoked=False,
+                       removed_rounds=getattr(exc, "removed_rounds", None),
+                       truncated_tools=getattr(exc, "truncated_tools", None),
+                       **comparison_fields(before, after))
+            raise
+        sizes = comparison_fields(before, measure_characters(prepared.request))
+        diagnostic("model.context_ready", **fields, streaming=streaming, provider_invoked=False,
+                   estimated_input_tokens=prepared.estimated_input_tokens,
+                   removed_rounds=prepared.removed_rounds, truncated_tools=prepared.truncated_tools,
+                   **sizes)
+        return prepared, sizes
+
     async def _complete(self, route_id: str, request: ModelRequest) -> ModelResponse:
         route = self.route(route_id)
         last_error: ModelProviderError | ContextCapacityError | None = None
         for profile_id in (route.primary_profile, *route.fallback_profiles):
             profile = self.profile(profile_id)
-            self._validate_request(profile, request)
+            fields = {key: request.metadata[key] for key in ("run_id", "iteration", "model_call_id") if key in request.metadata}
+            fields.update(route_id=route_id, provider_id=profile.provider_id, profile_id=profile_id, model=profile.model)
             try:
-                prepared = self._prepare_context(profile, request)
+                prepared, sizes = self._prepare_observed(profile, request, fields)
             except ContextCapacityError as exc:
                 last_error = exc
                 continue
             provider = self._provider(profile)
             for attempt in range(profile.max_retries + 1):
+                diagnostic("model.attempt_started", **fields, attempt=attempt + 1,
+                           retry_limit=profile.max_retries + 1, streaming=False,
+                           provider_invoked=True, **sizes)
+                observability.capture("model.request", lambda: {
+                    **fields, "attempt": attempt + 1, "streaming": False,
+                    "request": observability.model_request_payload(prepared.request),
+                })
+                attempt_started = time.monotonic()
+                attempt_status = "failed"
+                attempt_usage = None
                 try:
                     response = await provider.complete(prepared.request)
+                    attempt_usage = response.usage if 'usage' in response.model_fields_set else None
                     descriptor = self._registry.descriptor(profile.provider_id)
                     assert descriptor is not None
                     capabilities = profile.effective_capabilities(descriptor.capabilities)
@@ -243,12 +320,35 @@ class ModelGateway:
                             "model returned parallel tool calls disabled by the profile",
                             provider_id=profile.provider_id,
                         )
+                    if _can_record_skill_response(prepared.request, response.tool_calls, response.finish_reason):
+                        from suiteharness.skills.runtime import record_skill_model_response
+                        record_skill_model_response(prepared.request, response.tool_calls)
+                    attempt_status = "succeeded"
+                    observability.capture("model.response", lambda: {
+                        **fields, "attempt": attempt + 1,
+                        "response": observability.model_response_payload(response),
+                    })
                     return response
+                except asyncio.CancelledError:
+                    attempt_status = "cancelled"
+                    raise
                 except ModelProviderError as exc:
+                    diagnostic("model.attempt_failed", **fields, error=exc, attempt=attempt + 1,
+                               code=exc.code.value, status_code=exc.status_code, retryable=exc.retryable)
                     last_error = exc
                     if not exc.retryable or attempt >= profile.max_retries:
                         break
                     await asyncio.sleep(min(0.25 * (2**attempt), 2.0))
+                finally:
+                    observability.capture("model.attempt.end", lambda: {
+                        **fields, "attempt": attempt + 1, "status": attempt_status,
+                        "seconds": time.monotonic() - attempt_started,
+                    })
+                    diagnostic("model.attempt_finished", **fields, attempt=attempt + 1,
+                               streaming=False, provider_invoked=True, status=attempt_status,
+                               seconds=time.monotonic() - attempt_started,
+                               input_tokens=None if attempt_usage is None else attempt_usage.input_tokens,
+                               output_tokens=None if attempt_usage is None else attempt_usage.output_tokens)
             if isinstance(last_error, ModelProviderError) and not last_error.retryable:
                 raise last_error
         if last_error is not None:
@@ -257,11 +357,29 @@ class ModelGateway:
 
     async def _stream(self, route_id: str, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         started = time.monotonic()
+        request = request.model_copy(update={"metadata": {
+            **request.metadata, "model_call_id": "model-" + uuid.uuid4().hex}})
+        fields = {key: request.metadata[key] for key in ("run_id", "iteration", "model_call_id")
+                  if key in request.metadata}
+        fields["route_id"] = route_id
+        observability.capture("model.input.before", lambda: {
+            **fields, "request": observability.model_request_payload(request),
+        })
+        first_event = None
+        diagnostic("model.started", **fields, message_count=len(request.messages),
+                   tool_count=len(request.tools), max_output_tokens=request.max_output_tokens,
+                   streaming=True, provider_invoked=False,
+                   **comparison_fields(measure_characters(request), None))
         status = 'failed'
         usage = None
         source = self._stream_unobserved(route_id, request)
         try:
             async for event in source:
+                if first_event is None:
+                    first_event = time.monotonic() - started
+                    diagnostic("model.first_event", **fields, first_event_seconds=first_event)
+                if event.finish_reason is not None:
+                    diagnostic("model.finish_reason", **fields, finish_reason=event.finish_reason.value)
                 if event.usage is not None:
                     # Adapter usage events are cumulative snapshots, not deltas.
                     usage = event.usage
@@ -270,20 +388,31 @@ class ModelGateway:
         except (asyncio.CancelledError, GeneratorExit):
             status = 'cancelled'
             raise
+        except Exception as exc:
+            diagnostic("model.failed", **fields, error=exc, stage="model_stream",
+                       emitted=first_event is not None)
+            raise
         finally:
             try:
                 await source.aclose()
             finally:
                 self._record_call(route_id, status, started, usage)
+                diagnostic("model.finished", **fields, status=status,
+                           seconds=time.monotonic() - started,
+                           input_tokens=None if usage is None else usage.input_tokens,
+                           output_tokens=None if usage is None else usage.output_tokens)
 
     async def _stream_unobserved(self, route_id: str, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         route = self.route(route_id)
         last_error: ModelProviderError | ContextCapacityError | None = None
         for profile_id in (route.primary_profile, *route.fallback_profiles):
             profile = self.profile(profile_id)
-            self._validate_request(profile, request, streaming=True)
+            fields = {key: request.metadata[key] for key in ("run_id", "iteration", "model_call_id")
+                      if key in request.metadata}
+            fields.update(route_id=route_id, profile_id=profile_id, provider_id=profile.provider_id,
+                          model=profile.model)
             try:
-                prepared = self._prepare_context(profile, request)
+                prepared, sizes = self._prepare_observed(profile, request, fields, streaming=True)
             except ContextCapacityError as exc:
                 last_error = exc
                 continue
@@ -292,22 +421,45 @@ class ModelGateway:
             assert descriptor is not None
             capabilities = profile.effective_capabilities(descriptor.capabilities)
             for attempt in range(profile.max_retries + 1):
+                attempt_started = time.monotonic()
+                diagnostic("model.attempt_started", **fields, attempt=attempt + 1,
+                           retry_limit=profile.max_retries + 1, streaming=True,
+                           provider_invoked=True, **sizes)
+                observability.capture("model.request", lambda: {
+                    **fields, "attempt": attempt + 1, "streaming": True,
+                    "request": observability.model_request_payload(prepared.request),
+                })
                 emitted = False
+                attempt_status = "failed"
+                attempt_usage = None
                 call_ids: set[str] = set()
-                provider_stream = provider.stream(prepared.request)
+                completed_calls = {}
+                finish_reason = None
+                valid_stream_shape = True
+                provider_stream = None
                 try:
+                    provider_stream = provider.stream(prepared.request)
                     async for event in provider_stream:
+                        if finish_reason is not None:
+                            valid_stream_shape = False
+                        if event.usage is not None:
+                            attempt_usage = event.usage
                         if event.type is ModelStreamEventType.CONTEXT_COMPACTED or event.prepared_messages is not None:
                             raise ModelProviderError(ModelErrorCode.RESPONSE_INVALID,
                                 'provider attempted to emit gateway-owned context state', provider_id=profile.provider_id)
                         if event.tool_call is not None:
+                            if event.tool_call.call_id in call_ids:
+                                valid_stream_shape = False
                             call_ids.add(event.tool_call.call_id)
+                            completed_calls[event.tool_call.call_id] = event.tool_call
                             if len(call_ids) > 1 and not capabilities.parallel_tool_calls:
                                 raise ModelProviderError(
                                     ModelErrorCode.UNSUPPORTED_FEATURE,
                                     "model returned parallel tool calls disabled by the profile",
                                     provider_id=profile.provider_id,
                                 )
+                        if event.type is ModelStreamEventType.MESSAGE_END:
+                            finish_reason = event.finish_reason
                         if not emitted and (prepared.removed_rounds or prepared.truncated_tools):
                             # Only adopt context from a provider that actually
                             # starts yielding. A failed attempt must not replace
@@ -317,9 +469,27 @@ class ModelGateway:
                                 context_info={'estimated_input_tokens': prepared.estimated_input_tokens,
                                     'removed_rounds': prepared.removed_rounds, 'truncated_tools': prepared.truncated_tools})
                         emitted = True
+                        observability.capture("model.stream.delta", lambda: {
+                            **fields, "attempt": attempt + 1,
+                            **observability.safe_value(event),
+                        })
                         yield event
+                    # Register only a successfully exhausted stream. A partial
+                    # or cancelled attempt must not authorize tool execution.
+                    if valid_stream_shape and _can_record_skill_response(
+                        prepared.request, tuple(completed_calls.values()), finish_reason,
+                    ):
+                        from suiteharness.skills.runtime import record_skill_model_response
+                        record_skill_model_response(prepared.request, tuple(completed_calls.values()))
+                    attempt_status = "succeeded"
                     return
+                except (asyncio.CancelledError, GeneratorExit):
+                    attempt_status = "cancelled"
+                    raise
                 except ModelProviderError as exc:
+                    diagnostic("model.attempt_failed", **fields, error=exc, attempt=attempt + 1,
+                               emitted=emitted, retryable=exc.retryable, status_code=exc.status_code,
+                               code=exc.code.value, seconds=time.monotonic() - attempt_started)
                     last_error = exc
                     # Once bytes reached the caller, switching providers could splice two answers.
                     if emitted or not exc.retryable:
@@ -329,6 +499,16 @@ class ModelGateway:
                         continue
                     break
                 finally:
+                    observability.capture("model.stream.end", lambda: {
+                        **fields, "attempt": attempt + 1, "status": attempt_status,
+                        "seconds": time.monotonic() - attempt_started,
+                        "usage": observability.safe_value(attempt_usage),
+                    })
+                    diagnostic("model.attempt_finished", **fields, attempt=attempt + 1,
+                               emitted=emitted, seconds=time.monotonic() - attempt_started,
+                               streaming=True, provider_invoked=True, status=attempt_status,
+                               input_tokens=None if attempt_usage is None else attempt_usage.input_tokens,
+                               output_tokens=None if attempt_usage is None else attempt_usage.output_tokens)
                     close = getattr(provider_stream, 'aclose', None)
                     if close is not None:
                         await close()

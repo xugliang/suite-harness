@@ -32,6 +32,7 @@ from suiteharness.channels import (
 )
 from suiteharness.channels.websocket import OriginPolicy, WebSocketSessionRevalidator
 from suiteharness.config import LoadedSuiteHarnessConfig, SuiteHarnessConfigLoader
+from suiteharness.execution.commands import CommandRegistry
 from suiteharness.models import HttpTransport as ModelHttpTransport
 from suiteharness.runtime import (
     ActivatedCustomerBundle,
@@ -281,6 +282,7 @@ class CompanyServerBootstrap:
         mcp_adapters: McpHostAdapters | None = None,
         input_builder: RunInputBuilder = default_run_input,
         approval_timeout_seconds: float = 60.0,
+        command_registry: CommandRegistry | None = None,
     ) -> None:
         if not isinstance(loaded, LoadedSuiteHarnessConfig):
             raise TypeError("loaded must be LoadedSuiteHarnessConfig")
@@ -322,6 +324,9 @@ class CompanyServerBootstrap:
         self.mcp_adapters = mcp_adapters
         self.input_builder = input_builder
         self.approval_timeout_seconds = approval_timeout_seconds
+        if command_registry is not None and not isinstance(command_registry, CommandRegistry):
+            raise TypeError("command_registry must implement CommandRegistry")
+        self.command_registry = command_registry
 
     @classmethod
     def from_files(
@@ -365,6 +370,7 @@ class CompanyServerBootstrap:
                 ),
                 plugin_adapters=self.plugin_adapters,
                 mcp_adapters=self.mcp_adapters,
+                command_registry=self.command_registry,
             )
             # Product contributions must exist before resolving the selected bundle.
             await foundation.extensions.start_plugins()
@@ -400,6 +406,7 @@ class CompanyServerBootstrap:
                 feishu_adapters=self.feishu_adapters,
                 mcp_grant_material=extensions.mcp_by_product,
                 runtime_database=foundation.runtime_database,
+                tool_results=foundation.tool_results,
                 input_builder=self.input_builder,
             )
             runtime = CompanyServerRuntime(

@@ -20,6 +20,8 @@ from pydantic import (
     model_validator,
 )
 
+from suiteharness.context_labels import ContextCategory
+from suiteharness.execution.commands import CommandContext
 from suiteharness.runtime.scopes import RequestScope, ScopeKind, ScopePath
 
 _NAME = re.compile(r"^[a-z][a-z0-9]*(?:[._:/-][a-z0-9]+)*$")
@@ -134,6 +136,13 @@ class FailureCode(str, Enum):
     APPROVAL_REQUIRED = "approval_required"
     APPROVAL_INVALID = "approval_invalid"
     TOOL_INPUT_INVALID = "tool_input_invalid"
+    SKILL_REQUIRED = "skill_required"
+    SKILL_NOT_AVAILABLE = "skill_not_available"
+    SKILL_INVALID = "skill_invalid"
+    SKILL_CONTENT_CHANGED = "skill_content_changed"
+    SKILL_BUDGET_EXCEEDED = "skill_budget_exceeded"
+    SKILL_CONTEXT_UNAVAILABLE = "skill_context_unavailable"
+    SKILL_READ_FAILED = "skill_read_failed"
     RUN_INPUT_TOO_LARGE = "run_input_too_large"
     TOOL_ARGUMENTS_TOO_LARGE = "tool_arguments_too_large"
     TOOL_RESULT_TOO_LARGE = "tool_result_too_large"
@@ -160,7 +169,7 @@ class WorkflowDecisionKind(str, Enum):
 
 class AuditEventType(str, Enum):
     RUN_STARTED = "run_started"
-    AGENT_DELEGATED = "agent_delegated"
+    COMMAND_ROUTED = "command_routed"
     STRATEGY_DECISION = "strategy_decision"
     TOOL_INTENT = "tool_intent"
     TOOL_DENIED = "tool_denied"
@@ -243,7 +252,17 @@ class ToolSpec(_FrozenModel):
     description: str = ""
     effects: frozenset[ToolEffect]
     required_capabilities: frozenset[str] = frozenset()
+    required_skills: tuple[str, ...] = ()
     input_schema: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("required_skills")
+    @classmethod
+    def validate_required_skills(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("required_skills must be unique")
+        for item in value:
+            _name(item, "required skill")
+        return value
 
     @field_validator("name")
     @classmethod
@@ -438,20 +457,11 @@ class RunFailure(_FrozenModel):
 class ToolObservation(_FrozenModel):
     call_id: str
     tool_name: str
-    tool_identity: ToolIdentity | None = None
-    # Present only when the runner can safely retain the original read call
-    # for authorization on resume. None keeps existing observations readable.
-    arguments: dict[str, JsonValue] | None = None
     status: ToolCallStatus
     result: JsonValue | None = None
     failure: RunFailure | None = None
     started_at: datetime
     finished_at: datetime
-
-    @field_validator("arguments")
-    @classmethod
-    def validate_arguments(cls, value: dict[str, JsonValue] | None) -> dict[str, JsonValue] | None:
-        return None if value is None else json.loads(canonical_json(value))
 
     @field_validator("started_at", "finished_at")
     @classmethod
@@ -478,6 +488,7 @@ class ToolObservation(_FrozenModel):
 class PromptMessage(_FrozenModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str
+    context_category: ContextCategory | None = Field(default=None, exclude=True)
 
 
 class PromptEnvelope(_FrozenModel):
@@ -538,6 +549,7 @@ class WorkflowFrame(_FrozenModel):
     iteration: int = Field(ge=1)
     observations: tuple[ToolObservation, ...] = ()
     available_tools: tuple[ToolSpec, ...] = ()
+    command_context: CommandContext | None = None
     workflow_state: JsonValue = None
     tool_calls_used: int = Field(ge=0)
     elapsed_seconds: float = Field(ge=0.0)
@@ -586,30 +598,6 @@ class WorkflowDecision(_FrozenModel):
         )
 
 
-class RunResumeState(_FrozenModel):
-    """Internal, trusted checkpoint. Never accept this structure from a client."""
-
-    source_run_id: str
-    workflow_state: JsonValue = None
-    observations: tuple[ToolObservation, ...] = Field(default=(), max_length=1024)
-    iterations_used: int = Field(ge=0, le=10_000)
-    tool_calls_used: int = Field(ge=0, le=100_000)
-    call_ids: tuple[str, ...] = Field(default=(), max_length=1024)
-    prompt_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    route_key: str = Field(min_length=1, max_length=4096)
-
-    @field_validator("source_run_id")
-    @classmethod
-    def validate_source(cls, value: str) -> str:
-        return _identifier(value, "source_run_id")
-
-    @field_validator("workflow_state")
-    @classmethod
-    def validate_state(cls, value: JsonValue) -> JsonValue:
-        canonical_json(value)
-        return value
-
-
 class RunRequest(_FrozenModel):
     run_id: str
     scope: RequestScope
@@ -618,7 +606,6 @@ class RunRequest(_FrozenModel):
     conversation: ConversationContext = Field(default_factory=ConversationContext)
     read_only: bool = False
     budget: ExecutionBudget = Field(default_factory=ExecutionBudget)
-    resume: RunResumeState | None = None
 
     @field_validator("run_id", "grant_id")
     @classmethod

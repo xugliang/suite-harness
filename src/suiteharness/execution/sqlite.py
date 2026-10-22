@@ -16,48 +16,9 @@ class AuditConflictError(RuntimeError):
     """An immutable audit event identifier was already committed."""
 
 
-class SQLiteAuditJournal(AuditJournal):
+class SQLAuditOperations(AuditJournal):
     """Persist detached audit events; the public API intentionally has no update/delete."""
 
-    def __init__(self, database: str | Path) -> None:
-        path = Path(database)
-        if not path.is_absolute():
-            raise ValueError("audit database path must be absolute")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        created = not path.exists()
-        self._connection = sqlite3.connect(
-            str(path),
-            timeout=30.0,
-            isolation_level=None,
-            check_same_thread=False,
-        )
-        if created and os.name != "nt":
-            path.chmod(0o600)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA busy_timeout=30000")
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA synchronous=FULL")
-        self._connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS audit_events (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL UNIQUE,
-                occurred_at TEXT NOT NULL,
-                tenant_id TEXT NOT NULL,
-                product_id TEXT NOT NULL,
-                principal_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                run_id TEXT NOT NULL,
-                event_json TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS audit_by_tenant_time
-                ON audit_events(tenant_id, occurred_at, sequence);
-            CREATE INDEX IF NOT EXISTS audit_by_run
-                ON audit_events(tenant_id, product_id, run_id, sequence);
-            """
-        )
-        self._lock = asyncio.Lock()
-        self._closed = False
 
     async def append(self, event: AuditEvent) -> None:
         if not isinstance(event, AuditEvent):
@@ -143,6 +104,50 @@ class SQLiteAuditJournal(AuditJournal):
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("audit journal is closed")
+
+
+class SQLiteAuditJournal(SQLAuditOperations):
+    """SQLite connection ownership; SQL state rules are shared with PostgreSQL."""
+
+    def __init__(self, database: str | Path) -> None:
+        path = Path(database)
+        if not path.is_absolute():
+            raise ValueError("audit database path must be absolute")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        created = not path.exists()
+        self._connection = sqlite3.connect(
+            str(path),
+            timeout=30.0,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        if created and os.name != "nt":
+            path.chmod(0o600)
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA busy_timeout=30000")
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA synchronous=FULL")
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                occurred_at TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                event_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS audit_by_tenant_time
+                ON audit_events(tenant_id, occurred_at, sequence);
+            CREATE INDEX IF NOT EXISTS audit_by_run
+                ON audit_events(tenant_id, product_id, run_id, sequence);
+            """
+        )
+        self._lock = asyncio.Lock()
+        self._closed = False
 
 
 __all__ = ["AuditConflictError", "SQLiteAuditJournal"]

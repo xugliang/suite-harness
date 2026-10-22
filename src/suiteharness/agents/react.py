@@ -7,7 +7,6 @@ handler.  Every returned :class:`ToolIntent` therefore still crosses the trusted
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -16,6 +15,7 @@ from typing import Literal, cast
 from pydantic import JsonValue
 
 from suiteharness.agents.protocols import ModelGatewayLike, ProductModelRouteResolver
+from suiteharness.diagnostics import emit as diagnostic
 from suiteharness.execution import (
     PromptEnvelope,
     RunRequest,
@@ -60,36 +60,6 @@ class ReActWorkflow(Workflow):
         if self.tool_choice not in {"auto", "none", "required"}:
             raise ValueError("tool_choice must be auto, none, or required")
 
-    def resume_key(
-        self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
-    ) -> str:
-        # Validate the saved request identity before the gateway sees any data.
-        self._restore_state(request, frame, prompt)
-        settings: dict[str, JsonValue] = {
-            'schema': _STATE_SCHEMA, 'route_id': self.route_id, 'model': self.model,
-            'temperature': self.temperature, 'max_output_tokens': self.max_output_tokens,
-            'tool_choice': self.tool_choice,
-        }
-        # The configured gateway exposes immutable administrator-owned routes
-        # and profiles. Bind their contents too: a stable route alias alone
-        # does not imply a stable model or endpoint after a server restart.
-        route_lookup = getattr(self.gateway, 'route', None)
-        profile_lookup = getattr(self.gateway, 'profile', None)
-        fingerprint = getattr(self.gateway, 'resume_fingerprint', None)
-        if callable(fingerprint):
-            settings['gateway_fingerprint'] = fingerprint(self.route_id)
-        elif callable(route_lookup) and callable(profile_lookup):
-            route = route_lookup(self.route_id)
-            settings['route'] = route.model_dump(mode='json')
-            profiles = []
-            for profile_id in (route.primary_profile, *route.fallback_profiles):
-                profile = profile_lookup(profile_id)
-                data = profile.model_dump(mode='json')
-                data['allowed_models'] = sorted(profile.allowed_models)
-                profiles.append(data)
-            settings['profiles'] = profiles
-        return hashlib.sha256(canonical_json(settings).encode('utf-8')).hexdigest()
-
     async def next(
         self,
         request: RunRequest,
@@ -101,6 +71,7 @@ class ReActWorkflow(Workflow):
     async def stream(
         self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
     ) -> AsyncIterator[WorkflowEvent | WorkflowDecision]:
+        diagnostic("react.restore_state", stage="state_restore", iteration=frame.iteration)
         messages, consumed, seen_call_ids = self._restore_state(request, frame, prompt)
         new_observations = frame.observations[consumed:]
         for observation in new_observations:
@@ -130,9 +101,9 @@ class ReActWorkflow(Workflow):
                 "product_id": request.scope.product_id,
             }
         )
-        source = self.gateway.stream(
-            self.route_id,
-            ModelRequest(
+        diagnostic("react.build_model_request", stage="model_request", message_count=len(messages), tool_count=len(model_tools))
+        from suiteharness.skills.runtime import prepare_skill_model_request
+        model_request = prepare_skill_model_request(ModelRequest(
                 messages=tuple(messages),
                 model=self.model,
                 tools=model_tools,
@@ -140,8 +111,8 @@ class ReActWorkflow(Workflow):
                 temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 metadata=metadata,
-            ),
-        )
+            ))
+        source = self.gateway.stream(self.route_id, model_request)
 
         text_parts: list[str] = []
         tool_calls: list[ModelToolCall] = []
@@ -178,6 +149,8 @@ class ReActWorkflow(Workflow):
                     yield WorkflowEvent(kind='compact_completed', data=public)
                 if event.usage is not None:
                     yield WorkflowEvent(kind='usage', data=event.usage.model_dump(mode='json'))
+        diagnostic("react.validate_response", stage="response_validation",
+                   finish_reason=finish_reason.value if finish_reason is not None else None)
         if finish_reason is None:
             raise ReActStateError('model stream ended without message_end')
         if finish_reason not in {FinishReason.STOP, FinishReason.TOOL_CALLS}:
@@ -191,6 +164,7 @@ class ReActWorkflow(Workflow):
             role=ModelRole.ASSISTANT,
             content=(TextContent(text=''.join(text_parts)),) if text_parts else (),
             tool_calls=tuple(tool_calls),
+            context_category="current_execution",
         )
         messages.append(assistant)
         state = self._dump_state(request, messages, len(frame.observations), seen_call_ids)
@@ -228,12 +202,7 @@ class ReActWorkflow(Workflow):
             raise ReActStateError("workflow_state is not a suiteharness.react.v2 checkpoint")
         if state.get("route_id") != self.route_id:
             raise ReActStateError("workflow_state belongs to a different model route")
-        identity = self._request_identity(request)
-        saved_identity = state.get("request_identity")
-        if request.resume is not None and isinstance(saved_identity, dict):
-            if saved_identity.get('run_id') == request.resume.source_run_id:
-                identity['run_id'] = request.resume.source_run_id
-        if saved_identity != identity:
+        if state.get("request_identity") != self._request_identity(request):
             raise ReActStateError("workflow_state belongs to a different request scope")
         raw_messages = state.get("messages")
         consumed = state.get("consumed_observations")
@@ -250,6 +219,13 @@ class ReActWorkflow(Workflow):
             raise ReActStateError("workflow_state has an invalid shape")
         try:
             messages = [ModelMessage.model_validate(item, strict=False) for item in raw_messages]
+            categories = state.get("context_categories")
+            if categories is not None:
+                if not isinstance(categories, list) or len(categories) != len(messages):
+                    raise ValueError("invalid context provenance labels")
+                messages = [ModelMessage.model_validate(
+                    {**message.model_dump(mode="json"), "context_category": category}, strict=False
+                ) for message, category in zip(messages, categories, strict=True)]
         except Exception as exc:
             raise ReActStateError("workflow_state contains invalid model messages") from exc
         return messages, consumed, set(raw_seen)
@@ -263,7 +239,7 @@ class ReActWorkflow(Workflow):
             content = (
                 request.input if isinstance(request.input, str) else canonical_json(request.input)
             )
-            return [ModelMessage.text(ModelRole.USER, content)]
+            return [ModelMessage.text(ModelRole.USER, content, context_category="current_question")]
         role_map = {
             "system": ModelRole.SYSTEM,
             "user": ModelRole.USER,
@@ -275,17 +251,12 @@ class ReActWorkflow(Workflow):
             # its text as untrusted user context instead of forging a tool result.
             role = role_map.get(message.role, ModelRole.USER)
             content = message.content if message.role != "tool" else f"[tool] {message.content}"
-            messages.append(ModelMessage.text(role, content))
+            messages.append(ModelMessage.text(role, content, context_category=message.context_category))
         return messages
 
     @staticmethod
     def _observation_message(observation: ToolObservation) -> ModelMessage:
-        payload: dict[str, JsonValue] = {
-            "status": observation.status.value,
-            # Persist the original observation time. In particular, resumed
-            # web evidence must never look freshly fetched to the model.
-            "observed_at": observation.finished_at.isoformat(),
-        }
+        payload: dict[str, JsonValue] = {"status": observation.status.value}
         if observation.result is not None:
             payload["result"] = observation.result
         if observation.failure is not None:
@@ -298,6 +269,7 @@ class ReActWorkflow(Workflow):
             canonical_json(payload),
             tool_call_id=observation.call_id,
             name=observation.tool_name,
+            context_category="current_execution",
         )
 
     @staticmethod
@@ -338,6 +310,9 @@ class ReActWorkflow(Workflow):
                 "route_id": self.route_id,
                 "request_identity": self._request_identity(request),
                 "messages": [item.model_dump(mode="json") for item in messages],
+                # Sidecar labels keep the message wire/checkpoint shape unchanged;
+                # old ReAct readers ignore this optional top-level key on rollback.
+                "context_categories": [item.context_category for item in messages],
                 "consumed_observations": consumed_observations,
                 "seen_call_ids": sorted(seen_call_ids),
             },
@@ -373,15 +348,6 @@ class ProductRoutedReActWorkflow(Workflow):
     temperature: float | None = None
     max_output_tokens: int = 4096
     tool_choice: str = "auto"
-
-    def resume_key(
-        self, request: RunRequest, frame: WorkflowFrame, prompt: PromptEnvelope | None,
-    ) -> str:
-        return ReActWorkflow(
-            gateway=self.gateway, route_id=self.routes.route_for(request.scope.product_id),
-            model=self.model, temperature=self.temperature,
-            max_output_tokens=self.max_output_tokens, tool_choice=self.tool_choice,
-        ).resume_key(request, frame, prompt)
 
     async def next(
         self,

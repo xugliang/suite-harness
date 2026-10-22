@@ -49,9 +49,9 @@ class GrantAuthority(Protocol):
 class ToolAccessTemplate:
     """Exact aliases that one product may expose on one company channel.
 
-    The three alias sets deliberately encode effects separately.  Moving a tool
-    from read to write in its registration therefore makes an old template fail
-    closed instead of silently gaining authority.
+    The four alias sets deliberately encode effects separately.  Moving a tool
+    between read, local write, destructive write, and external write therefore
+    makes an old template fail closed instead of silently gaining authority.
     """
 
     channel_id: str
@@ -59,6 +59,7 @@ class ToolAccessTemplate:
     read_aliases: tuple[str, ...] = ()
     write_aliases: tuple[str, ...] = ()
     destructive_aliases: tuple[str, ...] = ()
+    external_aliases: tuple[str, ...] = ()
     lifetime: timedelta = timedelta(minutes=5)
 
     def __post_init__(self) -> None:
@@ -66,7 +67,12 @@ class ToolAccessTemplate:
             raise ValueError("invalid access-template channel_id")
         if not _IDENTIFIER.fullmatch(self.product_id):
             raise ValueError("invalid access-template product_id")
-        aliases = (*self.read_aliases, *self.write_aliases, *self.destructive_aliases)
+        aliases = (
+            *self.read_aliases,
+            *self.write_aliases,
+            *self.destructive_aliases,
+            *self.external_aliases,
+        )
         if any(not _TOOL_NAME.fullmatch(alias) for alias in aliases):
             raise ValueError("access-template aliases must be valid tool names")
         if len(aliases) != len(set(aliases)):
@@ -86,11 +92,20 @@ class ToolAccessTemplate:
 
     @property
     def aliases(self) -> tuple[str, ...]:
-        return (*self.read_aliases, *self.write_aliases, *self.destructive_aliases)
+        return (
+            *self.read_aliases,
+            *self.write_aliases,
+            *self.destructive_aliases,
+            *self.external_aliases,
+        )
 
     @property
     def read_only(self) -> bool:
-        return not self.write_aliases and not self.destructive_aliases
+        return not (
+            self.write_aliases
+            or self.destructive_aliases
+            or self.external_aliases
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,9 +219,9 @@ class ConfiguredGrantIssuer(ChannelGrantIssuer):
     Templates are selected by the exact ``(channel_id, product_id)`` pair.  A
     model, product plug-in, or inbound message cannot choose another template.
     Web writes and Bash may be listed explicitly, but the execution runner still
-    performs its mandatory per-call approval policy.  Feishu is read-only unless
-    its template explicitly lists ``suiteharness.fs.write`` and/or ``suiteharness.fs.edit``;
-    their path whitelist remains enforced by the channel policy and file tool.
+    performs its mandatory per-call approval policy.  Feishu local writes remain
+    limited to the built-in file tools; a trusted host may separately grant an
+    exact non-destructive ``WRITE + EXTERNAL`` product tool.
     """
 
     def __init__(
@@ -294,6 +309,11 @@ class ConfiguredGrantIssuer(ChannelGrantIssuer):
             identities.append(identity)
             capabilities.update(required)
             has_write = True
+        for alias in template.external_aliases:
+            identity, required = self._resolve(scope, alias, expected="external")
+            identities.append(identity)
+            capabilities.update(required)
+            has_write = True
 
         mcp_rule = self._mcp_access.get((scope.channel_id, scope.product_id))
         if mcp_rule is not None and (mcp_rule.server_ids or mcp_rule.tools_by_server):
@@ -345,10 +365,18 @@ class ConfiguredGrantIssuer(ChannelGrantIssuer):
             matches = registered.spec.is_read
         elif expected == "write":
             matches = (
-                ToolEffect.WRITE in effects and ToolEffect.DESTRUCTIVE not in effects
+                ToolEffect.WRITE in effects
+                and ToolEffect.DESTRUCTIVE not in effects
+                and ToolEffect.EXTERNAL not in effects
             )
-        else:
+        elif expected == "destructive":
             matches = ToolEffect.WRITE in effects and ToolEffect.DESTRUCTIVE in effects
+        else:
+            matches = (
+                ToolEffect.WRITE in effects
+                and ToolEffect.EXTERNAL in effects
+                and ToolEffect.DESTRUCTIVE not in effects
+            )
         if not matches:
             raise ToolAccessError(
                 f"configured {expected} alias has incompatible effects: {alias}"

@@ -65,9 +65,11 @@ class CompanyChannelAuthorizationPolicy(ToolAuthorizationPolicy):
     """Keep channel UX decisions inside the non-replaceable execution path.
 
     Web reads run directly and writes require an exact single-use approval.
-    Feishu reads run directly; only built-in file write/edit calls underneath a
-    configured relative root may run without an impossible chat approval.
-    Feishu destructive, shell, MCP mutation, and other write tools are denied.
+    Feishu reads run directly.  Built-in file write/edit calls underneath a
+    configured relative root and exact product-scoped ``WRITE + EXTERNAL``
+    tools granted by the trusted host may run without an impossible chat
+    approval.  Feishu destructive, shell, MCP mutation, and other writes are
+    denied.
     The workspace handler performs the canonical/symlink check again.
     """
 
@@ -96,6 +98,16 @@ class CompanyChannelAuthorizationPolicy(ToolAuthorizationPolicy):
         if ToolEffect.DESTRUCTIVE in spec.effects:
             return ToolAuthorization.DENY
         if spec.is_read:
+            return ToolAuthorization.ALLOW
+        is_product_external_write = (
+            ToolEffect.WRITE in spec.effects
+            and ToolEffect.EXTERNAL in spec.effects
+            and identity.namespace == "product"
+            and identity.origin
+            == f"scope:product:{request.scope.tenant_id}:{request.scope.product_id}"
+            and identity.name == spec.name
+        )
+        if is_product_external_write:
             return ToolAuthorization.ALLOW
         is_builtin_file_write = (
             identity.namespace == "suiteharness"

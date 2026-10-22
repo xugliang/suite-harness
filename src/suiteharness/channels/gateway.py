@@ -11,9 +11,9 @@ from contextlib import aclosing
 from dataclasses import dataclass
 
 from suiteharness.runtime import RequestScope, ScopePath
-from suiteharness.sessions.models import RunStopOutcome, TranscriptEvent
+from suiteharness.sessions.models import TranscriptEvent
 
-from .dispatch import FeishuDispatcher, HistoryPage, WebSocketDispatcher
+from .dispatch import FeishuDispatcher, WebSocketDispatcher
 from .models import AuthenticatedPrincipal, ChannelKind, InboundMessage, OutboundEvent
 
 
@@ -67,32 +67,9 @@ class ChannelApplication(ABC):
     ) -> AsyncIterator[OutboundEvent]: ...
 
     async def history(self, scope: RequestScope, *, limit: int = 100,
-                      include_invalidated: bool = False,
-                      include_cancelled: bool = False) -> tuple[TranscriptEvent, ...]:
+                      include_invalidated: bool = False) -> tuple[TranscriptEvent, ...]:
         """Optional scoped display history; simple channel adapters need not provide memory."""
         raise NotImplementedError('this channel application does not provide conversation history')
-
-    async def history_page(
-        self, scope: RequestScope, *, limit: int = 100, before_sequence: int | None = None,
-    ) -> HistoryPage:
-        if before_sequence is not None:
-            raise NotImplementedError('this channel application does not provide history pagination')
-        return HistoryPage(
-            await self.history(scope, limit=limit, include_cancelled=True),
-            pagination_supported=False,
-        )
-
-    async def stop_message(
-        self, scope: RequestScope, *, target_message_id: str | None,
-    ) -> RunStopOutcome:
-        """Optionally stop a scoped message or the only active run."""
-        raise NotImplementedError("this channel application does not provide run stopping")
-
-    def continue_task(
-        self, message: InboundMessage, scope: RequestScope, *, target_message_id: str,
-    ) -> AsyncIterator[OutboundEvent]:
-        """Optionally continue from application-owned, trusted persisted state."""
-        raise NotImplementedError("this channel application does not provide run continuation")
 
     async def invalidate_memory(self, scope: RequestScope, *, reason: str = 'source_changed',
                                 idempotency_key: str | None = None,
@@ -203,12 +180,6 @@ class EnterpriseChannelGateway(WebSocketDispatcher, FeishuDispatcher):
         return f"{prefix}-{digest}"
 
     async def dispatch(self, message: InboundMessage) -> AsyncIterator[OutboundEvent]:
-        principal = await self._authenticate(message)
-        async with aclosing(self._dispatch_principal(message, principal)) as source:
-            async for event in source:
-                yield event
-
-    async def _authenticate(self, message: InboundMessage) -> AuthenticatedPrincipal:
         try:
             async with asyncio.timeout(self._authentication_timeout_seconds):
                 principal = await self._authenticator.authenticate(message)
@@ -220,11 +191,13 @@ class EnterpriseChannelGateway(WebSocketDispatcher, FeishuDispatcher):
             raise ChannelAdmissionError(
                 "channel identity authentication failed closed"
             ) from exc
-        if not isinstance(principal, AuthenticatedPrincipal) or principal.tenant_id != self._tenant_id:
+        if principal is None or principal.tenant_id != self._tenant_id:
             raise ChannelAdmissionError(
                 "channel identity is not authorized for this deployment"
             )
-        return principal
+        async with aclosing(self._dispatch_principal(message, principal)) as source:
+            async for event in source:
+                yield event
 
     async def dispatch_authenticated(
         self,
@@ -238,60 +211,19 @@ class EnterpriseChannelGateway(WebSocketDispatcher, FeishuDispatcher):
         representation reconstructed from client-controlled message data.
         """
 
-        self._require_web(message)
-        async with aclosing(self._dispatch_principal(message, principal)) as source:
-            async for event in source:
-                yield event
-
-    @staticmethod
-    def _require_web(message: InboundMessage) -> None:
         if message.channel is not ChannelKind.WEB:
             raise ChannelAdmissionError(
                 "pre-authenticated dispatch is available only to the Web channel"
             )
-
-    async def stop(
-        self, message: InboundMessage, target_message_id: str | None = None,
-    ) -> RunStopOutcome:
-        """Stop after authenticating a provider-verified channel envelope."""
-        principal = await self._authenticate(message)
-        scope = await self._scope_for(message, principal)
-        return await self._application.stop_message(scope, target_message_id=target_message_id)
-
-    async def stop_authenticated(
-        self, message: InboundMessage, principal: AuthenticatedPrincipal,
-        target_message_id: str,
-    ) -> RunStopOutcome:
-        self._require_web(message)
-        scope = await self._scope_for(message, principal)
-        return await self._application.stop_message(scope, target_message_id=target_message_id)
-
-    async def history_authenticated(
-        self, message: InboundMessage, principal: AuthenticatedPrincipal, limit: int = 100,
-    ) -> tuple[TranscriptEvent, ...]:
-        self._require_web(message)
-        scope = await self._scope_for(message, principal)
-        return await self._application.history(scope, limit=limit, include_cancelled=True)
-
-    async def history_page_authenticated(
-        self, message: InboundMessage, principal: AuthenticatedPrincipal, limit: int = 100,
-        *, before_sequence: int | None = None,
-    ) -> HistoryPage:
-        self._require_web(message)
-        scope = await self._scope_for(message, principal)
-        return await self._application.history_page(
-            scope, limit=limit, before_sequence=before_sequence,
-        )
-
-    async def continue_authenticated(
-        self, message: InboundMessage, principal: AuthenticatedPrincipal,
-        target_message_id: str,
-    ) -> AsyncIterator[OutboundEvent]:
-        self._require_web(message)
-        scope = await self._scope_for(message, principal)
-        async with aclosing(self._application.continue_task(
-            message, scope, target_message_id=target_message_id,
-        )) as source:
+        if (
+            not isinstance(principal, AuthenticatedPrincipal)
+            or principal.tenant_id != self._tenant_id
+            or message.sender_external_id != principal.principal_id
+        ):
+            raise ChannelAdmissionError(
+                "authenticated Web identity does not match the message"
+            )
+        async with aclosing(self._dispatch_principal(message, principal)) as source:
             async for event in source:
                 yield event
 
@@ -300,21 +232,6 @@ class EnterpriseChannelGateway(WebSocketDispatcher, FeishuDispatcher):
         message: InboundMessage,
         principal: AuthenticatedPrincipal,
     ) -> AsyncIterator[OutboundEvent]:
-        scope = await self._scope_for(message, principal)
-        async with aclosing(self._application.handle(message, scope)) as source:
-            async for event in source:
-                yield event
-
-    async def _scope_for(
-        self, message: InboundMessage, principal: AuthenticatedPrincipal,
-    ) -> RequestScope:
-        if (
-            not isinstance(principal, AuthenticatedPrincipal)
-            or principal.tenant_id != self._tenant_id
-            or (message.channel is ChannelKind.WEB
-                and message.sender_external_id != principal.principal_id)
-        ):
-            raise ChannelAdmissionError("authenticated channel identity does not match the message")
         product_id = self._router.resolve(message)
         product_authorizer = self._product_access_authorizer
         if product_authorizer is not None:
@@ -383,7 +300,7 @@ class EnterpriseChannelGateway(WebSocketDispatcher, FeishuDispatcher):
             if self._share_conversation_sessions
             else principal.principal_id
         )
-        return RequestScope(
+        scope = RequestScope(
             path=ScopePath.agent(
                 self._tenant_id,
                 product_id,
@@ -398,6 +315,9 @@ class EnterpriseChannelGateway(WebSocketDispatcher, FeishuDispatcher):
             correlation_id=correlation_id,
             session_owner_id=session_owner_id,
         )
+        async with aclosing(self._application.handle(message, scope)) as source:
+            async for event in source:
+                yield event
 
     async def _authorize(
         self,

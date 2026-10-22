@@ -23,7 +23,6 @@ from suiteharness.channels import (
     ProductAccessAuthorizer,
     ProductRouter,
 )
-from suiteharness.channels.dispatch import HistoryPage
 from suiteharness.channels.feishu import (
     FeishuEventProcessor,
     FeishuHeaderSignatureVerifier,
@@ -49,6 +48,7 @@ from suiteharness.execution import ToolRegistry
 from suiteharness.memory.markdown_archive import MarkdownArchive
 from suiteharness.memory.resolver import ProductSessionMemoryResolver
 from suiteharness.memory.session_memory import SessionConversationMemory
+from suiteharness.execution.results import ToolResultStore
 from suiteharness.memory.summarization import GatewayMemorySummarizer
 from suiteharness.models import MODEL_GATEWAY
 from suiteharness.persistence import (
@@ -58,7 +58,6 @@ from suiteharness.persistence import (
 )
 from suiteharness.runtime import ProductContext, ScopePath
 from suiteharness.sessions import SessionStore
-from suiteharness.sessions.models import RunStopOutcome, TranscriptEvent
 
 from .access import (
     AdditionalGrantMaterial,
@@ -128,45 +127,6 @@ class _HostedEnterpriseChannelGateway(EnterpriseChannelGateway):
     ) -> AsyncIterator[OutboundEvent]:
         self._require_open()
         async with aclosing(super().dispatch_authenticated(message, principal)) as source:
-            async for event in source:
-                yield event
-
-    async def stop(
-        self, message: InboundMessage, target_message_id: str | None = None,
-    ) -> RunStopOutcome:
-        self._require_open()
-        return await super().stop(message, target_message_id)
-
-    async def stop_authenticated(
-        self, message: InboundMessage, principal: AuthenticatedPrincipal,
-        target_message_id: str,
-    ) -> RunStopOutcome:
-        self._require_open()
-        return await super().stop_authenticated(message, principal, target_message_id)
-
-    async def history_authenticated(
-        self, message: InboundMessage, principal: AuthenticatedPrincipal, limit: int = 100,
-    ) -> tuple[TranscriptEvent, ...]:
-        self._require_open()
-        return await super().history_authenticated(message, principal, limit)
-
-    async def history_page_authenticated(
-        self, message: InboundMessage, principal: AuthenticatedPrincipal, limit: int = 100,
-        *, before_sequence: int | None = None,
-    ) -> HistoryPage:
-        self._require_open()
-        return await super().history_page_authenticated(
-            message, principal, limit, before_sequence=before_sequence,
-        )
-
-    async def continue_authenticated(
-        self, message: InboundMessage, principal: AuthenticatedPrincipal,
-        target_message_id: str,
-    ) -> AsyncIterator[OutboundEvent]:
-        self._require_open()
-        async with aclosing(super().continue_authenticated(
-            message, principal, target_message_id,
-        )) as source:
             async for event in source:
                 yield event
 
@@ -275,7 +235,8 @@ class CompanyChannelRuntime:
         product_access_authorizer: ProductAccessAuthorizer | None = None,
         feishu_adapters: FeishuHostAdapters | None = None,
         mcp_grant_material: Mapping[str, McpGrantMaterial] | None = None,
-        runtime_database: SQLiteDatabase | None = None,
+        runtime_database: object | None = None,
+        tool_results: ToolResultStore | None = None,
         input_builder: RunInputBuilder = default_run_input,
         web_route_factory: StarletteRouteFactory = create_starlette_websocket_route,
         feishu_route_factory: StarletteRouteFactory = create_starlette_feishu_route,
@@ -287,7 +248,7 @@ class CompanyChannelRuntime:
         runtime = cls()
         runtime._web_route_factory = web_route_factory
         runtime._feishu_route_factory = feishu_route_factory
-        database: SQLiteDatabase | None = runtime_database
+        database = runtime_database
         owns_database = False
         try:
             runtime._build_common(
@@ -300,6 +261,7 @@ class CompanyChannelRuntime:
                 mcp_grant_material=mcp_grant_material or {},
                 input_builder=input_builder,
                 product_access_authorizer=product_access_authorizer,
+                tool_results=tool_results,
             )
             runtime._build_web(
                 loaded,
@@ -309,9 +271,12 @@ class CompanyChannelRuntime:
             )
             if loaded.config.channels.feishu.enabled:
                 if database is None:
-                    database = SQLiteDatabase(loaded.config.storage.runtime_path())
+                    from .storage import create_runtime_database
+                    database = create_runtime_database(loaded)
                     owns_database = True
                 runtime._build_feishu(loaded, database, feishu_adapters)
+                from .storage import open_runtime_database
+                await open_runtime_database(database)
             else:
                 runtime.feishu_gateway = None
                 runtime.feishu_deduplicator = None
@@ -353,6 +318,7 @@ class CompanyChannelRuntime:
         mcp_grant_material: Mapping[str, McpGrantMaterial],
         input_builder: RunInputBuilder,
         product_access_authorizer: ProductAccessAuthorizer | None,
+        tool_results: ToolResultStore | None = None,
     ) -> None:
         config = loaded.config
         required_session_methods = (
@@ -526,9 +492,9 @@ class CompanyChannelRuntime:
             summary_callback=summarizer,
         )
         archive = None
-        if memory_config.long_term_enabled:
-            assert memory_config.archive_root is not None
-            archive = MarkdownArchive(memory_config.archive_root, long_term_enabled=True)
+        if memory_config.archive_root is not None:
+            archive = MarkdownArchive(memory_config.archive_root,
+                                      long_term_enabled=memory_config.long_term_enabled)
         self.application = ChannelApplication(
             activation=activation,
             sessions=sessions,
@@ -536,6 +502,7 @@ class CompanyChannelRuntime:
             input_builder=input_builder,
             memory_resolver=ProductSessionMemoryResolver(activation.products, memory),
             archive=archive,
+            tool_results=tool_results,
         )
         self._loaded = loaded
         self._activation = activation
@@ -644,7 +611,7 @@ class CompanyChannelRuntime:
     def _build_feishu(
         self,
         loaded: LoadedSuiteHarnessConfig,
-        database: SQLiteDatabase,
+        database: object,
         adapters: FeishuHostAdapters | None,
     ) -> None:
         config = loaded.config
@@ -686,7 +653,12 @@ class CompanyChannelRuntime:
             authorization_timeout_seconds=config.channels.authorization_timeout_seconds,
             host_closed=lambda: self._closed,
         )
-        deduplicator = SQLiteChannelEventDeduplicator(
+        if config.storage.backend == "postgresql":
+            from suiteharness.persistence.postgres import PostgresChannelEventDeduplicator
+            deduplicator_type = PostgresChannelEventDeduplicator
+        else:
+            deduplicator_type = SQLiteChannelEventDeduplicator
+        deduplicator = deduplicator_type(
             database,
             scope=ChannelEventScope.deployment(
                 config.deployment.instance_id,
@@ -702,6 +674,9 @@ class CompanyChannelRuntime:
             default_product_id=adapters.default_product_id,
             deduplicator=deduplicator,
             outbound_sink=adapters.outbound_sink,
+            inbound_acknowledgement_sink=getattr(
+                adapters.outbound_sink, "acknowledge_received", None
+            ),
             processing_timeout_seconds=(
                 config.channels.feishu.event_processing_timeout_seconds
             ),

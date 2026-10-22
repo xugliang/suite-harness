@@ -298,6 +298,112 @@ class FeishuMessageClient:
         )
         return self._send_result(response, "message reply")
 
+    async def add_reaction(self, message_id: str, emoji_type: str) -> None:
+        """Add a lightweight acknowledgement to a verified inbound message."""
+
+        self._validate_message_id(message_id)
+        if (
+            not isinstance(emoji_type, str)
+            or not emoji_type
+            or len(emoji_type) > 64
+            or not emoji_type.replace("_", "").isalnum()
+        ):
+            raise ValueError("invalid Feishu reaction emoji_type")
+        token = await self._tokens.get_token()
+        response = await self._transport.send(
+            FeishuHttpRequest(
+                method="POST",
+                url=(f"{self._endpoint}/open-apis/im/v1/messages/"
+                     f"{quote(message_id, safe='')}/reactions"),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json_body={"reaction_type": {"emoji_type": emoji_type}},
+                timeout_seconds=self._timeout_seconds,
+            )
+        )
+        _api_payload(response, "message reaction")
+
+    async def send_interactive_card(
+        self,
+        receive_id: str,
+        markdown: str,
+        *,
+        receive_id_type: str = "chat_id",
+        idempotency_key: str | None = None,
+    ) -> FeishuSendResult:
+        """Create one updateable Markdown card for a progressive reply."""
+
+        if receive_id_type not in self._RECEIVE_ID_TYPES:
+            raise ValueError("unsupported Feishu receive_id_type")
+        if not receive_id or len(receive_id) > 1024 or "\x00" in receive_id:
+            raise ValueError("invalid Feishu receive_id")
+        self._validate_card_markdown(markdown)
+        uuid = _idempotency_key(idempotency_key)
+        token = await self._tokens.get_token()
+        query = urlencode({"receive_id_type": receive_id_type})
+        body: dict[str, Any] = {
+            "receive_id": receive_id,
+            "msg_type": "interactive",
+            "content": self._card_content(markdown),
+        }
+        if uuid is not None:
+            body["uuid"] = uuid
+        response = await self._transport.send(
+            FeishuHttpRequest(
+                method="POST",
+                url=f"{self._endpoint}/open-apis/im/v1/messages?{query}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json_body=body,
+                timeout_seconds=self._timeout_seconds,
+            )
+        )
+        return self._send_result(response, "interactive card create")
+
+    async def patch_interactive_card(self, message_id: str, markdown: str) -> None:
+        """Replace an existing progressive-reply card's safe Markdown body."""
+
+        self._validate_message_id(message_id)
+        self._validate_card_markdown(markdown)
+        token = await self._tokens.get_token()
+        response = await self._transport.send(
+            FeishuHttpRequest(
+                method="PATCH",
+                url=(f"{self._endpoint}/open-apis/im/v1/messages/"
+                     f"{quote(message_id, safe='')}"),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json_body={"content": self._card_content(markdown)},
+                timeout_seconds=self._timeout_seconds,
+            )
+        )
+        _api_payload(response, "interactive card update")
+
+    def _validate_message_id(self, message_id: str) -> None:
+        if not message_id or len(message_id) > 1024 or "\x00" in message_id:
+            raise ValueError("invalid Feishu message_id")
+
+    def _validate_card_markdown(self, markdown: str) -> None:
+        if not markdown or len(markdown) > self._max_text_chars or "\x00" in markdown:
+            raise ValueError("invalid Feishu card markdown")
+
+    @staticmethod
+    def _card_content(markdown: str) -> str:
+        return json.dumps(
+            {
+                "config": {"wide_screen_mode": True},
+                "elements": [{"tag": "markdown", "content": markdown}],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
     @staticmethod
     def _send_result(
         response: FeishuHttpResponse,

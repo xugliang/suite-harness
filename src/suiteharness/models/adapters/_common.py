@@ -117,11 +117,26 @@ def decode_tool_arguments(value: Any, provider_id: str) -> dict[str, JsonValue]:
     try:
         parsed = json.loads(value or "{}")
     except json.JSONDecodeError as exc:
-        raise ModelProviderError(
-            ModelErrorCode.RESPONSE_INVALID,
-            "model returned invalid tool argument JSON",
-            provider_id=provider_id,
-        ) from exc
+        # A provider can end immediately after a complete nested array/object,
+        # omitting only the root object's final brace. Never complete strings,
+        # scalars, arrays or nested fields; the normal tool schema validator
+        # remains authoritative after this one-delimiter transport repair.
+        text = value.rstrip()
+        if exc.pos == len(value) and text.startswith("{") and text.endswith(("]", "}")):
+            try:
+                parsed = json.loads(text + "}")
+            except json.JSONDecodeError:
+                raise ModelProviderError(
+                    ModelErrorCode.RESPONSE_INVALID,
+                    "model returned invalid tool argument JSON",
+                    provider_id=provider_id,
+                ) from exc
+        else:
+            raise ModelProviderError(
+                ModelErrorCode.RESPONSE_INVALID,
+                "model returned invalid tool argument JSON",
+                provider_id=provider_id,
+            ) from exc
     if not isinstance(parsed, dict):
         raise ModelProviderError(
             ModelErrorCode.RESPONSE_INVALID,

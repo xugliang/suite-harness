@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
+from suiteharness.context_labels import ContextCategory
+
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 _TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 
@@ -134,6 +136,9 @@ class ModelMessage(_FrozenModel):
     tool_calls: tuple[ModelToolCall, ...] = ()
     tool_call_id: str | None = None
     name: str | None = None
+    # Internal provenance only. Adapters must not transmit it; ReAct stores the
+    # optional label explicitly in private checkpoints for accurate resumed runs.
+    context_category: ContextCategory | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def role_shape(self) -> ModelMessage:
@@ -176,6 +181,8 @@ class ModelRequest(_FrozenModel):
     stop: tuple[str, ...] = ()
     response_schema: dict[str, JsonValue] | None = None
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    # Host-issued request-local reference; never sent to a model provider.
+    skill_context_token: str | None = Field(default=None, exclude=True)
 
     @field_validator("model")
     @classmethod

@@ -1,19 +1,18 @@
-# Data & caches
+# Runtime data, generated files and virtual environments
 data/
 .suiteharness/
 *.db
-*.db-journal
-*.db-wal
-*.db-shm
+*.db-*
 *.sqlite*
-*.sqlite3*
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.pytest-tmp-*/
+.pytest-*/
+.pytest_tmp_*/
+pytest-cache/
 .ruff_cache/
 .mypy_cache/
-.venv/
+.venv*/
 venv/
 .deps/
 .testdeps/
@@ -26,21 +25,32 @@ build/
 coverage.xml
 htmlcov/
 
-# Local configuration and secrets (commit an explicit *.example file instead)
+# Private configuration and credentials
 config/suiteharness.secrets.yaml
+*.secrets.yaml
+!*.secrets.example.yaml
+*.private.*
+*.local.*
 .env
 .env.*
 !.env.example
 *.key
-*.p12
 *.pem
+*.p12
 *.pfx
 *.log
 
-# Local test artifacts
-.pytest_tmp_*/
+# Backups and local migration artifacts
+.codex-backups/
+.codex-work/
+.rollback-*/
+deploy/rollbacks/
+*.tar
+*.tar.gz
+*.orig
+*.rej
 
-# OS / editor
+# Editors
 .DS_Store
 .idea/
 .vscode/

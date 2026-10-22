@@ -44,6 +44,38 @@ def test_history_compaction_preserves_tool_pairs_current_turn_and_original_reque
     assert result.estimated_input_tokens + 128 <= 1024
 
 
+def test_budget_drops_old_dialogue_before_conversation_summary():
+    request = ModelRequest(messages=(
+        ModelMessage.text(ModelRole.SYSTEM, '规则', context_category='system_prompt'),
+        ModelMessage.text(ModelRole.ASSISTANT, '历史摘要', context_category='conversation_summary'),
+        ModelMessage.text(ModelRole.USER, '旧问题' * 300, context_category='history_memory'),
+        ModelMessage.text(ModelRole.ASSISTANT, '旧回答', context_category='history_memory'),
+        ModelMessage.text(ModelRole.USER, '当前问题', context_category='current_question'),
+    ), max_output_tokens=128)
+    result = manager().prepare(request, window_tokens=1024)
+    assert [(m.role, m.content[0].text) for m in result.request.messages] == [
+        (ModelRole.SYSTEM, '规则'),
+        (ModelRole.ASSISTANT, '历史摘要'),
+        (ModelRole.USER, '当前问题'),
+    ]
+    assert [m.role for m in request.messages] == [ModelRole.SYSTEM, ModelRole.ASSISTANT, ModelRole.USER, ModelRole.ASSISTANT, ModelRole.USER]
+
+
+def test_budget_discards_summary_only_after_old_dialogue_if_still_too_large():
+    request = ModelRequest(messages=(
+        ModelMessage.text(ModelRole.SYSTEM, '规则', context_category='system_prompt'),
+        ModelMessage.text(ModelRole.ASSISTANT, '摘要' * 300, context_category='conversation_summary'),
+        ModelMessage.text(ModelRole.USER, '旧问题' * 300, context_category='history_memory'),
+        ModelMessage.text(ModelRole.ASSISTANT, '旧回答', context_category='history_memory'),
+        ModelMessage.text(ModelRole.USER, '当前问题', context_category='current_question'),
+    ), max_output_tokens=128)
+    result = manager().prepare(request, window_tokens=1024)
+    assert [(m.role, m.content[0].text) for m in result.request.messages] == [
+        (ModelRole.SYSTEM, '规则'),
+        (ModelRole.USER, '当前问题'),
+    ]
+
+
 def test_tool_schema_and_image_cost_are_counted():
     request = ModelRequest(messages=(ModelMessage(role=ModelRole.USER, content=(
         ImageContent(url='https://example.org/image.png'),)),), max_output_tokens=100)

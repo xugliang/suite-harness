@@ -5,6 +5,7 @@ from __future__ import annotations
 from suiteharness.runtime.scopes import ScopeKind, ServiceKey
 
 from .session_memory import SessionConversationMemory
+from .cleanup import ConversationCleanup
 from .protocols import Customer360Provider, EvidenceProvider, KnowledgeProvider, ProfileProvider
 
 # Private product data capabilities must be bound separately for every ProductContext.
@@ -44,9 +45,15 @@ CONVERSATION_MEMORY = ServiceKey(
     declared_at=ScopeKind.PRODUCT,
 )
 
+CONVERSATION_CLEANUP = ServiceKey(
+    name='memory.conversation-cleanup', contract=ConversationCleanup,
+    declared_at=ScopeKind.PRODUCT,
+)
+
 __all__ = [
     "CUSTOMER360_PROVIDER",
     "CONVERSATION_MEMORY",
+    "CONVERSATION_CLEANUP",
     "EVIDENCE_PROVIDER",
     "KNOWLEDGE_PROVIDER",
     "PROFILE_PROVIDER",
